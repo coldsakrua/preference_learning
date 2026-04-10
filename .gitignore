@@ -1,0 +1,6 @@
+# Dataset and generated data
+data/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
