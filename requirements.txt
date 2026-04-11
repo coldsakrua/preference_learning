@@ -5,3 +5,4 @@ vllm==0.8.5
 flash-attn==2.7.3.post1
 pyarrow>=16.0.0
 tqdm>=4.66.0
+math-verify

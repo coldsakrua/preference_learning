@@ -18,6 +18,7 @@ Stage 2 (train):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -463,7 +464,7 @@ def collate_batch(batch: List[Dict[str, str]]) -> Dict[str, List[str]]:
     }
 
 
-def compute_sequence_logps(
+def _compute_sequence_logps_batch(
     model: object,
     tokenizer: object,
     prompt_texts: Sequence[str],
@@ -514,6 +515,30 @@ def compute_sequence_logps(
         token_counts = valid_mask.sum(dim=-1).clamp_min(1)
         seq_logps = seq_logps / token_counts
     return seq_logps
+
+
+def compute_sequence_logps(
+    model: object,
+    tokenizer: object,
+    prompt_texts: Sequence[str],
+    completion_texts: Sequence[str],
+    max_length: int,
+    device: torch.device,
+    length_average: bool,
+) -> torch.Tensor:
+    prompts = list(prompt_texts)
+    completions = list(completion_texts)
+    if len(prompts) == 0:
+        return torch.empty(0, device=device, dtype=torch.float32)
+    return _compute_sequence_logps_batch(
+        model,
+        tokenizer,
+        prompts,
+        completions,
+        max_length,
+        device,
+        length_average,
+    )
 
 
 def train_with_preference_loss(args: argparse.Namespace) -> None:
@@ -667,6 +692,117 @@ def train_with_preference_loss(args: argparse.Namespace) -> None:
     print(f"[train] finished. final model saved to {final_dir}")
 
 
+def _online_rollout_completions_flat_vllm(
+    args: argparse.Namespace,
+    *,
+    model: object,
+    tokenizer: object,
+    device: torch.device,
+    prompt_texts: List[str],
+    rollout_steps: int,
+    total_steps_str: str,
+    init_model_path: str,
+    vllm_staging_dir: Path,
+    hf_updates_so_far: int,
+) -> List[str]:
+    from vllm import LLM, SamplingParams
+
+    if hf_updates_so_far > 0:
+        vllm_staging_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(vllm_staging_dir)
+        tokenizer.save_pretrained(vllm_staging_dir)
+        ckpt = str(vllm_staging_dir)
+    else:
+        ckpt = init_model_path
+
+    model.eval()
+    model.to("cpu")
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print(
+        f"[online] vLLM loading rollout_step={rollout_steps}/{total_steps_str} ckpt={ckpt}",
+        flush=True,
+    )
+    llm = LLM(
+        model=ckpt,
+        tokenizer=ckpt,
+        trust_remote_code=True,
+        tensor_parallel_size=args.tensor_parallel_size,
+        dtype=args.vllm_dtype,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.rollout_max_model_len,
+    )
+    sampling_params = SamplingParams(
+        n=2,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_new_tokens,
+        seed=args.seed + rollout_steps * 100003,
+    )
+    outputs = llm.generate(
+        prompt_texts,
+        sampling_params,
+        use_tqdm=args.online_vllm_use_tqdm,
+    )
+    completion_flat: List[str] = []
+    for output in outputs:
+        for cand in output.outputs:
+            completion_flat.append(cand.text)
+
+    del llm
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    model.to(device)
+    print(
+        f"[online] vLLM finished rollout_step={rollout_steps}/{total_steps_str}",
+        flush=True,
+    )
+    return completion_flat
+
+
+def _online_rollout_completions_flat_hf(
+    model: object,
+    tokenizer: object,
+    device: torch.device,
+    prompt_texts: List[str],
+    args: argparse.Namespace,
+) -> List[str]:
+    model.eval()
+    with torch.no_grad():
+        encoded = tokenizer(
+            prompt_texts,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.rollout_max_model_len,
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        expanded_input_ids = input_ids.repeat_interleave(2, dim=0)
+        expanded_attention_mask = attention_mask.repeat_interleave(2, dim=0)
+        generated = model.generate(
+            input_ids=expanded_input_ids,
+            attention_mask=expanded_attention_mask,
+            do_sample=True,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    prompt_lens = expanded_attention_mask.sum(dim=1).tolist()
+    out: List[str] = []
+    for i, prompt_len in enumerate(prompt_lens):
+        completion_ids = generated[i, int(prompt_len) :]
+        out.append(tokenizer.decode(completion_ids, skip_special_tokens=True))
+    return out
+
+
 def run_online_preference_training(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -727,9 +863,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
     total_steps_str = str(args.online_steps) if args.online_steps is not None else "inf"
     print(
-        f"[online] rollout_batch_size={args.rollout_batch_size} (2 samples per prompt), "
+        f"[online] rollout_backend={args.online_rollout_backend}, "
+        f"rollout_batch_size={args.rollout_batch_size} (2 samples per prompt via n=2), "
         f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}"
     )
+    if args.online_rollout_backend == "vllm" and device.type != "cuda":
+        raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
 
     with online_pairs_path.open("w", encoding="utf-8") as fout:
         for sample in source_iter:
@@ -758,47 +897,25 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 for s, sp in zip(buffer, system_prompts)
             ]
 
-            model.eval()
-            with torch.no_grad():
-                encoded = tokenizer(
-                    prompt_texts,
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=args.rollout_max_model_len,
+            vllm_staging_dir = output_root / "vllm_rollout_ckpt"
+            if args.online_rollout_backend == "vllm":
+                completion_flat = _online_rollout_completions_flat_vllm(
+                    args,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    prompt_texts=prompt_texts,
+                    rollout_steps=rollout_steps,
+                    total_steps_str=total_steps_str,
+                    init_model_path=model_path,
+                    vllm_staging_dir=vllm_staging_dir,
+                    hf_updates_so_far=updates,
                 )
-                input_ids = encoded["input_ids"].to(device)
-                attention_mask = encoded["attention_mask"].to(device)
-
-                expanded_input_ids = input_ids.repeat_interleave(2, dim=0)
-                expanded_attention_mask = attention_mask.repeat_interleave(2, dim=0)
-                n_seq = expanded_input_ids.size(0)
-                print(
-                    f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    f"model.generate batch={n_seq} max_new_tokens={args.max_new_tokens} ...",
-                    flush=True,
-                )
-                generated = model.generate(
-                    input_ids=expanded_input_ids,
-                    attention_mask=expanded_attention_mask,
-                    do_sample=True,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    max_new_tokens=args.max_new_tokens,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                print(
-                    f"[online] rollout_step={rollout_steps}/{total_steps_str} generate done",
-                    flush=True,
-                )
-
-            completion_texts: List[str] = []
-            prompt_lens = expanded_attention_mask.sum(dim=1).tolist()
-            for i, prompt_len in enumerate(prompt_lens):
-                completion_ids = generated[i, int(prompt_len) :]
-                completion_texts.append(tokenizer.decode(completion_ids, skip_special_tokens=True))
+            else:
+                with torch.no_grad():
+                    completion_flat = _online_rollout_completions_flat_hf(
+                        model, tokenizer, device, prompt_texts, args
+                    )
 
             model.train()
 
@@ -806,7 +923,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             chosen: List[str] = []
             rejected: List[str] = []
             for idx, sample_obj in enumerate(buffer):
-                candidates = completion_texts[2 * idx : 2 * idx + 2]
+                candidates = completion_flat[2 * idx : 2 * idx + 2]
                 pair = choose_preference_pair(candidates, sample_obj.ground_truth)
                 if pair is None:
                     continue
@@ -824,37 +941,58 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             if train_prompts:
-                all_prompts = train_prompts + train_prompts
-                all_completions = chosen + rejected
-                all_logps = compute_sequence_logps(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt_texts=all_prompts,
-                    completion_texts=all_completions,
-                    max_length=args.max_length,
-                    device=device,
-                    length_average=args.length_average,
+                batch_size = len(train_prompts)
+                mb = (
+                    args.logprob_micro_batch_size
+                    if args.logprob_micro_batch_size > 0
+                    else batch_size
                 )
 
-                batch_size = len(train_prompts)
-                chosen_logps = all_logps[:batch_size]
-                rejected_logps = all_logps[batch_size:]
-                preference_gap = chosen_logps - rejected_logps
-                loss = -F.logsigmoid(args.beta * preference_gap).mean()
-
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+                weighted_loss = 0.0
+                total_gap_weighted = 0.0
+                for start in range(0, batch_size, mb):
+                    end = min(start + mb, batch_size)
+                    tp = train_prompts[start:end]
+                    ch = chosen[start:end]
+                    rj = rejected[start:end]
+                    chosen_logps = _compute_sequence_logps_batch(
+                        model,
+                        tokenizer,
+                        tp,
+                        ch,
+                        args.max_length,
+                        device,
+                        args.length_average,
+                    )
+                    rejected_logps = _compute_sequence_logps_batch(
+                        model,
+                        tokenizer,
+                        tp,
+                        rj,
+                        args.max_length,
+                        device,
+                        args.length_average,
+                    )
+                    preference_gap = chosen_logps - rejected_logps
+                    loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
+                    scale = (end - start) / batch_size
+                    (loss_c * scale).backward()
+                    weighted_loss += loss_c.item() * scale
+                    total_gap_weighted += preference_gap.sum().item()
+
                 if args.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
 
                 updates += 1
                 kept_pairs += batch_size
+                mean_gap = total_gap_weighted / batch_size
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
                     f"optimizer_step={updates} scanned={scanned} "
-                    f"kept_in_batch={batch_size} loss={loss.item():.4f} "
-                    f"gap={preference_gap.mean().item():.4f}"
+                    f"kept_in_batch={batch_size} loss={weighted_loss:.4f} "
+                    f"gap={mean_gap:.4f}"
                 )
 
                 if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
@@ -984,6 +1122,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument(
+        "--logprob_micro_batch_size",
+        type=int,
+        default=8,
+        help=(
+            "Online only: number of preference pairs per step for logp computation. "
+            "Each step runs chosen then rejected LM forward on the same prompts; "
+            "uses scaled backward() per chunk to cap peak VRAM (avoids huge logits). "
+            "Use 0 to process all pairs in one go (may OOM on long completions)."
+        ),
+    )
     parser.add_argument("--length_average", type=str2bool, default=True)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
@@ -1012,6 +1161,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Save checkpoint every N online updates. Use 0 to disable periodic checkpoints.",
+    )
+    parser.add_argument(
+        "--online_rollout_backend",
+        type=str,
+        default="vllm",
+        choices=["vllm", "hf"],
+        help="Online: rollout engine — vLLM (default) or Hugging Face generate.",
+    )
+    parser.add_argument(
+        "--online_vllm_use_tqdm",
+        type=str2bool,
+        default=True,
+        help="Online + vLLM: show tqdm progress in llm.generate.",
     )
 
     return parser
