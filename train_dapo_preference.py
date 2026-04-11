@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
@@ -667,6 +667,226 @@ def train_with_preference_loss(args: argparse.Namespace) -> None:
     print(f"[train] finished. final model saved to {final_dir}")
 
 
+def run_online_preference_training(args: argparse.Namespace) -> None:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    online_pairs_path = output_root / "online_pairs.jsonl"
+
+    model_path = args.online_init_model_path.strip()
+    if not model_path:
+        model_path = args.train_model_path.strip() or args.rollout_model_path.strip()
+    if not model_path:
+        raise ValueError("Online mode requires a valid initial model path.")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    # Batched decoder-only generation expects left padding so the last token is real text.
+    tokenizer.padding_side = "left"
+
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if args.torch_dtype not in dtype_map:
+        raise ValueError(f"Unsupported torch dtype: {args.torch_dtype}")
+
+    model_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": dtype_map[args.torch_dtype],
+    }
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.train()
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    prompt_pool = build_prompt_pool(args)
+    prompt_rng = random.Random(args.seed + 20260412)
+
+    source_iter = iter_dapo_samples(
+        parquet_path=args.dataset_path,
+        scan_batch_size=args.scan_batch_size,
+        max_source_samples=args.max_source_samples,
+    )
+
+    updates = 0
+    rollout_steps = 0
+    scanned = 0
+    kept_pairs = 0
+    buffer: List[DapoSample] = []
+
+    total_steps_str = str(args.online_steps) if args.online_steps is not None else "inf"
+    print(
+        f"[online] rollout_batch_size={args.rollout_batch_size} (2 samples per prompt), "
+        f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}"
+    )
+
+    with online_pairs_path.open("w", encoding="utf-8") as fout:
+        for sample in source_iter:
+            buffer.append(sample)
+            scanned += 1
+            if len(buffer) < args.rollout_batch_size:
+                continue
+
+            rollout_steps += 1
+            system_prompts = [
+                choose_system_prompt(
+                    prompt_pool=prompt_pool,
+                    prompt_mode=args.prompt_mode,
+                    prompt_fixed_index=args.prompt_fixed_index,
+                    rng=prompt_rng,
+                )
+                for _ in buffer
+            ]
+            prompt_texts = [
+                apply_qwen_chat_template(
+                    tokenizer,
+                    s.prompt,
+                    enable_thinking=args.enable_thinking,
+                    system_prompt=sp,
+                )
+                for s, sp in zip(buffer, system_prompts)
+            ]
+
+            model.eval()
+            with torch.no_grad():
+                encoded = tokenizer(
+                    prompt_texts,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=args.rollout_max_model_len,
+                )
+                input_ids = encoded["input_ids"].to(device)
+                attention_mask = encoded["attention_mask"].to(device)
+
+                expanded_input_ids = input_ids.repeat_interleave(2, dim=0)
+                expanded_attention_mask = attention_mask.repeat_interleave(2, dim=0)
+                n_seq = expanded_input_ids.size(0)
+                print(
+                    f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                    f"model.generate batch={n_seq} max_new_tokens={args.max_new_tokens} ...",
+                    flush=True,
+                )
+                generated = model.generate(
+                    input_ids=expanded_input_ids,
+                    attention_mask=expanded_attention_mask,
+                    do_sample=True,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_new_tokens=args.max_new_tokens,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+                print(
+                    f"[online] rollout_step={rollout_steps}/{total_steps_str} generate done",
+                    flush=True,
+                )
+
+            completion_texts: List[str] = []
+            prompt_lens = expanded_attention_mask.sum(dim=1).tolist()
+            for i, prompt_len in enumerate(prompt_lens):
+                completion_ids = generated[i, int(prompt_len) :]
+                completion_texts.append(tokenizer.decode(completion_ids, skip_special_tokens=True))
+
+            model.train()
+
+            train_prompts: List[str] = []
+            chosen: List[str] = []
+            rejected: List[str] = []
+            for idx, sample_obj in enumerate(buffer):
+                candidates = completion_texts[2 * idx : 2 * idx + 2]
+                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                if pair is None:
+                    continue
+                train_prompts.append(prompt_texts[idx])
+                chosen.append(pair["chosen"])
+                rejected.append(pair["rejected"])
+                record = {
+                    "sample_id": sample_obj.sample_id,
+                    "prompt": sample_obj.prompt,
+                    "system_prompt": system_prompts[idx],
+                    "ground_truth": sample_obj.ground_truth,
+                    "chosen": pair["chosen"],
+                    "rejected": pair["rejected"],
+                }
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            if train_prompts:
+                all_prompts = train_prompts + train_prompts
+                all_completions = chosen + rejected
+                all_logps = compute_sequence_logps(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=all_prompts,
+                    completion_texts=all_completions,
+                    max_length=args.max_length,
+                    device=device,
+                    length_average=args.length_average,
+                )
+
+                batch_size = len(train_prompts)
+                chosen_logps = all_logps[:batch_size]
+                rejected_logps = all_logps[batch_size:]
+                preference_gap = chosen_logps - rejected_logps
+                loss = -F.logsigmoid(args.beta * preference_gap).mean()
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
+
+                updates += 1
+                kept_pairs += batch_size
+                print(
+                    f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                    f"optimizer_step={updates} scanned={scanned} "
+                    f"kept_in_batch={batch_size} loss={loss.item():.4f} "
+                    f"gap={preference_gap.mean().item():.4f}"
+                )
+
+                if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
+                    ckpt_dir = output_root / f"checkpoint-update-{updates}"
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    model.save_pretrained(ckpt_dir)
+                    tokenizer.save_pretrained(ckpt_dir)
+                    print(f"[online] saved checkpoint to {ckpt_dir}")
+            else:
+                print(
+                    f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                    f"scanned={scanned} kept_in_batch=0 skip_optimizer"
+                )
+
+            buffer = []
+            if args.online_steps is not None and rollout_steps >= args.online_steps:
+                break
+
+        if buffer and (args.online_steps is None or rollout_steps < args.online_steps):
+            print("[online] remaining tail batch ignored to keep fixed rollout_batch_size behavior")
+
+    final_dir = output_root / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(
+        f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
+        f"scanned={scanned}, kept_pairs={kept_pairs}, "
+        f"pairs_log={online_pairs_path}, final_model={final_dir}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DAPO preference training with vLLM rollout + DPO-style loss.")
 
@@ -675,7 +895,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage",
         type=str,
         default="all",
-        choices=["all", "generate", "train"],
+        choices=["all", "generate", "train", "online"],
         help="Pipeline stage to run.",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -771,6 +991,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
     parser.add_argument("--max_train_pairs", type=int, default=0)
     parser.add_argument("--save_every_epoch", type=str2bool, default=True)
+    parser.add_argument(
+        "--online_init_model_path",
+        type=str,
+        default="",
+        help="Initial model path for online training. Defaults to train/rollout model path.",
+    )
+    parser.add_argument(
+        "--online_steps",
+        type=int,
+        default=0,
+        help=(
+            "Online only: number of rollout batches to run. Each batch rolls out "
+            "rollout_batch_size prompts with 2 samples each, keeps one-right-one-wrong pairs, "
+            "then optimizer.step() if any. Use 0 for no limit (until source samples exhausted)."
+        ),
+    )
+    parser.add_argument(
+        "--online_save_every_updates",
+        type=int,
+        default=0,
+        help="Save checkpoint every N online updates. Use 0 to disable periodic checkpoints.",
+    )
 
     return parser
 
@@ -786,6 +1028,12 @@ def main() -> None:
         args.max_source_samples = None
     if args.max_train_pairs == 0:
         args.max_train_pairs = None
+    if args.online_steps == 0:
+        args.online_steps = None
+
+    if args.stage == "online":
+        run_online_preference_training(args)
+        return
 
     if args.stage in {"all", "generate"}:
         generate_preference_pairs(args)

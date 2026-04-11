@@ -4,3 +4,5 @@ data/
 # Python cache artifacts
 __pycache__/
 *.py[cod]
+
+logs/
