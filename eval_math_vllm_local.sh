@@ -24,7 +24,7 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260412_092545_job1373842/train/final}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-instruct}
 
 # model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260411_085017_job1373318/train/final}
 # 1=关闭 Qwen thinking/CoT（--no-thinking）；0=开启 CoT（与 eval 默认一致）

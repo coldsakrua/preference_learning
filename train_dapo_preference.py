@@ -2,17 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Two-stage preference training for DAPO math data.
+Online (on-policy) preference training for DAPO math data.
 
-Stage 1 (generate):
-  - Use vLLM to rollout each prompt twice.
-  - Keep samples where exactly one rollout is correct and the other is wrong.
-  - Save (prompt, system_prompt, chosen, rejected, ground_truth, responses, responses_correct) into JSONL.
-
-Stage 2 (train):
-  - Optimize preference objective:
-      L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x))))
-  - Supports optional length normalization for logpi.
+For each rollout step:
+  - Use vLLM/HF to sample 2 responses per prompt.
+  - Keep prompts where one response is correct and the other is wrong.
+  - Skip pairs with identical final answers (same-answer dedup).
+  - Apply preference update:
+      L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x)))) + lambda * CE(chosen)
 """
 
 from __future__ import annotations
@@ -222,23 +219,96 @@ def apply_qwen_chat_template(
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-_ANSWER_LINE = re.compile(r"answer\s*:\s*(.+)", flags=re.IGNORECASE)
+_ANSWER_LINE = re.compile(r"answer\s*[:：]\s*(.+)", flags=re.IGNORECASE)
+_ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:：]\s*(.+?)\s*$", flags=re.IGNORECASE)
 _BOXED = re.compile(r"\\boxed\{([^{}]+)\}")
 _LATEX_FRAC = re.compile(r"\\frac\{(-?\d+)\}\{(-?\d+)\}")
 
 
-def extract_final_answer(text: str) -> str:
+def strip_outer_formatting(text: str) -> str:
+    s = text.strip()
+    wrappers = [
+        ("**", "**"),
+        ("*", "*"),
+        ("`", "`"),
+        ("$", "$"),
+        ("\\(", "\\)"),
+        ("\\[", "\\]"),
+    ]
+    changed = True
+    while changed and s:
+        changed = False
+        for left, right in wrappers:
+            if s.startswith(left) and s.endswith(right) and len(s) > len(left) + len(right):
+                s = s[len(left) : -len(right)].strip()
+                changed = True
+    return s
+
+
+def normalize_answer_line_for_parse(line: str) -> str:
+    s = line.strip()
+    # Remove common markdown quote/list prefixes.
+    s = re.sub(r"^[>\-\*\#\s]+", "", s)
+    # Remove common markdown emphasis wrappers.
+    s = s.replace("**", "").replace("__", "").replace("`", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def parse_answer_from_line(line: str) -> Optional[str]:
+    normalized_line = normalize_answer_line_for_parse(line)
+    match = _ANSWER_LINE_CANONICAL.match(normalized_line)
+    if not match:
+        return None
+    answer = strip_outer_formatting(match.group(1))
+    if not answer:
+        return None
+    return answer
+
+
+def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
     if "</think>" in text:
         text = text.split("</think>")[-1]
-    text = text.strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in reversed(lines):
-        match = _ANSWER_LINE.search(line)
+    if not lines:
+        return False, ""
+    answer = parse_answer_from_line(lines[-1])
+    if answer is None:
+        return False, ""
+    return True, answer
+
+
+def extract_final_answer_robust(text: str) -> str:
+    has_last, answer_last = extract_final_answer_if_last_line(text)
+    if has_last:
+        return answer_last
+
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines[-4:]):
+        answer = parse_answer_from_line(line)
+        if answer:
+            return answer
+        match = _ANSWER_LINE.search(normalize_answer_line_for_parse(line))
         if match:
-            return match.group(1).strip()
+            fallback = strip_outer_formatting(match.group(1))
+            if fallback:
+                return fallback
+
+    boxed_matches = _BOXED.findall(text)
+    if boxed_matches:
+        answer = strip_outer_formatting(boxed_matches[-1])
+        if answer:
+            return answer
+
     if lines:
-        return lines[-1]
-    return text
+        return strip_outer_formatting(lines[-1])
+    return text.strip()
+
+
+def extract_final_answer(text: str) -> str:
+    return extract_final_answer_robust(text)
 
 
 def normalize_answer(answer: str) -> str:
@@ -267,7 +337,7 @@ def to_number_if_simple(answer: str) -> Optional[float]:
 
 
 def answers_match(predicted_text: str, ground_truth: str) -> bool:
-    predicted = normalize_answer(extract_final_answer(predicted_text))
+    predicted = normalize_answer(extract_final_answer_robust(predicted_text))
     target = normalize_answer(ground_truth)
     if predicted and predicted == target:
         return True
@@ -278,22 +348,67 @@ def answers_match(predicted_text: str, ground_truth: str) -> bool:
     return False
 
 
+def answer_text_matches(predicted_answer: str, ground_truth: str) -> bool:
+    predicted = normalize_answer(predicted_answer)
+    target = normalize_answer(ground_truth)
+    if predicted and predicted == target:
+        return True
+    predicted_num = to_number_if_simple(predicted)
+    target_num = to_number_if_simple(target)
+    if predicted_num is not None and target_num is not None:
+        return abs(predicted_num - target_num) <= 1e-6
+    return False
+
+
+def extract_normalized_final_answer(text: str) -> str:
+    return normalize_answer(extract_final_answer_robust(text))
+
+def candidates_share_same_final_answer(candidates: Sequence[str]) -> bool:
+    normalized_answers = [extract_normalized_final_answer(candidate) for candidate in candidates]
+    normalized_answers = [answer for answer in normalized_answers if answer]
+    if len(normalized_answers) < 2:
+        return False
+    return len(set(normalized_answers)) == 1
+
 def choose_preference_pair(
     candidates: Sequence[str],
     ground_truth: str,
+    require_rejected_final_answer: bool,
+    require_chosen_final_answer: bool,
 ) -> Optional[Dict[str, str]]:
+    # Skip pairs with identical final answers (different reasoning but same answer => no preference signal).
+    if candidates_share_same_final_answer(candidates):
+        return None
+
     chosen = None
+    chosen_final_answer = ""
     rejected = None
+    rejected_final_answer = ""
     for candidate in candidates:
-        if answers_match(candidate, ground_truth):
+        has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
+        parsed_answer = parsed_last_answer if has_final_answer_line else extract_final_answer_robust(candidate)
+        is_correct = answer_text_matches(parsed_answer, ground_truth)
+
+        if is_correct:
+            if require_chosen_final_answer and not has_final_answer_line:
+                continue
             if chosen is None:
                 chosen = candidate
+                chosen_final_answer = parsed_answer
         else:
+            if require_rejected_final_answer and not has_final_answer_line:
+                continue
             if rejected is None:
                 rejected = candidate
+                rejected_final_answer = parsed_last_answer if has_final_answer_line else parsed_answer
     if chosen is None or rejected is None:
         return None
-    return {"chosen": chosen, "rejected": rejected}
+    return {
+        "chosen": chosen,
+        "rejected": rejected,
+        "chosen_final_answer": chosen_final_answer,
+        "rejected_final_answer": rejected_final_answer,
+    }
 
 
 def build_preference_jsonl_record(
@@ -305,6 +420,8 @@ def build_preference_jsonl_record(
     pair: Dict[str, str],
 ) -> Dict[str, Any]:
     """JSONL row: chosen/rejected plus both raw rollouts in order (n=2) and per-rollout correctness."""
+    responses_final_answers = [extract_final_answer_robust(c) for c in candidates]
+    responses_has_final_answer_line = [extract_final_answer_if_last_line(c)[0] for c in candidates]
     return {
         "sample_id": sample_id,
         "prompt": prompt,
@@ -312,7 +429,11 @@ def build_preference_jsonl_record(
         "ground_truth": ground_truth,
         "chosen": pair["chosen"],
         "rejected": pair["rejected"],
+        "chosen_final_answer": pair.get("chosen_final_answer", ""),
+        "rejected_final_answer": pair.get("rejected_final_answer", ""),
         "responses": [str(c) for c in candidates],
+        "responses_final_answers": responses_final_answers,
+        "responses_has_final_answer_line": responses_has_final_answer_line,
         "responses_correct": [answers_match(c, ground_truth) for c in candidates],
     }
 
@@ -354,6 +475,7 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
 
     processed = 0
     saved_pairs = 0
+    same_answer_skipped = 0
     buffer: List[DapoSample] = []
 
     source_iter = iter_dapo_samples(
@@ -395,8 +517,15 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
                 candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                pair = choose_preference_pair(
+                    candidates,
+                    sample_obj.ground_truth,
+                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
+                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
+                )
                 if pair is None:
+                    if candidates_share_same_final_answer(candidates):
+                        same_answer_skipped += 1
                     continue
                 record = build_preference_jsonl_record(
                     sample_obj.sample_id,
@@ -438,8 +567,15 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
                 candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                pair = choose_preference_pair(
+                    candidates,
+                    sample_obj.ground_truth,
+                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
+                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
+                )
                 if pair is None:
+                    if candidates_share_same_final_answer(candidates):
+                        same_answer_skipped += 1
                     continue
                 record = build_preference_jsonl_record(
                     sample_obj.sample_id,
@@ -459,7 +595,7 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
     kept_ratio = (saved_pairs / processed) if processed else 0.0
     print(
         f"[generate] processed={processed}, saved_pairs={saved_pairs}, "
-        f"keep_ratio={kept_ratio:.4f}, output={output_path}"
+        f"same_answer_skipped={same_answer_skipped}, keep_ratio={kept_ratio:.4f}, output={output_path}"
     )
     return saved_pairs
 
@@ -725,7 +861,9 @@ def train_with_preference_loss(args: argparse.Namespace) -> None:
                 chosen_logps = all_logps[:batch_size]
                 rejected_logps = all_logps[batch_size:]
                 preference_gap = chosen_logps - rejected_logps
-                loss = -F.logsigmoid(args.beta * preference_gap).mean()
+                pref_loss = -F.logsigmoid(args.beta * preference_gap).mean()
+                chosen_ce_loss = (-chosen_logps).mean()
+                loss = pref_loss + args.chosen_ce_weight * chosen_ce_loss
 
                 scaled_loss = loss / args.gradient_accumulation_steps
                 scaled_loss.backward()
@@ -743,6 +881,8 @@ def train_with_preference_loss(args: argparse.Namespace) -> None:
                     avg_loss = running_loss / max(1, args.gradient_accumulation_steps)
                     epoch_iterator.set_postfix(
                         loss=f"{avg_loss:.4f}",
+                        pref=f"{pref_loss.item():.4f}",
+                        ce=f"{chosen_ce_loss.item():.4f}",
                         gap=f"{preference_gap.mean().item():.4f}",
                         step=global_step,
                     )
@@ -925,7 +1065,9 @@ def _online_run_preference_optimizer_step(
             args.length_average,
         )
         preference_gap = chosen_logps - rejected_logps
-        loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
+        pref_loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
+        chosen_ce_loss_c = (-chosen_logps).mean()
+        loss_c = pref_loss_c + args.chosen_ce_weight * chosen_ce_loss_c
         scale = (end - start) / batch_size
         (loss_c * scale).backward()
         weighted_loss += loss_c.item() * scale
@@ -995,6 +1137,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     rollout_steps = 0
     scanned = 0
     kept_pairs = 0
+    same_answer_skipped = 0
     buffer: List[DapoSample] = []
     pair_cache: List[OnlinePendingPair] = []
     k = args.online_pairs_per_step
@@ -1060,10 +1203,19 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             model.train()
 
             new_pairs_in_rollout = 0
+            same_answer_skipped_in_rollout = 0
             for idx, sample_obj in enumerate(buffer):
                 candidates = completion_flat[2 * idx : 2 * idx + 2]
-                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                pair = choose_preference_pair(
+                    candidates,
+                    sample_obj.ground_truth,
+                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
+                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
+                )
                 if pair is None:
+                    if candidates_share_same_final_answer(candidates):
+                        same_answer_skipped += 1
+                        same_answer_skipped_in_rollout += 1
                     continue
                 record = build_preference_jsonl_record(
                     sample_obj.sample_id,
@@ -1085,7 +1237,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
             print(
                 f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
-                f"new_pairs_in_rollout={new_pairs_in_rollout} pair_cache_size={len(pair_cache)}"
+                f"new_pairs_in_rollout={new_pairs_in_rollout} "
+                f"same_answer_skipped_in_rollout={same_answer_skipped_in_rollout} "
+                f"pair_cache_size={len(pair_cache)}"
             )
 
             while len(pair_cache) >= k:
@@ -1142,20 +1296,21 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
         f"scanned={scanned}, kept_pairs={kept_pairs}, "
+        f"same_answer_skipped={same_answer_skipped}, "
         f"pairs_log={online_pairs_path}, final_model={final_dir}"
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DAPO preference training with vLLM rollout + DPO-style loss.")
+    parser = argparse.ArgumentParser(description="Online DAPO preference training with vLLM rollout.")
 
     # pipeline control
     parser.add_argument(
         "--stage",
         type=str,
-        default="all",
-        choices=["all", "generate", "train", "online"],
-        help="Pipeline stage to run.",
+        default="online",
+        choices=["online"],
+        help="Only online mode is supported.",
     )
     parser.add_argument("--seed", type=int, default=42)
 
@@ -1163,10 +1318,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_path", type=str, default="/path/to/dapo-math-17k.parquet")
     parser.add_argument("--rollout_model_path", type=str, default="/path/to/Qwen3-4B")
     parser.add_argument("--train_model_path", type=str, default="/path/to/Qwen3-4B")
-    parser.add_argument("--preference_pairs_path", type=str, default="./outputs/dapo_pref_pairs.jsonl")
     parser.add_argument("--output_dir", type=str, default="./outputs/qwen3-4b-pref")
 
-    # generate stage
+    # online rollout
     parser.add_argument("--scan_batch_size", type=int, default=1024)
     parser.add_argument("--rollout_batch_size", type=int, default=128)
     parser.add_argument(
@@ -1175,19 +1329,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=17000,
         help="Maximum source prompts scanned for pair mining.",
     )
-    parser.add_argument(
-        "--target_pairs",
-        type=int,
-        default=5000,
-        help="Stop generating when this many preference pairs are collected. Use 0 for no limit.",
-    )
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--vllm_dtype", type=str, default="bfloat16")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
-    parser.add_argument("--rollout_max_model_len", type=int, default=8192)
+    parser.add_argument("--rollout_max_model_len", type=int, default=32768)
+    parser.add_argument(
+        "--sample_rejected_requires_final_answer",
+        type=str2bool,
+        default=True,
+        help=(
+            "Sampling filter: rejected response must have a parseable final answer on LAST line "
+            "(supports markdown variants like '**Answer:** 10'). Truncated/no-final-answer rejected "
+            "responses are dropped."
+        ),
+    )
+    parser.add_argument(
+        "--sample_chosen_requires_final_answer",
+        type=str2bool,
+        default=False,
+        help="Sampling filter: if true, chosen response also needs a parseable final answer on LAST line.",
+    )
 
     # shared chat format
     parser.add_argument(
@@ -1234,14 +1398,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Whether to enable Qwen thinking mode when building chat template.",
     )
 
-    # train stage
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--train_batch_size", type=int, default=2)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    # online optimization
     parser.add_argument("--learning_rate", type=float, default=2e-6)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument(
+        "--chosen_ce_weight",
+        type=float,
+        default=0.02,
+        help=(
+            "Additive anchor term on chosen responses: "
+            "total_loss = pref_loss + chosen_ce_weight * CE(chosen). Use 0 to disable."
+        ),
+    )
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument(
         "--logprob_micro_batch_size",
@@ -1259,26 +1428,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
-    parser.add_argument("--max_train_pairs", type=int, default=0)
-    parser.add_argument("--save_every_epoch", type=str2bool, default=True)
-    parser.add_argument(
-        "--record_train_samples",
-        type=str2bool,
-        default=False,
-        help="Train only: save actually sampled training pairs per step to JSONL.",
-    )
-    parser.add_argument(
-        "--train_sample_log_path",
-        type=str,
-        default="",
-        help="Train only: JSONL path for sampled training records. Default: <output_dir>/train_sampled_pairs.jsonl",
-    )
-    parser.add_argument(
-        "--train_sample_log_max_records",
-        type=int,
-        default=0,
-        help="Train only: maximum sampled records to log. Use 0 for no limit.",
-    )
     parser.add_argument(
         "--online_init_model_path",
         type=str,
@@ -1334,27 +1483,14 @@ def main() -> None:
     args = parser.parse_args()
     set_seed(args.seed)
 
-    if args.target_pairs == 0:
-        args.target_pairs = None
     if args.max_source_samples == 0:
         args.max_source_samples = None
-    if args.max_train_pairs == 0:
-        args.max_train_pairs = None
-    if args.train_sample_log_max_records == 0:
-        args.train_sample_log_max_records = None
     if args.online_steps == 0:
         args.online_steps = None
 
-    if args.stage == "online":
-        if args.online_pairs_per_step < 1:
-            raise SystemExit("error: --online-pairs-per-step must be >= 1")
-        run_online_preference_training(args)
-        return
-
-    if args.stage in {"all", "generate"}:
-        generate_preference_pairs(args)
-    if args.stage in {"all", "train"}:
-        train_with_preference_loss(args)
+    if args.online_pairs_per_step < 1:
+        raise SystemExit("error: --online-pairs-per-step must be >= 1")
+    run_online_preference_training(args)
 
 
 if __name__ == "__main__":

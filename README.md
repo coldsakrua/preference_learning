@@ -1,14 +1,17 @@
 # DAPO Preference Learning (Qwen3-4B + vLLM)
 
-This repository provides a two-stage training pipeline:
+This repository now uses an online-only (on-policy) training pipeline:
 
-1. Rollout with `vLLM` (`n=2` per sample), then keep pairs with exactly one correct and one wrong answer.
-2. Preference training with:
+1. Rollout with `vLLM` (`n=2` per sample) on current policy.
+2. Keep samples with exactly one correct and one wrong answer.
+3. Skip pairs where two rollouts share the same normalized final answer.
+4. Update current policy immediately with:
 
 ```text
-L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x))))
+L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x)))) + lambda * CE(chosen)
 ```
 
+Default `lambda` is `0.02` (`--chosen_ce_weight 0.02`).
 Length-normalized log-prob is supported (`--length_average true`).
 
 Main script: `train_dapo_preference.py`
@@ -44,59 +47,38 @@ Supported arguments:
 - `--prompt_fixed_index 0`
 - `--sample_rejected_requires_final_answer true` (default): reject truncated/no-final-answer negatives at sampling time
 - `--sample_chosen_requires_final_answer false` (optional stricter filter)
+- Same-answer dedup is enabled in sampling: if two rollouts have the same normalized final answer, the pair is skipped.
 
-When generating preference pairs, the selected `system_prompt` is saved into each JSONL row and reused during training.
+Answer parsing in sampling is robust to markdown variants, for example:
+
+- `Answer: 10`
+- `**Answer:** 10`
+- `**Answer: 10**`
+
+In online mode, sampled pairs are logged to `<output_dir>/online_pairs.jsonl`.
 
 ## Usage
 
-### 1) Generate preference pairs only
+### Online training (only supported mode)
 
 ```bash
 python train_dapo_preference.py \
-  --stage generate \
   --dataset_path /path/to/dapo-math-17k.parquet \
+  --online_init_model_path /path/to/Qwen3-4B \
   --rollout_model_path /path/to/Qwen3-4B \
-  --preference_pairs_path /path/to/outputs/dapo_pref_pairs.jsonl \
+  --output_dir /path/to/outputs/qwen3-4b-pref-online \
   --max_source_samples 17000 \
-  --target_pairs 5000 \
-  --rollout_batch_size 128 \
+  --online_steps 30 \
+  --rollout_batch_size 256 \
+  --online-pairs-per-step 32 \
   --tensor_parallel_size 1 \
+  --temperature 0.6 \
+  --top_p 0.95 \
+  --max_new_tokens 8192 \
+  --beta 0.1 \
+  --chosen_ce_weight 0.02 \
   --prompt_mode random \
   --prompt_candidates_file config/prompt_candidates_en.txt
-```
-
-### 2) Train only
-
-```bash
-python train_dapo_preference.py \
-  --stage train \
-  --train_model_path /path/to/Qwen3-4B \
-  --preference_pairs_path /path/to/outputs/dapo_pref_pairs.jsonl \
-  --output_dir /path/to/outputs/qwen3-4b-pref \
-  --num_epochs 1 \
-  --train_batch_size 2 \
-  --gradient_accumulation_steps 8 \
-  --beta 0.1 \
-  --length_average true \
-  --record_train_samples true
-```
-
-When `--record_train_samples true`, sampled records are saved to:
-
-- default: `<output_dir>/train_sampled_pairs.jsonl`
-- custom path: `--train_sample_log_path /path/to/sampled.jsonl`
-- optional cap: `--train_sample_log_max_records 100000`
-
-### 3) Run all stages
-
-```bash
-python train_dapo_preference.py \
-  --stage all \
-  --dataset_path /path/to/dapo-math-17k.parquet \
-  --rollout_model_path /path/to/Qwen3-4B \
-  --train_model_path /path/to/Qwen3-4B \
-  --preference_pairs_path /path/to/outputs/dapo_pref_pairs.jsonl \
-  --output_dir /path/to/outputs/qwen3-4b-pref
 ```
 
 ## SLURM Script
@@ -105,9 +87,12 @@ Use this ready-to-run example:
 
 - `run_dapo_pref_qwen3_4b_1gpu.sh`
 
-It does:
+It runs online rollout + preference updates and writes outputs under
+`outputs/dapo_pref_4b_1gpu/<timestamp>_job<id>/`.
 
-1. rollout + pair mining (with `--prompt_mode random`)
-2. preference training
+The SLURM defaults are aligned with local eval decoding (`eval_math_vllm_local.sh`):
 
-and writes outputs under `outputs/dapo_pref_4b_1gpu/<timestamp>_job<id>/`.
+- `temperature=0.6`
+- `top_p=0.95`
+- `max_new_tokens=8192`
+- `enable_thinking=false`
