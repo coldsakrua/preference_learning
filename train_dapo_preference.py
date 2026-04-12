@@ -73,6 +73,16 @@ class DapoSample:
     sample_id: str
 
 
+@dataclass
+class OnlinePendingPair:
+    """One preference pair queued for a fixed-size online optimizer step."""
+
+    train_prompt: str
+    chosen: str
+    rejected: str
+    record: Dict[str, Any]
+
+
 def extract_user_prompt(messages: object) -> str:
     if not isinstance(messages, list) or not messages:
         return ""
@@ -874,6 +884,61 @@ def _online_rollout_completions_flat_hf(
     return out
 
 
+def _online_run_preference_optimizer_step(
+    model: object,
+    tokenizer: object,
+    optimizer: AdamW,
+    device: torch.device,
+    args: argparse.Namespace,
+    train_prompts: List[str],
+    chosen: List[str],
+    rejected: List[str],
+) -> tuple[float, float]:
+    """Single optimizer.step() on a batch of preference pairs. Returns (loss, mean_gap)."""
+    batch_size = len(train_prompts)
+    mb = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else batch_size
+
+    optimizer.zero_grad(set_to_none=True)
+    weighted_loss = 0.0
+    total_gap_weighted = 0.0
+    for start in range(0, batch_size, mb):
+        end = min(start + mb, batch_size)
+        tp = train_prompts[start:end]
+        ch = chosen[start:end]
+        rj = rejected[start:end]
+        chosen_logps = _compute_sequence_logps_batch(
+            model,
+            tokenizer,
+            tp,
+            ch,
+            args.max_length,
+            device,
+            args.length_average,
+        )
+        rejected_logps = _compute_sequence_logps_batch(
+            model,
+            tokenizer,
+            tp,
+            rj,
+            args.max_length,
+            device,
+            args.length_average,
+        )
+        preference_gap = chosen_logps - rejected_logps
+        loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
+        scale = (end - start) / batch_size
+        (loss_c * scale).backward()
+        weighted_loss += loss_c.item() * scale
+        total_gap_weighted += preference_gap.sum().item()
+
+    if args.max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+    optimizer.step()
+
+    mean_gap = total_gap_weighted / batch_size
+    return weighted_loss, mean_gap
+
+
 def run_online_preference_training(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -931,11 +996,14 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     scanned = 0
     kept_pairs = 0
     buffer: List[DapoSample] = []
+    pair_cache: List[OnlinePendingPair] = []
+    k = args.online_pairs_per_step
 
     total_steps_str = str(args.online_steps) if args.online_steps is not None else "inf"
     print(
         f"[online] rollout_backend={args.online_rollout_backend}, "
         f"rollout_batch_size={args.rollout_batch_size} (2 samples per prompt via n=2), "
+        f"online_pairs_per_step={k} (pairs consumed per optimizer.step; extras cached), "
         f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}"
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
@@ -991,17 +1059,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
             model.train()
 
-            train_prompts: List[str] = []
-            chosen: List[str] = []
-            rejected: List[str] = []
+            new_pairs_in_rollout = 0
             for idx, sample_obj in enumerate(buffer):
                 candidates = completion_flat[2 * idx : 2 * idx + 2]
                 pair = choose_preference_pair(candidates, sample_obj.ground_truth)
                 if pair is None:
                     continue
-                train_prompts.append(prompt_texts[idx])
-                chosen.append(pair["chosen"])
-                rejected.append(pair["rejected"])
                 record = build_preference_jsonl_record(
                     sample_obj.sample_id,
                     sample_obj.prompt,
@@ -1010,62 +1073,47 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     candidates,
                     pair,
                 )
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fout.flush()
-
-            if train_prompts:
-                batch_size = len(train_prompts)
-                mb = (
-                    args.logprob_micro_batch_size
-                    if args.logprob_micro_batch_size > 0
-                    else batch_size
+                pair_cache.append(
+                    OnlinePendingPair(
+                        train_prompt=prompt_texts[idx],
+                        chosen=pair["chosen"],
+                        rejected=pair["rejected"],
+                        record=record,
+                    )
                 )
+                new_pairs_in_rollout += 1
 
-                optimizer.zero_grad(set_to_none=True)
-                weighted_loss = 0.0
-                total_gap_weighted = 0.0
-                for start in range(0, batch_size, mb):
-                    end = min(start + mb, batch_size)
-                    tp = train_prompts[start:end]
-                    ch = chosen[start:end]
-                    rj = rejected[start:end]
-                    chosen_logps = _compute_sequence_logps_batch(
-                        model,
-                        tokenizer,
-                        tp,
-                        ch,
-                        args.max_length,
-                        device,
-                        args.length_average,
-                    )
-                    rejected_logps = _compute_sequence_logps_batch(
-                        model,
-                        tokenizer,
-                        tp,
-                        rj,
-                        args.max_length,
-                        device,
-                        args.length_average,
-                    )
-                    preference_gap = chosen_logps - rejected_logps
-                    loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
-                    scale = (end - start) / batch_size
-                    (loss_c * scale).backward()
-                    weighted_loss += loss_c.item() * scale
-                    total_gap_weighted += preference_gap.sum().item()
+            print(
+                f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
+                f"new_pairs_in_rollout={new_pairs_in_rollout} pair_cache_size={len(pair_cache)}"
+            )
 
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
+            while len(pair_cache) >= k:
+                chunk = pair_cache[:k]
+                pair_cache = pair_cache[k:]
+                train_prompts = [p.train_prompt for p in chunk]
+                chosen_list = [p.chosen for p in chunk]
+                rejected_list = [p.rejected for p in chunk]
+                for p in chunk:
+                    fout.write(json.dumps(p.record, ensure_ascii=False) + "\n")
+                    fout.flush()
 
+                weighted_loss, mean_gap = _online_run_preference_optimizer_step(
+                    model,
+                    tokenizer,
+                    optimizer,
+                    device,
+                    args,
+                    train_prompts,
+                    chosen_list,
+                    rejected_list,
+                )
                 updates += 1
-                kept_pairs += batch_size
-                mean_gap = total_gap_weighted / batch_size
+                kept_pairs += k
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    f"optimizer_step={updates} scanned={scanned} "
-                    f"kept_in_batch={batch_size} loss={weighted_loss:.4f} "
-                    f"gap={mean_gap:.4f}"
+                    f"optimizer_step={updates} consumed_pairs={k} pair_cache_size={len(pair_cache)} "
+                    f"loss={weighted_loss:.4f} gap={mean_gap:.4f}"
                 )
 
                 if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
@@ -1074,11 +1122,6 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     model.save_pretrained(ckpt_dir)
                     tokenizer.save_pretrained(ckpt_dir)
                     print(f"[online] saved checkpoint to {ckpt_dir}")
-            else:
-                print(
-                    f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    f"scanned={scanned} kept_in_batch=0 skip_optimizer"
-                )
 
             buffer = []
             if args.online_steps is not None and rollout_steps >= args.online_steps:
@@ -1086,6 +1129,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
         if buffer and (args.online_steps is None or rollout_steps < args.online_steps):
             print("[online] remaining tail batch ignored to keep fixed rollout_batch_size behavior")
+        if pair_cache:
+            print(
+                f"[online] pair_cache_remaining={len(pair_cache)} pairs "
+                f"(need {k} for one optimizer step; not trained — start next run or lower --online-pairs-per-step)"
+            )
 
     final_dir = output_root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -1243,8 +1291,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Online only: number of rollout batches to run. Each batch rolls out "
-            "rollout_batch_size prompts with 2 samples each, keeps one-right-one-wrong pairs, "
-            "then optimizer.step() if any. Use 0 for no limit (until source samples exhausted)."
+            "rollout_batch_size prompts with 2 samples each; valid pairs append to a cache. "
+            "optimizer.step() runs only when the cache has at least --online-pairs-per-step pairs. "
+            "Use 0 for no limit (until source samples exhausted)."
+        ),
+    )
+    parser.add_argument(
+        "--online-pairs-per-step",
+        type=int,
+        default=32,
+        dest="online_pairs_per_step",
+        help=(
+            "Online only: each optimizer.step() consumes exactly this many preference pairs. "
+            "Extra pairs from a rollout stay in the cache for the next step(s)."
         ),
     )
     parser.add_argument(
@@ -1287,6 +1346,8 @@ def main() -> None:
         args.online_steps = None
 
     if args.stage == "online":
+        if args.online_pairs_per_step < 1:
+            raise SystemExit("error: --online-pairs-per-step must be >= 1")
         run_online_preference_training(args)
         return
 
