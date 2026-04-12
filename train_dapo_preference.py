@@ -7,7 +7,7 @@ Two-stage preference training for DAPO math data.
 Stage 1 (generate):
   - Use vLLM to rollout each prompt twice.
   - Keep samples where exactly one rollout is correct and the other is wrong.
-  - Save (prompt, system_prompt, chosen, rejected, ground_truth) into JSONL.
+  - Save (prompt, system_prompt, chosen, rejected, ground_truth, responses, responses_correct) into JSONL.
 
 Stage 2 (train):
   - Optimize preference objective:
@@ -25,7 +25,7 @@ import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import pyarrow.parquet as pq
 import torch
@@ -231,22 +231,6 @@ def extract_final_answer(text: str) -> str:
     return text
 
 
-def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
-    if "</think>" in text:
-        text = text.split("</think>")[-1]
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return False, ""
-    last_line = lines[-1]
-    match = re.fullmatch(r"answer\s*:\s*(.+)", last_line, flags=re.IGNORECASE)
-    if not match:
-        return False, ""
-    answer = match.group(1).strip()
-    if not answer:
-        return False, ""
-    return True, answer
-
-
 def normalize_answer(answer: str) -> str:
     answer = answer.strip()
     answer = _BOXED.sub(r"\1", answer)
@@ -284,54 +268,42 @@ def answers_match(predicted_text: str, ground_truth: str) -> bool:
     return False
 
 
-def answer_text_matches(answer_text: str, ground_truth: str) -> bool:
-    predicted = normalize_answer(answer_text)
-    target = normalize_answer(ground_truth)
-    if predicted and predicted == target:
-        return True
-    predicted_num = to_number_if_simple(predicted)
-    target_num = to_number_if_simple(target)
-    if predicted_num is not None and target_num is not None:
-        return abs(predicted_num - target_num) <= 1e-6
-    return False
-
-
 def choose_preference_pair(
     candidates: Sequence[str],
     ground_truth: str,
-    require_rejected_final_answer: bool = True,
-    require_chosen_final_answer: bool = False,
 ) -> Optional[Dict[str, str]]:
     chosen = None
-    chosen_final_answer = ""
     rejected = None
-    rejected_final_answer = ""
     for candidate in candidates:
-        has_final_line, final_answer = extract_final_answer_if_last_line(candidate)
-        if has_final_line:
-            is_correct = answer_text_matches(final_answer, ground_truth)
-        else:
-            is_correct = answers_match(candidate, ground_truth)
-
-        if is_correct:
-            if require_chosen_final_answer and (not has_final_line):
-                continue
+        if answers_match(candidate, ground_truth):
             if chosen is None:
                 chosen = candidate
-                chosen_final_answer = final_answer if has_final_line else ""
         else:
-            if require_rejected_final_answer and (not has_final_line):
-                continue
             if rejected is None:
                 rejected = candidate
-                rejected_final_answer = final_answer if has_final_line else ""
     if chosen is None or rejected is None:
         return None
+    return {"chosen": chosen, "rejected": rejected}
+
+
+def build_preference_jsonl_record(
+    sample_id: str,
+    prompt: str,
+    system_prompt: str,
+    ground_truth: str,
+    candidates: Sequence[str],
+    pair: Dict[str, str],
+) -> Dict[str, Any]:
+    """JSONL row: chosen/rejected plus both raw rollouts in order (n=2) and per-rollout correctness."""
     return {
-        "chosen": chosen,
-        "rejected": rejected,
-        "chosen_final_answer": chosen_final_answer,
-        "rejected_final_answer": rejected_final_answer,
+        "sample_id": sample_id,
+        "prompt": prompt,
+        "system_prompt": system_prompt,
+        "ground_truth": ground_truth,
+        "chosen": pair["chosen"],
+        "rejected": pair["rejected"],
+        "responses": [str(c) for c in candidates],
+        "responses_correct": [answers_match(c, ground_truth) for c in candidates],
     }
 
 
@@ -413,24 +385,17 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
                 candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(
-                    candidates,
-                    sample_obj.ground_truth,
-                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
-                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
-                )
+                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
                 if pair is None:
                     continue
-                record = {
-                    "sample_id": sample_obj.sample_id,
-                    "prompt": sample_obj.prompt,
-                    "system_prompt": system_prompt,
-                    "ground_truth": sample_obj.ground_truth,
-                    "chosen": pair["chosen"],
-                    "rejected": pair["rejected"],
-                    "chosen_final_answer": pair["chosen_final_answer"],
-                    "rejected_final_answer": pair["rejected_final_answer"],
-                }
+                record = build_preference_jsonl_record(
+                    sample_obj.sample_id,
+                    sample_obj.prompt,
+                    system_prompt,
+                    sample_obj.ground_truth,
+                    candidates,
+                    pair,
+                )
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 saved_pairs += 1
                 pbar.update(1)
@@ -463,24 +428,17 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
                 candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(
-                    candidates,
-                    sample_obj.ground_truth,
-                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
-                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
-                )
+                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
                 if pair is None:
                     continue
-                record = {
-                    "sample_id": sample_obj.sample_id,
-                    "prompt": sample_obj.prompt,
-                    "system_prompt": system_prompt,
-                    "ground_truth": sample_obj.ground_truth,
-                    "chosen": pair["chosen"],
-                    "rejected": pair["rejected"],
-                    "chosen_final_answer": pair["chosen_final_answer"],
-                    "rejected_final_answer": pair["rejected_final_answer"],
-                }
+                record = build_preference_jsonl_record(
+                    sample_obj.sample_id,
+                    sample_obj.prompt,
+                    system_prompt,
+                    sample_obj.ground_truth,
+                    candidates,
+                    pair,
+                )
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 saved_pairs += 1
                 pbar.update(1)
@@ -919,7 +877,7 @@ def _online_rollout_completions_flat_hf(
 def run_online_preference_training(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    output_root = Path(args.output_dir)
+    output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     online_pairs_path = output_root / "online_pairs.jsonl"
 
@@ -983,7 +941,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
 
-    with online_pairs_path.open("w", encoding="utf-8") as fout:
+    # Line-buffered + flush per row so JSONL is visible on shared FS while the job runs.
+    with online_pairs_path.open("w", encoding="utf-8", buffering=1) as fout:
         for sample in source_iter:
             buffer.append(sample)
             scanned += 1
@@ -1037,28 +996,22 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             rejected: List[str] = []
             for idx, sample_obj in enumerate(buffer):
                 candidates = completion_flat[2 * idx : 2 * idx + 2]
-                pair = choose_preference_pair(
-                    candidates,
-                    sample_obj.ground_truth,
-                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
-                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
-                )
+                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
                 if pair is None:
                     continue
                 train_prompts.append(prompt_texts[idx])
                 chosen.append(pair["chosen"])
                 rejected.append(pair["rejected"])
-                record = {
-                    "sample_id": sample_obj.sample_id,
-                    "prompt": sample_obj.prompt,
-                    "system_prompt": system_prompts[idx],
-                    "ground_truth": sample_obj.ground_truth,
-                    "chosen": pair["chosen"],
-                    "rejected": pair["rejected"],
-                    "chosen_final_answer": pair["chosen_final_answer"],
-                    "rejected_final_answer": pair["rejected_final_answer"],
-                }
+                record = build_preference_jsonl_record(
+                    sample_obj.sample_id,
+                    sample_obj.prompt,
+                    system_prompts[idx],
+                    sample_obj.ground_truth,
+                    candidates,
+                    pair,
+                )
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fout.flush()
 
             if train_prompts:
                 batch_size = len(train_prompts)
@@ -1187,25 +1140,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm_dtype", type=str, default="bfloat16")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--rollout_max_model_len", type=int, default=8192)
-    parser.add_argument(
-        "--sample_rejected_requires_final_answer",
-        type=str2bool,
-        default=True,
-        help=(
-            "Pair mining: keep a rejected sample only if its LAST non-empty line is "
-            "'Answer: ...' and the parsed answer is wrong. Truncated/no-final-answer rejected "
-            "samples are dropped."
-        ),
-    )
-    parser.add_argument(
-        "--sample_chosen_requires_final_answer",
-        type=str2bool,
-        default=False,
-        help=(
-            "Pair mining: optionally require chosen sample to also have LAST line "
-            "'Answer: ...'."
-        ),
-    )
 
     # shared chat format
     parser.add_argument(
