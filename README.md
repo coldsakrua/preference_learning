@@ -75,8 +75,15 @@ python train_dapo_preference.py \
   --train_batch_size 2 \
   --gradient_accumulation_steps 8 \
   --beta 0.1 \
-  --length_average true
+  --length_average true \
+  --record_train_samples true
 ```
+
+When `--record_train_samples true`, sampled records are saved to:
+
+- default: `<output_dir>/train_sampled_pairs.jsonl`
+- custom path: `--train_sample_log_path /path/to/sampled.jsonl`
+- optional cap: `--train_sample_log_max_records 100000`
 
 ### 3) Run all stages
 

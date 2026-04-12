@@ -457,6 +457,7 @@ class PreferenceDataset(Dataset):
 
 def collate_batch(batch: List[Dict[str, str]]) -> Dict[str, List[str]]:
     return {
+        "sample_id": [str(item.get("sample_id", "")).strip() for item in batch],
         "prompt": [item["prompt"] for item in batch],
         "system_prompt": [str(item.get("system_prompt", "")).strip() for item in batch],
         "chosen": [item["chosen"] for item in batch],
@@ -541,6 +542,12 @@ def compute_sequence_logps(
     )
 
 
+def resolve_train_sample_log_path(args: argparse.Namespace, output_dir: Path) -> Path:
+    if str(args.train_sample_log_path).strip():
+        return Path(args.train_sample_log_path)
+    return output_dir / "train_sampled_pairs.jsonl"
+
+
 def train_with_preference_loss(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
@@ -605,91 +612,134 @@ def train_with_preference_loss(args: argparse.Namespace) -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    record_train_samples = bool(args.record_train_samples)
+    train_sample_log_path = resolve_train_sample_log_path(args, output_dir)
+    train_sample_log_path.parent.mkdir(parents=True, exist_ok=True)
+    train_sample_log_fout = None
+    logged_records = 0
+    max_log_records = args.train_sample_log_max_records
 
     global_step = 0
     running_loss = 0.0
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    for epoch in range(args.num_epochs):
-        epoch_iterator = tqdm(
-            dataloader,
-            desc=f"train epoch {epoch + 1}/{args.num_epochs}",
-            dynamic_ncols=True,
-        )
-        for step, batch in enumerate(epoch_iterator, start=1):
-            raw_prompts = batch["prompt"]
-            raw_system_prompts = batch["system_prompt"]
-            chosen = batch["chosen"]
-            rejected = batch["rejected"]
+    try:
+        if record_train_samples:
+            train_sample_log_fout = train_sample_log_path.open("w", encoding="utf-8")
 
-            prompt_texts = [
-                apply_qwen_chat_template(
-                    tokenizer,
-                    prompt,
-                    enable_thinking=args.enable_thinking,
-                    system_prompt=choose_system_prompt(
-                        prompt_pool=prompt_pool,
-                        prompt_mode=args.prompt_mode,
-                        prompt_fixed_index=args.prompt_fixed_index,
-                        rng=prompt_rng,
-                        explicit_prompt=record_system_prompt,
-                    ),
-                )
-                for prompt, record_system_prompt in zip(raw_prompts, raw_system_prompts)
-            ]
-
-            all_prompts = prompt_texts + prompt_texts
-            all_completions = chosen + rejected
-            all_logps = compute_sequence_logps(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_texts=all_prompts,
-                completion_texts=all_completions,
-                max_length=args.max_length,
-                device=device,
-                length_average=args.length_average,
+        for epoch in range(args.num_epochs):
+            epoch_iterator = tqdm(
+                dataloader,
+                desc=f"train epoch {epoch + 1}/{args.num_epochs}",
+                dynamic_ncols=True,
             )
+            for step, batch in enumerate(epoch_iterator, start=1):
+                sample_ids = batch["sample_id"]
+                raw_prompts = batch["prompt"]
+                raw_system_prompts = batch["system_prompt"]
+                chosen = batch["chosen"]
+                rejected = batch["rejected"]
 
-            batch_size = len(prompt_texts)
-            chosen_logps = all_logps[:batch_size]
-            rejected_logps = all_logps[batch_size:]
-            preference_gap = chosen_logps - rejected_logps
-            loss = -F.logsigmoid(args.beta * preference_gap).mean()
+                if record_train_samples and train_sample_log_fout is not None:
+                    if max_log_records is None or logged_records < max_log_records:
+                        for idx, (sample_id, raw_prompt, raw_system_prompt, chosen_text, rejected_text) in enumerate(
+                            zip(sample_ids, raw_prompts, raw_system_prompts, chosen, rejected)
+                        ):
+                            if max_log_records is not None and logged_records >= max_log_records:
+                                break
+                            record = {
+                                "epoch": epoch + 1,
+                                "step_in_epoch": step,
+                                "global_optimizer_step": global_step,
+                                "sample_index_in_batch": idx,
+                                "sample_id": sample_id,
+                                "prompt": raw_prompt,
+                                "system_prompt": raw_system_prompt,
+                                "chosen": chosen_text,
+                                "rejected": rejected_text,
+                            }
+                            train_sample_log_fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            logged_records += 1
 
-            scaled_loss = loss / args.gradient_accumulation_steps
-            scaled_loss.backward()
-            running_loss += loss.item()
+                prompt_texts = [
+                    apply_qwen_chat_template(
+                        tokenizer,
+                        prompt,
+                        enable_thinking=args.enable_thinking,
+                        system_prompt=choose_system_prompt(
+                            prompt_pool=prompt_pool,
+                            prompt_mode=args.prompt_mode,
+                            prompt_fixed_index=args.prompt_fixed_index,
+                            rng=prompt_rng,
+                            explicit_prompt=record_system_prompt,
+                        ),
+                    )
+                    for prompt, record_system_prompt in zip(raw_prompts, raw_system_prompts)
+                ]
 
-            should_update = (step % args.gradient_accumulation_steps == 0) or (step == len(dataloader))
-            if should_update:
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-
-                avg_loss = running_loss / max(1, args.gradient_accumulation_steps)
-                epoch_iterator.set_postfix(
-                    loss=f"{avg_loss:.4f}",
-                    gap=f"{preference_gap.mean().item():.4f}",
-                    step=global_step,
+                all_prompts = prompt_texts + prompt_texts
+                all_completions = chosen + rejected
+                all_logps = compute_sequence_logps(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=all_prompts,
+                    completion_texts=all_completions,
+                    max_length=args.max_length,
+                    device=device,
+                    length_average=args.length_average,
                 )
-                running_loss = 0.0
 
-        if args.save_every_epoch:
-            epoch_dir = output_dir / f"checkpoint-epoch-{epoch + 1}"
-            epoch_dir.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(epoch_dir)
-            tokenizer.save_pretrained(epoch_dir)
-            print(f"[train] saved checkpoint to {epoch_dir}")
+                batch_size = len(prompt_texts)
+                chosen_logps = all_logps[:batch_size]
+                rejected_logps = all_logps[batch_size:]
+                preference_gap = chosen_logps - rejected_logps
+                loss = -F.logsigmoid(args.beta * preference_gap).mean()
+
+                scaled_loss = loss / args.gradient_accumulation_steps
+                scaled_loss.backward()
+                running_loss += loss.item()
+
+                should_update = (step % args.gradient_accumulation_steps == 0) or (step == len(dataloader))
+                if should_update:
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                    avg_loss = running_loss / max(1, args.gradient_accumulation_steps)
+                    epoch_iterator.set_postfix(
+                        loss=f"{avg_loss:.4f}",
+                        gap=f"{preference_gap.mean().item():.4f}",
+                        step=global_step,
+                    )
+                    running_loss = 0.0
+
+            if args.save_every_epoch:
+                epoch_dir = output_dir / f"checkpoint-epoch-{epoch + 1}"
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+                model.save_pretrained(epoch_dir)
+                tokenizer.save_pretrained(epoch_dir)
+                print(f"[train] saved checkpoint to {epoch_dir}")
+    finally:
+        if train_sample_log_fout is not None:
+            train_sample_log_fout.close()
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
     print(f"[train] finished. final model saved to {final_dir}")
+    if record_train_samples:
+        suffix = ""
+        if max_log_records is not None:
+            suffix = f" (max={max_log_records})"
+        print(
+            f"[train] sampled training records saved: {logged_records} -> "
+            f"{train_sample_log_path}{suffix}"
+        )
 
 
 def _online_rollout_completions_flat_vllm(
@@ -1141,6 +1191,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_train_pairs", type=int, default=0)
     parser.add_argument("--save_every_epoch", type=str2bool, default=True)
     parser.add_argument(
+        "--record_train_samples",
+        type=str2bool,
+        default=False,
+        help="Train only: save actually sampled training pairs per step to JSONL.",
+    )
+    parser.add_argument(
+        "--train_sample_log_path",
+        type=str,
+        default="",
+        help="Train only: JSONL path for sampled training records. Default: <output_dir>/train_sampled_pairs.jsonl",
+    )
+    parser.add_argument(
+        "--train_sample_log_max_records",
+        type=int,
+        default=0,
+        help="Train only: maximum sampled records to log. Use 0 for no limit.",
+    )
+    parser.add_argument(
         "--online_init_model_path",
         type=str,
         default="",
@@ -1190,6 +1258,8 @@ def main() -> None:
         args.max_source_samples = None
     if args.max_train_pairs == 0:
         args.max_train_pairs = None
+    if args.train_sample_log_max_records == 0:
+        args.train_sample_log_max_records = None
     if args.online_steps == 0:
         args.online_steps = None
 
