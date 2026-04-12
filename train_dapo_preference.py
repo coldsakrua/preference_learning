@@ -231,6 +231,22 @@ def extract_final_answer(text: str) -> str:
     return text
 
 
+def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False, ""
+    last_line = lines[-1]
+    match = re.fullmatch(r"answer\s*:\s*(.+)", last_line, flags=re.IGNORECASE)
+    if not match:
+        return False, ""
+    answer = match.group(1).strip()
+    if not answer:
+        return False, ""
+    return True, answer
+
+
 def normalize_answer(answer: str) -> str:
     answer = answer.strip()
     answer = _BOXED.sub(r"\1", answer)
@@ -268,22 +284,55 @@ def answers_match(predicted_text: str, ground_truth: str) -> bool:
     return False
 
 
+def answer_text_matches(answer_text: str, ground_truth: str) -> bool:
+    predicted = normalize_answer(answer_text)
+    target = normalize_answer(ground_truth)
+    if predicted and predicted == target:
+        return True
+    predicted_num = to_number_if_simple(predicted)
+    target_num = to_number_if_simple(target)
+    if predicted_num is not None and target_num is not None:
+        return abs(predicted_num - target_num) <= 1e-6
+    return False
+
+
 def choose_preference_pair(
     candidates: Sequence[str],
     ground_truth: str,
+    require_rejected_final_answer: bool = True,
+    require_chosen_final_answer: bool = False,
 ) -> Optional[Dict[str, str]]:
     chosen = None
+    chosen_final_answer = ""
     rejected = None
+    rejected_final_answer = ""
     for candidate in candidates:
-        if answers_match(candidate, ground_truth):
+        has_final_line, final_answer = extract_final_answer_if_last_line(candidate)
+        if has_final_line:
+            is_correct = answer_text_matches(final_answer, ground_truth)
+        else:
+            is_correct = answers_match(candidate, ground_truth)
+
+        if is_correct:
+            if require_chosen_final_answer and (not has_final_line):
+                continue
             if chosen is None:
                 chosen = candidate
+                chosen_final_answer = final_answer if has_final_line else ""
         else:
+            if require_rejected_final_answer and (not has_final_line):
+                continue
             if rejected is None:
                 rejected = candidate
+                rejected_final_answer = final_answer if has_final_line else ""
     if chosen is None or rejected is None:
         return None
-    return {"chosen": chosen, "rejected": rejected}
+    return {
+        "chosen": chosen,
+        "rejected": rejected,
+        "chosen_final_answer": chosen_final_answer,
+        "rejected_final_answer": rejected_final_answer,
+    }
 
 
 def generate_preference_pairs(args: argparse.Namespace) -> int:
@@ -364,7 +413,12 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
                 candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                pair = choose_preference_pair(
+                    candidates,
+                    sample_obj.ground_truth,
+                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
+                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
+                )
                 if pair is None:
                     continue
                 record = {
@@ -374,6 +428,8 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
                     "ground_truth": sample_obj.ground_truth,
                     "chosen": pair["chosen"],
                     "rejected": pair["rejected"],
+                    "chosen_final_answer": pair["chosen_final_answer"],
+                    "rejected_final_answer": pair["rejected_final_answer"],
                 }
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 saved_pairs += 1
@@ -407,7 +463,12 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
                 candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                pair = choose_preference_pair(
+                    candidates,
+                    sample_obj.ground_truth,
+                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
+                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
+                )
                 if pair is None:
                     continue
                 record = {
@@ -417,6 +478,8 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
                     "ground_truth": sample_obj.ground_truth,
                     "chosen": pair["chosen"],
                     "rejected": pair["rejected"],
+                    "chosen_final_answer": pair["chosen_final_answer"],
+                    "rejected_final_answer": pair["rejected_final_answer"],
                 }
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 saved_pairs += 1
@@ -974,7 +1037,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             rejected: List[str] = []
             for idx, sample_obj in enumerate(buffer):
                 candidates = completion_flat[2 * idx : 2 * idx + 2]
-                pair = choose_preference_pair(candidates, sample_obj.ground_truth)
+                pair = choose_preference_pair(
+                    candidates,
+                    sample_obj.ground_truth,
+                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
+                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
+                )
                 if pair is None:
                     continue
                 train_prompts.append(prompt_texts[idx])
@@ -987,6 +1055,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     "ground_truth": sample_obj.ground_truth,
                     "chosen": pair["chosen"],
                     "rejected": pair["rejected"],
+                    "chosen_final_answer": pair["chosen_final_answer"],
+                    "rejected_final_answer": pair["rejected_final_answer"],
                 }
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -1117,6 +1187,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm_dtype", type=str, default="bfloat16")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--rollout_max_model_len", type=int, default=8192)
+    parser.add_argument(
+        "--sample_rejected_requires_final_answer",
+        type=str2bool,
+        default=True,
+        help=(
+            "Pair mining: keep a rejected sample only if its LAST non-empty line is "
+            "'Answer: ...' and the parsed answer is wrong. Truncated/no-final-answer rejected "
+            "samples are dropped."
+        ),
+    )
+    parser.add_argument(
+        "--sample_chosen_requires_final_answer",
+        type=str2bool,
+        default=False,
+        help=(
+            "Pair mining: optionally require chosen sample to also have LAST line "
+            "'Answer: ...'."
+        ),
+    )
 
     # shared chat format
     parser.add_argument(

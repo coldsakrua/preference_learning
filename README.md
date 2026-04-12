@@ -42,6 +42,8 @@ Supported arguments:
 - `--prompt_candidates_file config/prompt_candidates_en.txt`
 - `--use_default_prompt_candidates true`
 - `--prompt_fixed_index 0`
+- `--sample_rejected_requires_final_answer true` (default): reject truncated/no-final-answer negatives at sampling time
+- `--sample_chosen_requires_final_answer false` (optional stricter filter)
 
 When generating preference pairs, the selected `system_prompt` is saved into each JSONL row and reused during training.
 
