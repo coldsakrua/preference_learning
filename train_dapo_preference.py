@@ -6,10 +6,9 @@ Online (on-policy) preference training for DAPO math data.
 
 For each rollout step:
   - Use vLLM/HF to sample N responses per prompt (--rollout_n, default 8).
-  - Keep prompts where one response is correct and the other is wrong.
-  - Skip pairs with identical final answers (same-answer dedup).
-  - Apply preference update:
-      L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x)))) + lambda * CE(chosen)
+  - If mixed correct/wrong: use all (correct x wrong) pairs with pairwise mean loss.
+  - If all correct: use full SFT loss on all sampled responses.
+  - If all wrong: skip for now.
 """
 
 from __future__ import annotations
@@ -71,12 +70,33 @@ class DapoSample:
 
 
 @dataclass
-class OnlinePendingPair:
-    """One preference pair queued for immediate rollout-step updates."""
+class OnlinePendingObjective:
+    """One prompt-level objective queued for immediate rollout-step updates."""
 
     train_prompt: str
-    chosen: str
-    rejected: str
+    correct: List[str]
+    wrong: List[str]
+    objective_type: str  # "pref" or "sft"
+    pair_weight: float
+
+
+@dataclass
+class OnlineStepLossStats:
+    total_loss: float
+    pref_loss: float
+    sft_loss: float
+    mean_gap: float
+    pref_pairs_used: int
+    sft_samples_used: int
+
+
+@dataclass
+class RolloutCandidateSplit:
+    responses_has_final_answer_line: List[bool]
+    responses_final_answers: List[str]
+    responses_correct: List[bool]
+    correct_kept: List[str]
+    wrong_kept: List[str]
 
 
 def extract_user_prompt(messages: object) -> str:
@@ -434,6 +454,99 @@ def build_preference_jsonl_record(
         "responses_final_answers": responses_final_answers,
         "responses_has_final_answer_line": responses_has_final_answer_line,
         "responses_correct": [answers_match(c, ground_truth) for c in candidates],
+    }
+
+
+def compute_entropy_rarity_weight(
+    n_correct: int,
+    n_total: int,
+    rarity_floor: float,
+    eps: float,
+) -> tuple[float, float, float, float]:
+    if n_total <= 0:
+        return 0.0, 0.0, rarity_floor, 0.0
+    r = n_correct / n_total
+    entropy = -(r * math.log(r + eps) + (1.0 - r) * math.log(1.0 - r + eps))
+    rarity_bonus = max(1.0 - r, rarity_floor)
+    return r, entropy, rarity_bonus, entropy * rarity_bonus
+
+
+def split_rollout_candidates_for_training(
+    candidates: Sequence[str],
+    ground_truth: str,
+    require_rejected_final_answer: bool,
+    require_chosen_final_answer: bool,
+) -> RolloutCandidateSplit:
+    responses_has_final_answer_line: List[bool] = []
+    responses_final_answers: List[str] = []
+    responses_correct: List[bool] = []
+    correct_kept: List[str] = []
+    wrong_kept: List[str] = []
+    for candidate in candidates:
+        has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
+        parsed_answer = parsed_last_answer if has_final_answer_line else extract_final_answer_robust(candidate)
+        is_correct = answer_text_matches(parsed_answer, ground_truth)
+        responses_has_final_answer_line.append(has_final_answer_line)
+        responses_final_answers.append(parsed_answer)
+        responses_correct.append(is_correct)
+
+        if is_correct:
+            if require_chosen_final_answer and not has_final_answer_line:
+                continue
+            correct_kept.append(str(candidate))
+        else:
+            if require_rejected_final_answer and not has_final_answer_line:
+                continue
+            wrong_kept.append(str(candidate))
+    return RolloutCandidateSplit(
+        responses_has_final_answer_line=responses_has_final_answer_line,
+        responses_final_answers=responses_final_answers,
+        responses_correct=responses_correct,
+        correct_kept=correct_kept,
+        wrong_kept=wrong_kept,
+    )
+
+
+def build_online_objective_jsonl_record(
+    sample_id: str,
+    prompt: str,
+    system_prompt: str,
+    ground_truth: str,
+    candidates: Sequence[str],
+    split: RolloutCandidateSplit,
+    objective_type: str,
+    r: float,
+    entropy: float,
+    rarity_bonus: float,
+    weight: float,
+) -> Dict[str, Any]:
+    chosen_preview = str(split.correct_kept[0]) if split.correct_kept else ""
+    rejected_preview = str(split.wrong_kept[0]) if split.wrong_kept else ""
+    n_correct_total = int(sum(1 for x in split.responses_correct if x))
+    n_total = len(candidates)
+    return {
+        "sample_id": sample_id,
+        "prompt": prompt,
+        "system_prompt": system_prompt,
+        "ground_truth": ground_truth,
+        "chosen": chosen_preview,
+        "rejected": rejected_preview,
+        "responses": [str(c) for c in candidates],
+        "responses_final_answers": [str(a) for a in split.responses_final_answers],
+        "responses_has_final_answer_line": [bool(v) for v in split.responses_has_final_answer_line],
+        "responses_correct": [bool(v) for v in split.responses_correct],
+        "correct_kept": [str(c) for c in split.correct_kept],
+        "wrong_kept": [str(w) for w in split.wrong_kept],
+        "n_total": n_total,
+        "n_correct_total": n_correct_total,
+        "n_wrong_total": n_total - n_correct_total,
+        "n_correct_kept": len(split.correct_kept),
+        "n_wrong_kept": len(split.wrong_kept),
+        "r": float(r),
+        "entropy": float(entropy),
+        "rarity_bonus": float(rarity_bonus),
+        "weight": float(weight),
+        "objective_type": objective_type,
     }
 
 
@@ -1216,68 +1329,271 @@ def filter_pairs_without_truncation(
     return keep_prompts, keep_chosen, keep_rejected, stats
 
 
+@dataclass
+class SftTruncationStats:
+    total_samples: int
+    kept_samples: int
+    dropped_samples: int
+    dropped_prompt_too_long: int
+    dropped_completion_too_long: int
+
+
+def filter_weighted_pairs_without_truncation(
+    tokenizer: object,
+    train_prompts: Sequence[str],
+    chosen: Sequence[str],
+    rejected: Sequence[str],
+    weights: Sequence[float],
+    max_length: int,
+) -> tuple[List[str], List[str], List[str], List[float], PairTruncationStats]:
+    total = len(train_prompts)
+    if total == 0:
+        stats = PairTruncationStats(
+            total_pairs=0,
+            kept_pairs=0,
+            dropped_pairs=0,
+            dropped_prompt_too_long=0,
+            dropped_chosen_too_long=0,
+            dropped_rejected_too_long=0,
+        )
+        return [], [], [], [], stats
+
+    prompt_ids = tokenizer(
+        list(train_prompts),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    chosen_ids = tokenizer(
+        list(chosen),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    rejected_ids = tokenizer(
+        list(rejected),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    keep_prompts: List[str] = []
+    keep_chosen: List[str] = []
+    keep_rejected: List[str] = []
+    keep_weights: List[float] = []
+    dropped_prompt_too_long = 0
+    dropped_chosen_too_long = 0
+    dropped_rejected_too_long = 0
+    for prompt, ch, rj, w, p_ids, ch_ids, rj_ids in zip(
+        train_prompts, chosen, rejected, weights, prompt_ids, chosen_ids, rejected_ids
+    ):
+        budget = max_length - len(p_ids)
+        if budget <= 0:
+            dropped_prompt_too_long += 1
+            continue
+        chosen_ok = len(ch_ids) <= budget
+        rejected_ok = len(rj_ids) <= budget
+        if not chosen_ok:
+            dropped_chosen_too_long += 1
+        if not rejected_ok:
+            dropped_rejected_too_long += 1
+        if not chosen_ok or not rejected_ok:
+            continue
+        keep_prompts.append(str(prompt))
+        keep_chosen.append(str(ch))
+        keep_rejected.append(str(rj))
+        keep_weights.append(float(w))
+    kept = len(keep_prompts)
+    stats = PairTruncationStats(
+        total_pairs=total,
+        kept_pairs=kept,
+        dropped_pairs=total - kept,
+        dropped_prompt_too_long=dropped_prompt_too_long,
+        dropped_chosen_too_long=dropped_chosen_too_long,
+        dropped_rejected_too_long=dropped_rejected_too_long,
+    )
+    return keep_prompts, keep_chosen, keep_rejected, keep_weights, stats
+
+
+def filter_weighted_sft_without_truncation(
+    tokenizer: object,
+    train_prompts: Sequence[str],
+    completions: Sequence[str],
+    weights: Sequence[float],
+    max_length: int,
+) -> tuple[List[str], List[str], List[float], SftTruncationStats]:
+    total = len(train_prompts)
+    if total == 0:
+        stats = SftTruncationStats(
+            total_samples=0,
+            kept_samples=0,
+            dropped_samples=0,
+            dropped_prompt_too_long=0,
+            dropped_completion_too_long=0,
+        )
+        return [], [], [], stats
+
+    prompt_ids = tokenizer(
+        list(train_prompts),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    completion_ids = tokenizer(
+        list(completions),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+
+    keep_prompts: List[str] = []
+    keep_completions: List[str] = []
+    keep_weights: List[float] = []
+    dropped_prompt_too_long = 0
+    dropped_completion_too_long = 0
+    for prompt, completion, w, p_ids, c_ids in zip(
+        train_prompts, completions, weights, prompt_ids, completion_ids
+    ):
+        budget = max_length - len(p_ids)
+        if budget <= 0:
+            dropped_prompt_too_long += 1
+            continue
+        if len(c_ids) > budget:
+            dropped_completion_too_long += 1
+            continue
+        keep_prompts.append(str(prompt))
+        keep_completions.append(str(completion))
+        keep_weights.append(float(w))
+
+    kept = len(keep_prompts)
+    stats = SftTruncationStats(
+        total_samples=total,
+        kept_samples=kept,
+        dropped_samples=total - kept,
+        dropped_prompt_too_long=dropped_prompt_too_long,
+        dropped_completion_too_long=dropped_completion_too_long,
+    )
+    return keep_prompts, keep_completions, keep_weights, stats
+
+
 def _online_run_preference_optimizer_step(
     model: object,
     tokenizer: object,
     optimizer: AdamW,
     device: torch.device,
     args: argparse.Namespace,
-    train_prompts: List[str],
-    chosen: List[str],
-    rejected: List[str],
-) -> tuple[float, float]:
-    """Single optimizer.step() on a batch of preference pairs. Returns (loss, mean_gap)."""
-    batch_size = len(train_prompts)
-    mb = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else batch_size
+    pref_train_prompts: List[str],
+    pref_chosen: List[str],
+    pref_rejected: List[str],
+    pref_weights: List[float],
+    sft_train_prompts: List[str],
+    sft_completions: List[str],
+    sft_weights: List[float],
+) -> OnlineStepLossStats:
+    """Single optimizer.step() on weighted preference and SFT samples."""
+    pref_batch = len(pref_train_prompts)
+    sft_batch = len(sft_train_prompts)
+    total_weight = float(sum(pref_weights) + sum(sft_weights))
+    if total_weight <= 0:
+        return OnlineStepLossStats(
+            total_loss=0.0,
+            pref_loss=0.0,
+            sft_loss=0.0,
+            mean_gap=0.0,
+            pref_pairs_used=0,
+            sft_samples_used=0,
+        )
+    mb_pref = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(pref_batch, 1)
+    mb_sft = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(sft_batch, 1)
 
     optimizer.zero_grad(set_to_none=True)
-    weighted_loss = 0.0
-    total_gap_weighted = 0.0
-    for start in range(0, batch_size, mb):
-        end = min(start + mb, batch_size)
-        tp = train_prompts[start:end]
-        ch = chosen[start:end]
-        rj = rejected[start:end]
-        chosen_logps = _compute_sequence_logps_batch(
-            model,
-            tokenizer,
-            tp,
-            ch,
-            args.max_length,
-            device,
-            args.length_average,
-        )
-        rejected_logps = _compute_sequence_logps_batch(
-            model,
-            tokenizer,
-            tp,
-            rj,
-            args.max_length,
-            device,
-            args.length_average,
-        )
-        preference_gap = chosen_logps - rejected_logps
-        pref_loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
-        chosen_ce_loss_c = (-chosen_logps).mean()
-        loss_c = pref_loss_c + args.chosen_ce_weight * chosen_ce_loss_c
-        if not loss_c.requires_grad:
-            raise RuntimeError(
-                "Online preference loss has no grad_fn. "
-                "If use_lora=true with gradient_checkpointing=true, "
-                "ensure input grads are enabled for checkpointing."
+    pref_loss_weighted_sum = 0.0
+    sft_loss_weighted_sum = 0.0
+    gap_weighted_sum = 0.0
+    pref_weight_sum = 0.0
+
+    if pref_batch > 0:
+        for start in range(0, pref_batch, mb_pref):
+            end = min(start + mb_pref, pref_batch)
+            tp = pref_train_prompts[start:end]
+            ch = pref_chosen[start:end]
+            rj = pref_rejected[start:end]
+            w = torch.tensor(pref_weights[start:end], device=device, dtype=torch.float32)
+            chosen_logps = _compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                tp,
+                ch,
+                args.max_length,
+                device,
+                args.length_average,
             )
-        scale = (end - start) / batch_size
-        (loss_c * scale).backward()
-        weighted_loss += loss_c.item() * scale
-        total_gap_weighted += preference_gap.sum().item()
+            rejected_logps = _compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                tp,
+                rj,
+                args.max_length,
+                device,
+                args.length_average,
+            )
+            preference_gap = chosen_logps - rejected_logps
+            pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
+            loss_chunk = (pref_loss_vec * w).sum() / total_weight
+            if not loss_chunk.requires_grad:
+                raise RuntimeError(
+                    "Online preference loss has no grad_fn. "
+                    "If use_lora=true with gradient_checkpointing=true, "
+                    "ensure input grads are enabled for checkpointing."
+                )
+            loss_chunk.backward()
+            pref_loss_weighted_sum += (pref_loss_vec * w).sum().item()
+            gap_weighted_sum += (preference_gap * w).sum().item()
+            pref_weight_sum += w.sum().item()
+
+    if sft_batch > 0:
+        for start in range(0, sft_batch, mb_sft):
+            end = min(start + mb_sft, sft_batch)
+            tp = sft_train_prompts[start:end]
+            cp = sft_completions[start:end]
+            w = torch.tensor(sft_weights[start:end], device=device, dtype=torch.float32)
+            logps = _compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                tp,
+                cp,
+                args.max_length,
+                device,
+                args.length_average,
+            )
+            sft_loss_vec = -logps
+            loss_chunk = (sft_loss_vec * w).sum() / total_weight
+            if not loss_chunk.requires_grad:
+                raise RuntimeError(
+                    "Online SFT loss has no grad_fn. "
+                    "If use_lora=true with gradient_checkpointing=true, "
+                    "ensure input grads are enabled for checkpointing."
+                )
+            loss_chunk.backward()
+            sft_loss_weighted_sum += (sft_loss_vec * w).sum().item()
 
     if args.max_grad_norm > 0:
         trainable = [p for p in model.parameters() if p.requires_grad]
         torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
     optimizer.step()
 
-    mean_gap = total_gap_weighted / batch_size
-    return weighted_loss, mean_gap
+    mean_gap = gap_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
+    pref_loss = pref_loss_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
+    sft_weight_sum = float(sum(sft_weights))
+    sft_loss = sft_loss_weighted_sum / sft_weight_sum if sft_weight_sum > 0 else 0.0
+    total_loss = (pref_loss_weighted_sum + sft_loss_weighted_sum) / total_weight
+    return OnlineStepLossStats(
+        total_loss=total_loss,
+        pref_loss=pref_loss,
+        sft_loss=sft_loss,
+        mean_gap=mean_gap,
+        pref_pairs_used=pref_batch,
+        sft_samples_used=sft_batch,
+    )
 
 
 def run_online_preference_training(args: argparse.Namespace) -> None:
@@ -1350,8 +1666,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     updates = 0
     rollout_steps = 0
     scanned = 0
-    kept_pairs = 0
-    same_answer_skipped = 0
+    kept_pref_pairs = 0
+    kept_sft_samples = 0
+    skipped_all_wrong = 0
+    skipped_mixed_after_filter = 0
+    logged_pref_objectives = 0
+    logged_sft_objectives = 0
     buffer: List[DapoSample] = []
     k = args.online_pairs_per_step
 
@@ -1362,12 +1682,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"({args.rollout_n} samples per prompt via n={args.rollout_n}), "
         f"online_pairs_per_step={k} (chunk size within one rollout step; no cross-step cache), "
         f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}, "
-        f"vllm_enforce_eager={args.online_vllm_enforce_eager}"
+        f"vllm_enforce_eager={args.online_vllm_enforce_eager}, "
+        f"rarity_floor={args.pref_weight_rarity_floor}"
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
 
-    # Persist sampled pairs immediately so online_pairs.jsonl is visible while the job runs.
+    # Persist sampled objectives immediately so online_pairs.jsonl is visible while the job runs.
     with online_pairs_path.open("w", encoding="utf-8", buffering=1) as fout:
         for sample in source_iter:
             buffer.append(sample)
@@ -1417,9 +1738,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
             model.train()
 
-            new_pairs_in_rollout = 0
-            same_answer_skipped_in_rollout = 0
-            rollout_pairs: List[OnlinePendingPair] = []
+            rollout_objectives: List[OnlinePendingObjective] = []
+            pref_objectives_in_rollout = 0
+            sft_objectives_in_rollout = 0
+            skipped_all_wrong_in_rollout = 0
+            skipped_mixed_after_filter_in_rollout = 0
             for idx, sample_obj in enumerate(buffer):
                 start = idx * args.rollout_n
                 end = start + args.rollout_n
@@ -1429,91 +1752,204 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         f"Rollout candidate count mismatch at sample {idx}: "
                         f"expected {args.rollout_n}, got {len(candidates)}"
                     )
-                pair = choose_preference_pair(
+
+                split = split_rollout_candidates_for_training(
                     candidates,
                     sample_obj.ground_truth,
                     require_rejected_final_answer=args.sample_rejected_requires_final_answer,
                     require_chosen_final_answer=args.sample_chosen_requires_final_answer,
                 )
-                if pair is None:
-                    if candidates_share_same_final_answer(candidates):
-                        same_answer_skipped += 1
-                        same_answer_skipped_in_rollout += 1
-                    continue
-                record = build_preference_jsonl_record(
-                    sample_obj.sample_id,
-                    sample_obj.prompt,
-                    system_prompts[idx],
-                    sample_obj.ground_truth,
-                    candidates,
-                    pair,
+                n_total = len(candidates)
+                n_correct_total = sum(1 for x in split.responses_correct if x)
+                r, entropy, rarity_bonus, weight = compute_entropy_rarity_weight(
+                    n_correct=n_correct_total,
+                    n_total=n_total,
+                    rarity_floor=args.pref_weight_rarity_floor,
+                    eps=args.pref_weight_eps,
                 )
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                rollout_pairs.append(
-                    OnlinePendingPair(
-                        train_prompt=prompt_texts[idx],
-                        chosen=pair["chosen"],
-                        rejected=pair["rejected"],
+
+                objective_type = "skip"
+                if n_correct_total == 0:
+                    skipped_all_wrong += 1
+                    skipped_all_wrong_in_rollout += 1
+                elif n_correct_total == n_total:
+                    if split.correct_kept:
+                        objective_type = "sft"
+                        rollout_objectives.append(
+                            OnlinePendingObjective(
+                                train_prompt=prompt_texts[idx],
+                                correct=split.correct_kept,
+                                wrong=[],
+                                objective_type=objective_type,
+                                pair_weight=args.full_correct_sft_weight,
+                            )
+                        )
+                        sft_objectives_in_rollout += 1
+                        logged_sft_objectives += 1
+                    else:
+                        skipped_mixed_after_filter += 1
+                        skipped_mixed_after_filter_in_rollout += 1
+                elif split.correct_kept and split.wrong_kept:
+                    objective_type = "pref"
+                    rollout_objectives.append(
+                        OnlinePendingObjective(
+                            train_prompt=prompt_texts[idx],
+                            correct=split.correct_kept,
+                            wrong=split.wrong_kept,
+                            objective_type=objective_type,
+                            pair_weight=weight,
+                        )
                     )
-                )
-                new_pairs_in_rollout += 1
-            if new_pairs_in_rollout > 0:
+                    pref_objectives_in_rollout += 1
+                    logged_pref_objectives += 1
+                else:
+                    skipped_mixed_after_filter += 1
+                    skipped_mixed_after_filter_in_rollout += 1
+
+                if objective_type != "skip":
+                    record = build_online_objective_jsonl_record(
+                        sample_id=sample_obj.sample_id,
+                        prompt=sample_obj.prompt,
+                        system_prompt=system_prompts[idx],
+                        ground_truth=sample_obj.ground_truth,
+                        candidates=candidates,
+                        split=split,
+                        objective_type=objective_type,
+                        r=r,
+                        entropy=entropy,
+                        rarity_bonus=rarity_bonus,
+                        weight=(args.full_correct_sft_weight if objective_type == "sft" else weight),
+                    )
+                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            if rollout_objectives:
                 fout.flush()
 
             print(
                 f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
-                f"new_pairs_in_rollout={new_pairs_in_rollout} "
-                f"same_answer_skipped_in_rollout={same_answer_skipped_in_rollout} "
-                f"pairs_ready_for_update={len(rollout_pairs)}"
+                f"pref_objectives_in_rollout={pref_objectives_in_rollout} "
+                f"sft_objectives_in_rollout={sft_objectives_in_rollout} "
+                f"skipped_all_wrong_in_rollout={skipped_all_wrong_in_rollout} "
+                f"skipped_after_filter_in_rollout={skipped_mixed_after_filter_in_rollout} "
+                f"objectives_ready_for_update={len(rollout_objectives)}"
             )
 
             updates_in_rollout = 0
-            consumed_in_rollout = 0
-            dropped_by_truncation_in_rollout = 0
-            if rollout_pairs:
-                for chunk_start in range(0, len(rollout_pairs), k):
-                    chunk = rollout_pairs[chunk_start : chunk_start + k]
-                    train_prompts_raw = [p.train_prompt for p in chunk]
-                    chosen_raw = [p.chosen for p in chunk]
-                    rejected_raw = [p.rejected for p in chunk]
-                    train_prompts, chosen_list, rejected_list, trunc_stats = filter_pairs_without_truncation(
+            consumed_pref_pairs_in_rollout = 0
+            consumed_sft_samples_in_rollout = 0
+            dropped_pref_pairs_by_truncation_in_rollout = 0
+            dropped_sft_by_truncation_in_rollout = 0
+            if rollout_objectives:
+                for chunk_start in range(0, len(rollout_objectives), k):
+                    chunk = rollout_objectives[chunk_start : chunk_start + k]
+                    pref_train_prompts_raw: List[str] = []
+                    pref_chosen_raw: List[str] = []
+                    pref_rejected_raw: List[str] = []
+                    pref_weights_raw: List[float] = []
+                    sft_train_prompts_raw: List[str] = []
+                    sft_completions_raw: List[str] = []
+                    sft_weights_raw: List[float] = []
+
+                    for objective in chunk:
+                        if objective.objective_type == "pref":
+                            pair_count = len(objective.correct) * len(objective.wrong)
+                            if pair_count <= 0:
+                                continue
+                            pair_weight = objective.pair_weight / pair_count
+                            for c in objective.correct:
+                                for w in objective.wrong:
+                                    pref_train_prompts_raw.append(objective.train_prompt)
+                                    pref_chosen_raw.append(c)
+                                    pref_rejected_raw.append(w)
+                                    pref_weights_raw.append(pair_weight)
+                        elif objective.objective_type == "sft":
+                            sample_count = len(objective.correct)
+                            if sample_count <= 0:
+                                continue
+                            sample_weight = objective.pair_weight / sample_count
+                            for c in objective.correct:
+                                sft_train_prompts_raw.append(objective.train_prompt)
+                                sft_completions_raw.append(c)
+                                sft_weights_raw.append(sample_weight)
+
+                    (
+                        pref_train_prompts,
+                        pref_chosen,
+                        pref_rejected,
+                        pref_weights,
+                        pref_trunc_stats,
+                    ) = filter_weighted_pairs_without_truncation(
                         tokenizer=tokenizer,
-                        train_prompts=train_prompts_raw,
-                        chosen=chosen_raw,
-                        rejected=rejected_raw,
+                        train_prompts=pref_train_prompts_raw,
+                        chosen=pref_chosen_raw,
+                        rejected=pref_rejected_raw,
+                        weights=pref_weights_raw,
                         max_length=args.max_length,
                     )
-                    dropped_by_truncation_in_rollout += trunc_stats.dropped_pairs
-                    if trunc_stats.dropped_pairs > 0:
+                    dropped_pref_pairs_by_truncation_in_rollout += pref_trunc_stats.dropped_pairs
+                    if pref_trunc_stats.dropped_pairs > 0:
                         print(
                             f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                            f"truncation_filter dropped_pairs={trunc_stats.dropped_pairs}/{trunc_stats.total_pairs} "
-                            f"(prompt_too_long={trunc_stats.dropped_prompt_too_long}, "
-                            f"chosen_too_long={trunc_stats.dropped_chosen_too_long}, "
-                            f"rejected_too_long={trunc_stats.dropped_rejected_too_long})"
+                            f"truncation_filter_pref dropped_pairs={pref_trunc_stats.dropped_pairs}/{pref_trunc_stats.total_pairs} "
+                            f"(prompt_too_long={pref_trunc_stats.dropped_prompt_too_long}, "
+                            f"chosen_too_long={pref_trunc_stats.dropped_chosen_too_long}, "
+                            f"rejected_too_long={pref_trunc_stats.dropped_rejected_too_long})"
                         )
-                    if not train_prompts:
+
+                    (
+                        sft_train_prompts,
+                        sft_completions,
+                        sft_weights,
+                        sft_trunc_stats,
+                    ) = filter_weighted_sft_without_truncation(
+                        tokenizer=tokenizer,
+                        train_prompts=sft_train_prompts_raw,
+                        completions=sft_completions_raw,
+                        weights=sft_weights_raw,
+                        max_length=args.max_length,
+                    )
+                    dropped_sft_by_truncation_in_rollout += sft_trunc_stats.dropped_samples
+                    if sft_trunc_stats.dropped_samples > 0:
+                        print(
+                            f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                            f"truncation_filter_sft dropped_samples={sft_trunc_stats.dropped_samples}/{sft_trunc_stats.total_samples} "
+                            f"(prompt_too_long={sft_trunc_stats.dropped_prompt_too_long}, "
+                            f"completion_too_long={sft_trunc_stats.dropped_completion_too_long})"
+                        )
+
+                    if not pref_train_prompts and not sft_train_prompts:
+                        continue
+                    if (sum(pref_weights) + sum(sft_weights)) <= 0:
                         continue
 
-                    weighted_loss, mean_gap = _online_run_preference_optimizer_step(
-                        model,
-                        tokenizer,
-                        optimizer,
-                        device,
-                        args,
-                        train_prompts,
-                        chosen_list,
-                        rejected_list,
+                    loss_stats = _online_run_preference_optimizer_step(
+                        model=model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        device=device,
+                        args=args,
+                        pref_train_prompts=pref_train_prompts,
+                        pref_chosen=pref_chosen,
+                        pref_rejected=pref_rejected,
+                        pref_weights=pref_weights,
+                        sft_train_prompts=sft_train_prompts,
+                        sft_completions=sft_completions,
+                        sft_weights=sft_weights,
                     )
                     updates += 1
                     updates_in_rollout += 1
-                    used_pairs = len(train_prompts)
-                    consumed_in_rollout += used_pairs
-                    kept_pairs += used_pairs
+                    consumed_pref_pairs_in_rollout += loss_stats.pref_pairs_used
+                    consumed_sft_samples_in_rollout += loss_stats.sft_samples_used
+                    kept_pref_pairs += loss_stats.pref_pairs_used
+                    kept_sft_samples += loss_stats.sft_samples_used
                     print(
                         f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                        f"optimizer_step={updates} consumed_pairs={used_pairs} "
-                        f"loss={weighted_loss:.4f} gap={mean_gap:.4f}"
+                        f"optimizer_step={updates} pref_pairs={loss_stats.pref_pairs_used} "
+                        f"sft_samples={loss_stats.sft_samples_used} "
+                        f"loss={loss_stats.total_loss:.4f} "
+                        f"pref_loss={loss_stats.pref_loss:.4f} "
+                        f"sft_loss={loss_stats.sft_loss:.4f} "
+                        f"gap={loss_stats.mean_gap:.4f}"
                     )
 
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
@@ -1523,17 +1959,19 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         tokenizer.save_pretrained(ckpt_dir)
                         print(f"[online] saved checkpoint to {ckpt_dir}")
 
-            if rollout_pairs and updates_in_rollout == 0:
+            if rollout_objectives and updates_in_rollout == 0:
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    "no optimizer update (all rollout pairs filtered out)"
+                    "no optimizer update (all mixed/sft samples filtered out)"
                 )
-            elif rollout_pairs:
+            elif rollout_objectives:
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
                     f"updates_in_rollout={updates_in_rollout} "
-                    f"consumed_pairs_in_rollout={consumed_in_rollout} "
-                    f"dropped_by_truncation_in_rollout={dropped_by_truncation_in_rollout}"
+                    f"consumed_pref_pairs_in_rollout={consumed_pref_pairs_in_rollout} "
+                    f"consumed_sft_samples_in_rollout={consumed_sft_samples_in_rollout} "
+                    f"dropped_pref_pairs_by_truncation_in_rollout={dropped_pref_pairs_by_truncation_in_rollout} "
+                    f"dropped_sft_by_truncation_in_rollout={dropped_sft_by_truncation_in_rollout}"
                 )
 
             buffer = []
@@ -1549,9 +1987,10 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     tokenizer.save_pretrained(final_dir)
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
-        f"scanned={scanned}, kept_pairs={kept_pairs}, "
-        f"same_answer_skipped={same_answer_skipped}, "
-        f"pairs_log={online_pairs_path}, final_model={final_dir}"
+        f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, kept_sft_samples={kept_sft_samples}, "
+        f"logged_pref_objectives={logged_pref_objectives}, logged_sft_objectives={logged_sft_objectives}, "
+        f"skipped_all_wrong={skipped_all_wrong}, skipped_after_filter={skipped_mixed_after_filter}, "
+        f"objectives_log={online_pairs_path}, final_model={final_dir}"
     )
 
 
@@ -1581,7 +2020,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max_source_samples",
         type=int,
         default=17000,
-        help="Maximum source prompts scanned for pair mining.",
+        help="Maximum source prompts scanned for online objective mining.",
     )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -1589,7 +2028,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rollout_n",
         type=int,
         default=8,
-        help="Number of sampled responses per prompt during rollout; one correct/one wrong are selected into a pair.",
+        help="Number of sampled responses per prompt during rollout.",
     )
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
@@ -1667,9 +2106,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.02,
         help=(
-            "Additive anchor term on chosen responses: "
-            "total_loss = pref_loss + chosen_ce_weight * CE(chosen). Use 0 to disable."
+            "Deprecated compatibility flag (kept for old run scripts). "
+            "The online objective now uses weighted all-pairs preference + full-correct SFT."
         ),
+    )
+    parser.add_argument(
+        "--pref_weight_rarity_floor",
+        type=float,
+        default=0.25,
+        help="Rarity floor alpha in weight = entropy(r) * max(1-r, alpha) for mixed (correct/wrong) prompts.",
+    )
+    parser.add_argument(
+        "--pref_weight_eps",
+        type=float,
+        default=1e-6,
+        help="Numerical epsilon used in entropy(r) for mixed-prompt weighting.",
+    )
+    parser.add_argument(
+        "--full_correct_sft_weight",
+        type=float,
+        default=1.0,
+        help="Per-prompt objective weight used when all rollout samples are correct (full SFT branch).",
     )
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument(
@@ -1721,8 +2178,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Online only: number of rollout batches to run. Each batch rolls out "
-            "rollout_batch_size prompts with --rollout_n samples each; valid pairs are "
-            "consumed immediately in this rollout step (no cross-step cache). "
+            "rollout_batch_size prompts with --rollout_n samples each; prompt-level "
+            "objectives (weighted mixed all-pairs + full-correct SFT) are consumed "
+            "immediately in this rollout step (no cross-step cache). "
             "Use 0 for no limit (until source samples exhausted)."
         ),
     )
@@ -1732,8 +2190,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=16,
         dest="online_pairs_per_step",
         help=(
-            "Online only: chunk size for optimizer updates inside one rollout step. "
-            "If a rollout yields fewer pairs, it still updates once with all available pairs."
+            "Online only: number of prompt-level objectives per optimizer chunk inside one rollout step. "
+            "If a rollout yields fewer objectives, it still updates once with all available objectives."
         ),
     )
     parser.add_argument(
@@ -1782,6 +2240,12 @@ def main() -> None:
         raise SystemExit("error: --online-pairs-per-step must be >= 1")
     if args.rollout_n < 2:
         raise SystemExit("error: --rollout_n must be >= 2")
+    if args.pref_weight_rarity_floor < 0:
+        raise SystemExit("error: --pref_weight_rarity_floor must be >= 0")
+    if args.pref_weight_eps <= 0:
+        raise SystemExit("error: --pref_weight_eps must be > 0")
+    if args.full_correct_sft_weight < 0:
+        raise SystemExit("error: --full_correct_sft_weight must be >= 0")
     run_online_preference_training(args)
 
 

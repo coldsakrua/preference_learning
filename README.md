@@ -3,17 +3,25 @@
 This repository now uses an online-only (on-policy) training pipeline:
 
 1. Rollout with `vLLM` (`n=8` per sample by default, via `--rollout_n`) on current policy.
-2. From rollout candidates, keep samples with one correct and one wrong answer as a preference pair.
-3. Skip pairs where two rollouts share the same normalized final answer.
-4. Update current policy immediately in the same rollout step (no cross-step pair cache) with:
+2. For each prompt:
+   - Mixed correct/wrong rollouts: use all `n_correct x n_wrong` pairs (pairwise loss is mean over all pairs).
+   - All rollout samples correct: use full SFT on all sampled responses.
+   - All rollout samples wrong: skip for now.
+3. For mixed prompts, use entropy-rarity weighting:
 
 ```text
-L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x)))) + lambda * CE(chosen)
+r = n_correct / n_total
+entropy = -r*log(r+eps) - (1-r)*log(1-r+eps)
+weight = entropy * max(1-r, alpha)
 ```
 
-Default `lambda` is `0.02` (`--chosen_ce_weight 0.02`).
+with `alpha` controlled by `--pref_weight_rarity_floor` (default `0.25`), and `eps` by
+`--pref_weight_eps` (default `1e-6`).
+
+4. Update current policy immediately in the same rollout step (no cross-step cache).
+
 Length-normalized log-prob is supported (`--length_average true`).
-Pairs that would be truncated by `--max_length` during log-prob computation are dropped and reported in logs.
+Preference pairs / SFT samples that would be truncated by `--max_length` during log-prob computation are dropped and reported in logs.
 
 Main script: `train_dapo_preference.py`
 
@@ -48,7 +56,8 @@ Supported arguments:
 - `--prompt_fixed_index 0`
 - `--sample_rejected_requires_final_answer true` (default): reject truncated/no-final-answer negatives at sampling time
 - `--sample_chosen_requires_final_answer false` (optional stricter filter)
-- Same-answer dedup is enabled in sampling: if two rollouts have the same normalized final answer, the pair is skipped.
+- `--pref_weight_rarity_floor 0.25`: rarity bonus floor in entropy-rarity weighting
+- `--full_correct_sft_weight 1.0`: per-prompt objective weight for the all-correct SFT branch
 
 Answer parsing in sampling is robust to markdown variants, for example:
 
@@ -79,7 +88,8 @@ python train_dapo_preference.py \
   --max_new_tokens 8192 \
   --max_length 8192 \
   --beta 0.1 \
-  --chosen_ce_weight 0.02 \
+  --pref_weight_rarity_floor 0.25 \
+  --full_correct_sft_weight 1.0 \
   --prompt_mode random \
   --prompt_candidates_file config/prompt_candidates_en.txt
 ```
