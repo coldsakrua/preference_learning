@@ -2,10 +2,10 @@
 
 This repository now uses an online-only (on-policy) training pipeline:
 
-1. Rollout with `vLLM` (`n=2` per sample) on current policy.
-2. Keep samples with exactly one correct and one wrong answer.
+1. Rollout with `vLLM` (`n=8` per sample by default, via `--rollout_n`) on current policy.
+2. From rollout candidates, keep samples with one correct and one wrong answer as a preference pair.
 3. Skip pairs where two rollouts share the same normalized final answer.
-4. Update current policy immediately with:
+4. Update current policy immediately in the same rollout step (no cross-step pair cache) with:
 
 ```text
 L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x)))) + lambda * CE(chosen)
@@ -13,6 +13,7 @@ L = -log(sigmoid(beta * (logpi(y+|x) - logpi(y-|x)))) + lambda * CE(chosen)
 
 Default `lambda` is `0.02` (`--chosen_ce_weight 0.02`).
 Length-normalized log-prob is supported (`--length_average true`).
+Pairs that would be truncated by `--max_length` during log-prob computation are dropped and reported in logs.
 
 Main script: `train_dapo_preference.py`
 
@@ -70,11 +71,13 @@ python train_dapo_preference.py \
   --max_source_samples 17000 \
   --online_steps 30 \
   --rollout_batch_size 256 \
+  --rollout_n 8 \
   --online-pairs-per-step 32 \
   --tensor_parallel_size 1 \
   --temperature 0.6 \
   --top_p 0.95 \
   --max_new_tokens 8192 \
+  --max_length 8192 \
   --beta 0.1 \
   --chosen_ce_weight 0.02 \
   --prompt_mode random \
@@ -85,7 +88,8 @@ python train_dapo_preference.py \
 
 Use this ready-to-run example:
 
-- `run_dapo_pref_qwen3_4b_1gpu.sh`
+- `run_dapo_pref_qwen3_4b.sh`
+- `run_dapo_pref_qwen3_1b.sh`
 
 It runs online rollout + preference updates and writes outputs under
 `outputs/dapo_pref_4b_1gpu/<timestamp>_job<id>/`.

@@ -5,7 +5,7 @@
 Online (on-policy) preference training for DAPO math data.
 
 For each rollout step:
-  - Use vLLM/HF to sample 2 responses per prompt.
+  - Use vLLM/HF to sample N responses per prompt (--rollout_n, default 8).
   - Keep prompts where one response is correct and the other is wrong.
   - Skip pairs with identical final answers (same-answer dedup).
   - Apply preference update:
@@ -72,7 +72,7 @@ class DapoSample:
 
 @dataclass
 class OnlinePendingPair:
-    """One preference pair queued for a fixed-size online optimizer step."""
+    """One preference pair queued for immediate rollout-step updates."""
 
     train_prompt: str
     chosen: str
@@ -218,8 +218,8 @@ def apply_qwen_chat_template(
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-_ANSWER_LINE = re.compile(r"answer\s*[:：]\s*(.+)", flags=re.IGNORECASE)
-_ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:：]\s*(.+?)\s*$", flags=re.IGNORECASE)
+_ANSWER_LINE = re.compile(r"answer\s*[:\uFF1A]\s*(.+)", flags=re.IGNORECASE)
+_ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
 _BOXED = re.compile(r"\\boxed\{([^{}]+)\}")
 _LATEX_FRAC = re.compile(r"\\frac\{(-?\d+)\}\{(-?\d+)\}")
 
@@ -418,7 +418,7 @@ def build_preference_jsonl_record(
     candidates: Sequence[str],
     pair: Dict[str, str],
 ) -> Dict[str, Any]:
-    """JSONL row: chosen/rejected plus both raw rollouts in order (n=2) and per-rollout correctness."""
+    """JSONL row: chosen/rejected plus raw rollouts (n=rollout_n) and per-rollout correctness."""
     responses_final_answers = [extract_final_answer_robust(c) for c in candidates]
     responses_has_final_answer_line = [extract_final_answer_if_last_line(c)[0] for c in candidates]
     return {
@@ -456,7 +456,7 @@ def generate_preference_pairs(args: argparse.Namespace) -> int:
         max_model_len=args.rollout_max_model_len,
     )
     sampling_params = SamplingParams(
-        n=2,
+        n=args.rollout_n,
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_new_tokens,
@@ -930,6 +930,36 @@ def wrap_model_with_lora(model: Any, args: argparse.Namespace) -> Any:
     return get_peft_model(model, lora_config)
 
 
+def ensure_input_require_grads_for_checkpointing(model: Any) -> None:
+    """
+    Make input embeddings require grad when gradient checkpointing is enabled.
+    This is required for PEFT/LoRA; otherwise autograd can see no grad_fn.
+    """
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+        return
+
+    if not hasattr(model, "get_input_embeddings"):
+        return
+    embeddings = model.get_input_embeddings()
+    if embeddings is None:
+        return
+    if getattr(model, "_pref_input_require_grads_hook", None) is not None:
+        return
+
+    def _make_inputs_require_grad(_module: Any, _inputs: Any, output: Any) -> Any:
+        if isinstance(output, torch.Tensor):
+            output.requires_grad_(True)
+        elif isinstance(output, tuple):
+            for item in output:
+                if isinstance(item, torch.Tensor):
+                    item.requires_grad_(True)
+        return output
+
+    hook = embeddings.register_forward_hook(_make_inputs_require_grad)
+    setattr(model, "_pref_input_require_grads_hook", hook)
+
+
 def _online_rollout_completions_flat_vllm(
     args: argparse.Namespace,
     *,
@@ -976,6 +1006,7 @@ def _online_rollout_completions_flat_vllm(
             "dtype": args.vllm_dtype,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_model_len": args.rollout_max_model_len,
+            "enforce_eager": args.online_vllm_enforce_eager,
             "enable_lora": True,
             "max_lora_rank": args.vllm_max_lora_rank,
             "max_loras": 1,
@@ -998,6 +1029,7 @@ def _online_rollout_completions_flat_vllm(
             "dtype": args.vllm_dtype,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_model_len": args.rollout_max_model_len,
+            "enforce_eager": args.online_vllm_enforce_eager,
         }
     else:
         ckpt = init_model_path
@@ -1013,6 +1045,7 @@ def _online_rollout_completions_flat_vllm(
             "dtype": args.vllm_dtype,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_model_len": args.rollout_max_model_len,
+            "enforce_eager": args.online_vllm_enforce_eager,
         }
 
     model.eval()
@@ -1023,7 +1056,7 @@ def _online_rollout_completions_flat_vllm(
 
     llm = LLM(**llm_kw)
     sampling_params = SamplingParams(
-        n=2,
+        n=args.rollout_n,
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_new_tokens,
@@ -1074,8 +1107,8 @@ def _online_rollout_completions_flat_hf(
         )
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded["attention_mask"].to(device)
-        expanded_input_ids = input_ids.repeat_interleave(2, dim=0)
-        expanded_attention_mask = attention_mask.repeat_interleave(2, dim=0)
+        expanded_input_ids = input_ids.repeat_interleave(args.rollout_n, dim=0)
+        expanded_attention_mask = attention_mask.repeat_interleave(args.rollout_n, dim=0)
         generated = model.generate(
             input_ids=expanded_input_ids,
             attention_mask=expanded_attention_mask,
@@ -1092,6 +1125,95 @@ def _online_rollout_completions_flat_hf(
         completion_ids = generated[i, int(prompt_len) :]
         out.append(tokenizer.decode(completion_ids, skip_special_tokens=True))
     return out
+
+
+@dataclass
+class PairTruncationStats:
+    total_pairs: int
+    kept_pairs: int
+    dropped_pairs: int
+    dropped_prompt_too_long: int
+    dropped_chosen_too_long: int
+    dropped_rejected_too_long: int
+
+
+def filter_pairs_without_truncation(
+    tokenizer: object,
+    train_prompts: Sequence[str],
+    chosen: Sequence[str],
+    rejected: Sequence[str],
+    max_length: int,
+) -> tuple[List[str], List[str], List[str], PairTruncationStats]:
+    """Drop pairs that would be truncated by max_length in log-prob computation."""
+    total = len(train_prompts)
+    if total == 0:
+        stats = PairTruncationStats(
+            total_pairs=0,
+            kept_pairs=0,
+            dropped_pairs=0,
+            dropped_prompt_too_long=0,
+            dropped_chosen_too_long=0,
+            dropped_rejected_too_long=0,
+        )
+        return [], [], [], stats
+
+    prompt_ids = tokenizer(
+        list(train_prompts),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    chosen_ids = tokenizer(
+        list(chosen),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    rejected_ids = tokenizer(
+        list(rejected),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+
+    keep_prompts: List[str] = []
+    keep_chosen: List[str] = []
+    keep_rejected: List[str] = []
+    dropped_prompt_too_long = 0
+    dropped_chosen_too_long = 0
+    dropped_rejected_too_long = 0
+
+    for prompt, ch, rj, p_ids, ch_ids, rj_ids in zip(
+        train_prompts, chosen, rejected, prompt_ids, chosen_ids, rejected_ids
+    ):
+        prompt_len = len(p_ids)
+        budget = max_length - prompt_len
+        if budget <= 0:
+            dropped_prompt_too_long += 1
+            continue
+        chosen_ok = len(ch_ids) <= budget
+        rejected_ok = len(rj_ids) <= budget
+        if not chosen_ok:
+            dropped_chosen_too_long += 1
+        if not rejected_ok:
+            dropped_rejected_too_long += 1
+        if not chosen_ok or not rejected_ok:
+            continue
+        keep_prompts.append(str(prompt))
+        keep_chosen.append(str(ch))
+        keep_rejected.append(str(rj))
+
+    kept = len(keep_prompts)
+    dropped = total - kept
+    stats = PairTruncationStats(
+        total_pairs=total,
+        kept_pairs=kept,
+        dropped_pairs=dropped,
+        dropped_prompt_too_long=dropped_prompt_too_long,
+        dropped_chosen_too_long=dropped_chosen_too_long,
+        dropped_rejected_too_long=dropped_rejected_too_long,
+    )
+    return keep_prompts, keep_chosen, keep_rejected, stats
 
 
 def _online_run_preference_optimizer_step(
@@ -1138,6 +1260,12 @@ def _online_run_preference_optimizer_step(
         pref_loss_c = -F.logsigmoid(args.beta * preference_gap).mean()
         chosen_ce_loss_c = (-chosen_logps).mean()
         loss_c = pref_loss_c + args.chosen_ce_weight * chosen_ce_loss_c
+        if not loss_c.requires_grad:
+            raise RuntimeError(
+                "Online preference loss has no grad_fn. "
+                "If use_lora=true with gradient_checkpointing=true, "
+                "ensure input grads are enabled for checkpointing."
+            )
         scale = (end - start) / batch_size
         (loss_c * scale).backward()
         weighted_loss += loss_c.item() * scale
@@ -1202,6 +1330,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+        if args.use_lora:
+            ensure_input_require_grads_for_checkpointing(model)
 
     optimizer = AdamW(
         (p for p in model.parameters() if p.requires_grad),
@@ -1223,15 +1353,16 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     kept_pairs = 0
     same_answer_skipped = 0
     buffer: List[DapoSample] = []
-    pair_cache: List[OnlinePendingPair] = []
     k = args.online_pairs_per_step
 
     total_steps_str = str(args.online_steps) if args.online_steps is not None else "inf"
     print(
         f"[online] rollout_backend={args.online_rollout_backend}, "
-        f"rollout_batch_size={args.rollout_batch_size} (2 samples per prompt via n=2), "
-        f"online_pairs_per_step={k} (pairs consumed per optimizer.step; extras cached), "
-        f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}"
+        f"rollout_batch_size={args.rollout_batch_size} "
+        f"({args.rollout_n} samples per prompt via n={args.rollout_n}), "
+        f"online_pairs_per_step={k} (chunk size within one rollout step; no cross-step cache), "
+        f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}, "
+        f"vllm_enforce_eager={args.online_vllm_enforce_eager}"
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
@@ -1288,8 +1419,16 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
             new_pairs_in_rollout = 0
             same_answer_skipped_in_rollout = 0
+            rollout_pairs: List[OnlinePendingPair] = []
             for idx, sample_obj in enumerate(buffer):
-                candidates = completion_flat[2 * idx : 2 * idx + 2]
+                start = idx * args.rollout_n
+                end = start + args.rollout_n
+                candidates = completion_flat[start:end]
+                if len(candidates) != args.rollout_n:
+                    raise RuntimeError(
+                        f"Rollout candidate count mismatch at sample {idx}: "
+                        f"expected {args.rollout_n}, got {len(candidates)}"
+                    )
                 pair = choose_preference_pair(
                     candidates,
                     sample_obj.ground_truth,
@@ -1310,7 +1449,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     pair,
                 )
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                pair_cache.append(
+                rollout_pairs.append(
                     OnlinePendingPair(
                         train_prompt=prompt_texts[idx],
                         chosen=pair["chosen"],
@@ -1325,40 +1464,77 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
                 f"new_pairs_in_rollout={new_pairs_in_rollout} "
                 f"same_answer_skipped_in_rollout={same_answer_skipped_in_rollout} "
-                f"pair_cache_size={len(pair_cache)}"
+                f"pairs_ready_for_update={len(rollout_pairs)}"
             )
 
-            while len(pair_cache) >= k:
-                chunk = pair_cache[:k]
-                pair_cache = pair_cache[k:]
-                train_prompts = [p.train_prompt for p in chunk]
-                chosen_list = [p.chosen for p in chunk]
-                rejected_list = [p.rejected for p in chunk]
+            updates_in_rollout = 0
+            consumed_in_rollout = 0
+            dropped_by_truncation_in_rollout = 0
+            if rollout_pairs:
+                for chunk_start in range(0, len(rollout_pairs), k):
+                    chunk = rollout_pairs[chunk_start : chunk_start + k]
+                    train_prompts_raw = [p.train_prompt for p in chunk]
+                    chosen_raw = [p.chosen for p in chunk]
+                    rejected_raw = [p.rejected for p in chunk]
+                    train_prompts, chosen_list, rejected_list, trunc_stats = filter_pairs_without_truncation(
+                        tokenizer=tokenizer,
+                        train_prompts=train_prompts_raw,
+                        chosen=chosen_raw,
+                        rejected=rejected_raw,
+                        max_length=args.max_length,
+                    )
+                    dropped_by_truncation_in_rollout += trunc_stats.dropped_pairs
+                    if trunc_stats.dropped_pairs > 0:
+                        print(
+                            f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                            f"truncation_filter dropped_pairs={trunc_stats.dropped_pairs}/{trunc_stats.total_pairs} "
+                            f"(prompt_too_long={trunc_stats.dropped_prompt_too_long}, "
+                            f"chosen_too_long={trunc_stats.dropped_chosen_too_long}, "
+                            f"rejected_too_long={trunc_stats.dropped_rejected_too_long})"
+                        )
+                    if not train_prompts:
+                        continue
 
-                weighted_loss, mean_gap = _online_run_preference_optimizer_step(
-                    model,
-                    tokenizer,
-                    optimizer,
-                    device,
-                    args,
-                    train_prompts,
-                    chosen_list,
-                    rejected_list,
-                )
-                updates += 1
-                kept_pairs += k
+                    weighted_loss, mean_gap = _online_run_preference_optimizer_step(
+                        model,
+                        tokenizer,
+                        optimizer,
+                        device,
+                        args,
+                        train_prompts,
+                        chosen_list,
+                        rejected_list,
+                    )
+                    updates += 1
+                    updates_in_rollout += 1
+                    used_pairs = len(train_prompts)
+                    consumed_in_rollout += used_pairs
+                    kept_pairs += used_pairs
+                    print(
+                        f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                        f"optimizer_step={updates} consumed_pairs={used_pairs} "
+                        f"loss={weighted_loss:.4f} gap={mean_gap:.4f}"
+                    )
+
+                    if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
+                        ckpt_dir = output_root / f"checkpoint-update-{updates}"
+                        ckpt_dir.mkdir(parents=True, exist_ok=True)
+                        model.save_pretrained(ckpt_dir)
+                        tokenizer.save_pretrained(ckpt_dir)
+                        print(f"[online] saved checkpoint to {ckpt_dir}")
+
+            if rollout_pairs and updates_in_rollout == 0:
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    f"optimizer_step={updates} consumed_pairs={k} pair_cache_size={len(pair_cache)} "
-                    f"loss={weighted_loss:.4f} gap={mean_gap:.4f}"
+                    "no optimizer update (all rollout pairs filtered out)"
                 )
-
-                if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
-                    ckpt_dir = output_root / f"checkpoint-update-{updates}"
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    model.save_pretrained(ckpt_dir)
-                    tokenizer.save_pretrained(ckpt_dir)
-                    print(f"[online] saved checkpoint to {ckpt_dir}")
+            elif rollout_pairs:
+                print(
+                    f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                    f"updates_in_rollout={updates_in_rollout} "
+                    f"consumed_pairs_in_rollout={consumed_in_rollout} "
+                    f"dropped_by_truncation_in_rollout={dropped_by_truncation_in_rollout}"
+                )
 
             buffer = []
             if args.online_steps is not None and rollout_steps >= args.online_steps:
@@ -1366,11 +1542,6 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
         if buffer and (args.online_steps is None or rollout_steps < args.online_steps):
             print("[online] remaining tail batch ignored to keep fixed rollout_batch_size behavior")
-        if pair_cache:
-            print(
-                f"[online] pair_cache_remaining={len(pair_cache)} pairs "
-                f"(need {k} for one optimizer step; not trained — start next run or lower --online-pairs-per-step)"
-            )
 
     final_dir = output_root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,6 +1585,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument(
+        "--rollout_n",
+        type=int,
+        default=8,
+        help="Number of sampled responses per prompt during rollout; one correct/one wrong are selected into a pair.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--vllm_dtype", type=str, default="bfloat16")
@@ -1544,19 +1721,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Online only: number of rollout batches to run. Each batch rolls out "
-            "rollout_batch_size prompts with 2 samples each; valid pairs append to a cache. "
-            "optimizer.step() runs only when the cache has at least --online-pairs-per-step pairs. "
+            "rollout_batch_size prompts with --rollout_n samples each; valid pairs are "
+            "consumed immediately in this rollout step (no cross-step cache). "
             "Use 0 for no limit (until source samples exhausted)."
         ),
     )
     parser.add_argument(
         "--online-pairs-per-step",
         type=int,
-        default=32,
+        default=16,
         dest="online_pairs_per_step",
         help=(
-            "Online only: each optimizer.step() consumes exactly this many preference pairs. "
-            "Extra pairs from a rollout stay in the cache for the next step(s)."
+            "Online only: chunk size for optimizer updates inside one rollout step. "
+            "If a rollout yields fewer pairs, it still updates once with all available pairs."
         ),
     )
     parser.add_argument(
@@ -1570,13 +1747,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="vllm",
         choices=["vllm", "hf"],
-        help="Online: rollout engine — vLLM (default) or Hugging Face generate.",
+        help="Online: rollout engine - vLLM (default) or Hugging Face generate.",
     )
     parser.add_argument(
         "--online_vllm_use_tqdm",
         type=str2bool,
         default=True,
         help="Online + vLLM: show tqdm progress in llm.generate.",
+    )
+    parser.add_argument(
+        "--online_vllm_enforce_eager",
+        type=str2bool,
+        default=True,
+        help=(
+            "Online + vLLM: use eager mode to reduce per-rollout engine init overhead "
+            "when the engine is recreated frequently."
+        ),
     )
 
     return parser
@@ -1594,9 +1780,12 @@ def main() -> None:
 
     if args.online_pairs_per_step < 1:
         raise SystemExit("error: --online-pairs-per-step must be >= 1")
+    if args.rollout_n < 2:
+        raise SystemExit("error: --rollout_n must be >= 2")
     run_online_preference_training(args)
 
 
 if __name__ == "__main__":
     main()
+
 

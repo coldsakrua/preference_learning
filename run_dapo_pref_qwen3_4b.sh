@@ -35,6 +35,8 @@ seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-512}
 online_steps=${ONLINE_STEPS:-30}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
+rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
@@ -42,13 +44,14 @@ learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.1}
 chosen_ce_weight=${CHOSEN_CE_WEIGHT:-0.02}
 # HF 算 chosen/rejected 的 logp：单条序列 = 提示词 + 回复，tokenizer 总长度上限（不是多轮对话条数）
-max_length=${MAX_LENGTH:-4096}
+max_length=${MAX_LENGTH:-8192}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 # vLLM 单轮：需 >= 题干 token + max_new_tokens；默认 8192 省 KV（超长题可 export ROLLOUT_MAX_MODEL_LEN）
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-8192}
+online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 
 # PEFT LoRA (anchor env includes peft). Set USE_LORA=false for full fine-tuning.
 use_lora=${USE_LORA:-true}
@@ -88,6 +91,8 @@ python train_dapo_preference.py \
   --prompt_candidates_file "${prompt_file}" \
   --max_source_samples "${max_source_samples}" \
   --online_steps "${online_steps}" \
+  --online-pairs-per-step "${online_pairs_per_step}" \
+  --rollout_n "${rollout_n}" \
   --rollout_batch_size "${rollout_batch_size}" \
   --temperature "${temperature}" \
   --top_p "${top_p}" \
@@ -102,6 +107,7 @@ python train_dapo_preference.py \
   --lora_alpha "${lora_alpha}" \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
+  --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --sample_rejected_requires_final_answer true \
   --sample_chosen_requires_final_answer false \
   --enable_thinking false
