@@ -24,7 +24,7 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-instruct}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b}
 
 # model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260411_085017_job1373318/train/final}
 # 1=关闭 Qwen thinking/CoT（--no-thinking）；0=开启 CoT（与 eval 默认一致）
@@ -32,12 +32,13 @@ NO_THINKING=${NO_THINKING:-1}
 datasets_csv=${DATASETS:-math500,aime24,aime25,aime26,hmmt25}
 data_format=${DATA_FORMAT:-auto}
 # LoRA: set CHECKPOINT_DIR or LORA_PATH (adapter dir, or .../train — eval picks final/ or lora_adapter/).
-checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-}}
-max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-}}
+checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260413_070316_job1374322/train/vllm_rollout_ckpt/lora_adapter}}
+max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-64}}
+use_lora=${USE_LORA:-0}
 num_samples=${NUM_SAMPLES:-0}
 val_n=${VAL_N:-16}
 pass_at_k=${PASS_AT_K:-1,4,8,16}
-max_new_tokens=${MAX_NEW_TOKENS:-16384}
+max_new_tokens=${MAX_NEW_TOKENS:-4096}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 seed=${SEED:-42}
@@ -63,6 +64,7 @@ mkdir -p "$(dirname "${output_json}")"
 
 echo "[EVAL] model_path=${model_path}"
 echo "[EVAL] checkpoint_dir=${checkpoint_dir:-<none>}"
+echo "[EVAL] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
 echo "[EVAL] DATASETS=${datasets_csv}"
 echo "[EVAL] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
 echo "[EVAL] output_json=${output_json}"
@@ -93,11 +95,13 @@ for _n in "${_ds[@]}"; do
   cmd+=(--dataset="${_n}")
 done
 
-if [[ -n "${checkpoint_dir}" ]]; then
-  cmd+=(--lora-path "${checkpoint_dir}")
-fi
-if [[ -n "${checkpoint_dir}" && -n "${max_lora_rank}" && "${max_lora_rank}" != "0" ]]; then
-  cmd+=(--max-lora-rank "${max_lora_rank}")
+if [[ "${use_lora}" == "1" ]]; then
+  if [[ -n "${checkpoint_dir}" ]]; then
+    cmd+=(--lora-path "${checkpoint_dir}")
+  fi
+  if [[ -n "${checkpoint_dir}" && -n "${max_lora_rank}" && "${max_lora_rank}" != "0" ]]; then
+    cmd+=(--max-lora-rank "${max_lora_rank}")
+  fi
 fi
 
 if [[ "${ENFORCE_EAGER:-0}" == "1" ]]; then

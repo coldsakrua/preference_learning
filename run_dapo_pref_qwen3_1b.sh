@@ -33,7 +33,7 @@ prompt_file=${PROMPT_FILE:-/gpfs/share/home/2501210611/prefernce-learning/prefer
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-512}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
 online_steps=${ONLINE_STEPS:-30}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
 rollout_n=${ROLLOUT_N:-8}
