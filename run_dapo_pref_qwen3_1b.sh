@@ -42,13 +42,13 @@ learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.1}
 chosen_ce_weight=${CHOSEN_CE_WEIGHT:-0.02}
 # HF 算 chosen/rejected 的 logp：单条序列 = 提示词 + 回复，tokenizer 总长度上限（不是多轮对话条数）
-max_length=${MAX_LENGTH:-4096}
+max_length=${MAX_LENGTH:-2048}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 # vLLM 单轮：需 >= 题干 token + max_new_tokens；16384 对 2048 生成都偏大，默认降到 8192 省 KV
-rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-8192}
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 
 # PEFT LoRA (anchor env includes peft). Set USE_LORA=false for full fine-tuning.
 use_lora=${USE_LORA:-true}

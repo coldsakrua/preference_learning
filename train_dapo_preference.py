@@ -77,7 +77,6 @@ class OnlinePendingPair:
     train_prompt: str
     chosen: str
     rejected: str
-    record: Dict[str, Any]
 
 
 def extract_user_prompt(messages: object) -> str:
@@ -1237,7 +1236,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
 
-    # Line-buffered + flush per row so JSONL is visible on shared FS while the job runs.
+    # Persist sampled pairs immediately so online_pairs.jsonl is visible while the job runs.
     with online_pairs_path.open("w", encoding="utf-8", buffering=1) as fout:
         for sample in source_iter:
             buffer.append(sample)
@@ -1310,15 +1309,17 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     candidates,
                     pair,
                 )
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 pair_cache.append(
                     OnlinePendingPair(
                         train_prompt=prompt_texts[idx],
                         chosen=pair["chosen"],
                         rejected=pair["rejected"],
-                        record=record,
                     )
                 )
                 new_pairs_in_rollout += 1
+            if new_pairs_in_rollout > 0:
+                fout.flush()
 
             print(
                 f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
@@ -1333,9 +1334,6 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 train_prompts = [p.train_prompt for p in chunk]
                 chosen_list = [p.chosen for p in chunk]
                 rejected_list = [p.rejected for p in chunk]
-                for p in chunk:
-                    fout.write(json.dumps(p.record, ensure_ascii=False) + "\n")
-                    fout.flush()
 
                 weighted_loss, mean_gap = _online_run_preference_optimizer_step(
                     model,
