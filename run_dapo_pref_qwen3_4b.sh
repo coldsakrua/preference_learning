@@ -33,20 +33,29 @@ prompt_file=${PROMPT_FILE:-/gpfs/share/home/2501210611/prefernce-learning/prefer
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-256}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-512}
 online_steps=${ONLINE_STEPS:-30}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
-max_new_tokens=${MAX_NEW_TOKENS:-8192}
+max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.1}
 chosen_ce_weight=${CHOSEN_CE_WEIGHT:-0.02}
-max_length=${MAX_LENGTH:-8192}
+# HF 算 chosen/rejected 的 logp：单条序列 = 提示词 + 回复，tokenizer 总长度上限（不是多轮对话条数）
+max_length=${MAX_LENGTH:-4096}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
-rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-32768}
+# vLLM 单轮：需 >= 题干 token + max_new_tokens；默认 8192 省 KV（超长题可 export ROLLOUT_MAX_MODEL_LEN）
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-8192}
+
+# PEFT LoRA (anchor env includes peft). Set USE_LORA=false for full fine-tuning.
+use_lora=${USE_LORA:-true}
+lora_r=${LORA_R:-64}
+lora_alpha=${LORA_ALPHA:-128}
+lora_dropout=${LORA_DROPOUT:-0.05}
+vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -61,6 +70,7 @@ train_out="${run_root}/train"
 mkdir -p "${run_root}" "${train_out}"
 
 echo "[DAPO-PREF] run_root=${run_root}"
+echo "[DAPO-PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[DAPO-PREF] online mode: vLLM rollout + HF preference update"
 python train_dapo_preference.py \
   --seed "${seed}" \
@@ -87,6 +97,11 @@ python train_dapo_preference.py \
   --chosen_ce_weight "${chosen_ce_weight}" \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
+  --use_lora "${use_lora}" \
+  --lora_r "${lora_r}" \
+  --lora_alpha "${lora_alpha}" \
+  --lora_dropout "${lora_dropout}" \
+  --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --sample_rejected_requires_final_answer true \
   --sample_chosen_requires_final_answer false \
   --enable_thinking false

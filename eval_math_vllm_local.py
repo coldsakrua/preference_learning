@@ -34,6 +34,13 @@ Example:
     --data-path data/AIME26/test.parquet \\
     --data-path data/other/test.parquet \\
     --output-json outputs/multi_eval.json
+
+  # Base + LoRA adapter (--lora-path same as --checkpoint-dir; may point to .../train, auto uses final/):
+  python eval_math_vllm_local.py \\
+    --model-path /path/to/qwen3-4b \\
+    --lora-path /path/to/lora_adapter \\
+    --dataset math500 \\
+    --output-json outputs/eval_lora.json
 """
 
 from __future__ import annotations
@@ -258,6 +265,91 @@ def load_examples(path: Path, fmt: str, limit: Optional[int]) -> List[Dict[str, 
     raise ValueError(f"Unknown --data-format: {fmt}")
 
 
+def _adapter_dir_has_weights(d: Path) -> bool:
+    return (d / "adapter_model.safetensors").is_file() or (d / "adapter_model.bin").is_file()
+
+
+def _adapter_config_base_model(adapter_dir: Path) -> Optional[str]:
+    p = adapter_dir / "adapter_config.json"
+    if not p.is_file():
+        return None
+    try:
+        meta = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return meta.get("base_model_name_or_path") or meta.get("base_model_name")
+
+
+def _infer_max_lora_rank_from_adapter(adapter_dir: Path, fallback: int) -> int:
+    p = adapter_dir / "adapter_config.json"
+    if not p.is_file():
+        return fallback
+    try:
+        meta = json.loads(p.read_text(encoding="utf-8"))
+        r = int(meta.get("r", fallback))
+        return max(r, 1)
+    except Exception:
+        return fallback
+
+
+def _is_peft_adapter_dir(d: Path) -> bool:
+    return _adapter_dir_has_weights(d) and (d / "adapter_config.json").is_file()
+
+
+def resolve_user_lora_dir(raw: Optional[str]) -> Optional[Path]:
+    """
+    Turn CLI LoRA path into the directory that actually holds adapter_config + weights.
+
+    If ``raw`` is a training output parent (e.g. .../train) without weights at the root,
+    use ``final/`` or ``lora_adapter/`` when present (matches train_dapo_preference.py layout).
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    p = Path(raw).expanduser().resolve()
+    if not p.is_dir():
+        return p
+    if _is_peft_adapter_dir(p):
+        return p
+    for sub in ("final", "lora_adapter"):
+        c = p / sub
+        if _is_peft_adapter_dir(c):
+            print(f"[eval] LoRA path {p} -> using adapter at {c}")
+            return c
+    return p
+
+
+def resolve_vllm_base_and_lora(
+    model_path: str,
+    checkpoint_dir: Optional[str],
+) -> tuple[str, Optional[Path]]:
+    """
+    Returns (vLLM base model path, optional LoRA adapter directory).
+
+    If --checkpoint-dir / --lora-path is set, --model-path is the base model and that option is the adapter
+    (after resolve_user_lora_dir, e.g. .../train -> .../train/final).
+    Else if --model-path points to a PEFT adapter (adapter_config + adapter weights), base is read from
+    adapter_config.json and the same path is the LoRA directory.
+    """
+    mp = Path(model_path).expanduser().resolve()
+    ckpt_raw = checkpoint_dir.strip() if checkpoint_dir and str(checkpoint_dir).strip() else ""
+    if ckpt_raw:
+        return str(mp), Path(ckpt_raw).expanduser().resolve()
+    if _is_peft_adapter_dir(mp):
+        base_raw = _adapter_config_base_model(mp)
+        if not base_raw:
+            raise SystemExit(
+                f"error: {mp} looks like a LoRA adapter but adapter_config.json "
+                "has no base_model_name_or_path"
+            )
+        bpath = Path(base_raw)
+        if bpath.exists():
+            base_resolved = str(bpath.expanduser().resolve())
+        else:
+            base_resolved = base_raw
+        return base_resolved, mp
+    return str(mp), None
+
+
 def build_llm(
     model_path: str,
     lora_path: Optional[str],
@@ -265,6 +357,7 @@ def build_llm(
     gpu_memory_utilization: float,
     max_model_len: int,
     enforce_eager: bool,
+    max_lora_rank: int,
 ) -> Any:
     from vllm import LLM
 
@@ -284,7 +377,7 @@ def build_llm(
         adapter_bin = Path(lora_path) / "adapter_model.bin"
         if adapter_st.is_file() or adapter_bin.is_file():
             cfg["enable_lora"] = True
-            cfg["max_lora_rank"] = 64
+            cfg["max_lora_rank"] = max_lora_rank
             cfg["max_loras"] = 1
             cfg["max_cpu_loras"] = 1
         else:
@@ -408,7 +501,27 @@ def main() -> None:
         default="auto",
         choices=["auto", "jsonl", "dapo_parquet", "amo_qa_parquet", "problem_answer_parquet"],
     )
-    parser.add_argument("--checkpoint-dir", type=str, default=None, help="LoRA adapter directory (optional)")
+    parser.add_argument(
+        "--checkpoint-dir",
+        "--lora-path",
+        dest="lora_arg",
+        type=str,
+        default=None,
+        help=(
+            "PEFT LoRA adapter directory (optional). Alias: --lora-path. "
+            "May be train output root (.../train); then uses final/ or lora_adapter/ if weights are there."
+        ),
+    )
+    parser.add_argument(
+        "--max-lora-rank",
+        type=int,
+        default=0,
+        help=(
+            "vLLM max_lora_rank when using a LoRA adapter. "
+            "0 = use r from adapter_config.json (fallback 64). "
+            "If set below adapter r, it is raised automatically."
+        ),
+    )
     parser.add_argument("--output-json", type=str, default="", help="Summary JSON path (not needed for --list-datasets).")
     parser.add_argument("--num-samples", type=int, default=0, help="0 = use all rows")
     parser.add_argument("--max-new-tokens", type=int, default=8192)
@@ -531,27 +644,56 @@ def main() -> None:
     print(f"[eval] total {len(examples)} problems from {len(resolved_paths)} file(s)")
     print(f"[eval] math_verify={'yes' if _HAS_MATH_VERIFY else 'no'}, thinking={args.enable_thinking}")
 
-    llm = build_llm(
+    lora_dir_cli = resolve_user_lora_dir(args.lora_arg)
+    vllm_model_path, lora_dir = resolve_vllm_base_and_lora(
         args.model_path,
-        args.checkpoint_dir,
+        str(lora_dir_cli) if lora_dir_cli is not None else None,
+    )
+    lora_dir_str = str(lora_dir) if lora_dir is not None else None
+
+    max_lora_rank_cli = args.max_lora_rank
+    if lora_dir is not None and _adapter_dir_has_weights(lora_dir):
+        inferred_r = _infer_max_lora_rank_from_adapter(lora_dir, 64)
+        if max_lora_rank_cli <= 0:
+            max_lora_rank = inferred_r
+        else:
+            max_lora_rank = max(max_lora_rank_cli, inferred_r)
+            if max_lora_rank_cli < inferred_r:
+                print(
+                    f"[warn] --max-lora-rank {max_lora_rank_cli} < adapter r={inferred_r}; "
+                    f"using {max_lora_rank} for vLLM."
+                )
+        print(f"[eval] vLLM base={vllm_model_path} LoRA={lora_dir} max_lora_rank={max_lora_rank}")
+    else:
+        max_lora_rank = max_lora_rank_cli if max_lora_rank_cli > 0 else 64
+        if lora_dir is not None and not _adapter_dir_has_weights(lora_dir):
+            print(f"[warn] LoRA dir {lora_dir} has no adapter weights; eval runs base model only.")
+        print(f"[eval] vLLM model={vllm_model_path}")
+
+    llm = build_llm(
+        vllm_model_path,
+        lora_dir_str,
         args.tensor_parallel_size,
         args.gpu_memory_utilization,
         max_model_len,
         args.enforce_eager,
+        max_lora_rank,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+
+    tokenizer_src = vllm_model_path
+    if lora_dir is not None and (lora_dir / "tokenizer_config.json").is_file():
+        tokenizer_src = str(lora_dir.resolve())
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
 
     lora_request = None
-    if args.checkpoint_dir:
-        p = Path(args.checkpoint_dir)
-        if (p / "adapter_model.safetensors").is_file() or (p / "adapter_model.bin").is_file():
-            try:
-                from vllm.lora.request import LoRARequest
+    if lora_dir is not None and _adapter_dir_has_weights(lora_dir):
+        try:
+            from vllm.lora.request import LoRARequest
 
-                lora_request = LoRARequest("eval_lora", 1, str(p.resolve()))
-                print(f"[eval] LoRARequest -> {p}")
-            except Exception as e:
-                print(f"[warn] LoRA disabled: {e}")
+            lora_request = LoRARequest("eval_lora", 1, str(lora_dir.resolve()))
+            print(f"[eval] LoRARequest -> {lora_dir}")
+        except Exception as e:
+            print(f"[warn] LoRA disabled: {e}")
 
     user_suffix = (
         "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
@@ -723,7 +865,10 @@ def main() -> None:
 
     summary = {
         "model_path": args.model_path,
-        "checkpoint_dir": args.checkpoint_dir,
+        "vllm_base_model_path": vllm_model_path,
+        "checkpoint_dir": args.lora_arg,
+        "lora_adapter_dir": lora_dir_str,
+        "max_lora_rank": max_lora_rank,
         "data_root": str(data_root),
         "data_paths": [str(p) for p in resolved_paths],
         "dataset_args": list(args.dataset) if args.dataset else [],

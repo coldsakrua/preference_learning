@@ -31,11 +31,13 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 NO_THINKING=${NO_THINKING:-1}
 datasets_csv=${DATASETS:-math500,aime24,aime25,aime26,hmmt25}
 data_format=${DATA_FORMAT:-auto}
-checkpoint_dir=${CHECKPOINT_DIR:-}
+# LoRA: set CHECKPOINT_DIR or LORA_PATH (adapter dir, or .../train — eval picks final/ or lora_adapter/).
+checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-}}
+max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-}}
 num_samples=${NUM_SAMPLES:-0}
 val_n=${VAL_N:-16}
 pass_at_k=${PASS_AT_K:-1,4,8,16}
-max_new_tokens=${MAX_NEW_TOKENS:-8192}
+max_new_tokens=${MAX_NEW_TOKENS:-16384}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 seed=${SEED:-42}
@@ -55,12 +57,12 @@ if [[ "${NO_THINKING}" == "1" ]]; then
 else
   _eval_cot_dir=cot
 fi
-# 未设 OUTPUT_JSON 时按是否 CoT 分子目录；手动指定 OUTPUT_JSON 则完全沿用
 output_json=${OUTPUT_JSON:-outputs/eval_math_local/${_eval_cot_dir}/eval_${run_tag}.json}
 
 mkdir -p "$(dirname "${output_json}")"
 
 echo "[EVAL] model_path=${model_path}"
+echo "[EVAL] checkpoint_dir=${checkpoint_dir:-<none>}"
 echo "[EVAL] DATASETS=${datasets_csv}"
 echo "[EVAL] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
 echo "[EVAL] output_json=${output_json}"
@@ -92,7 +94,10 @@ for _n in "${_ds[@]}"; do
 done
 
 if [[ -n "${checkpoint_dir}" ]]; then
-  cmd+=(--checkpoint-dir "${checkpoint_dir}")
+  cmd+=(--lora-path "${checkpoint_dir}")
+fi
+if [[ -n "${checkpoint_dir}" && -n "${max_lora_rank}" && "${max_lora_rank}" != "0" ]]; then
+  cmd+=(--max-lora-rank "${max_lora_rank}")
 fi
 
 if [[ "${ENFORCE_EAGER:-0}" == "1" ]]; then

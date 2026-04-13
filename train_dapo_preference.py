@@ -913,6 +913,24 @@ def train_with_preference_loss(args: argparse.Namespace) -> None:
         )
 
 
+def wrap_model_with_lora(model: Any, args: argparse.Namespace) -> Any:
+    """Attach LoRA adapters (PEFT). Base weights stay frozen; only adapters train."""
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    targets = [t.strip() for t in args.lora_target_modules.split(",") if t.strip()]
+    if not targets:
+        raise ValueError("--lora-target-modules must list at least one module name.")
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=targets,
+    )
+    return get_peft_model(model, lora_config)
+
+
 def _online_rollout_completions_flat_vllm(
     args: argparse.Namespace,
     *,
@@ -928,13 +946,75 @@ def _online_rollout_completions_flat_vllm(
 ) -> List[str]:
     from vllm import LLM, SamplingParams
 
-    if hf_updates_so_far > 0:
+    use_lora = bool(getattr(args, "use_lora", False))
+    lora_request = None
+    if use_lora:
+        vllm_staging_dir.mkdir(parents=True, exist_ok=True)
+        adapter_dir = vllm_staging_dir / "lora_adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(adapter_dir)
+        tokenizer.save_pretrained(adapter_dir)
+        ckpt = init_model_path
+        try:
+            from vllm.lora.request import LoRARequest
+
+            lora_request = LoRARequest("online_lora", 1, str(adapter_dir.resolve()))
+        except Exception as e:
+            raise RuntimeError(
+                "use_lora=true requires vLLM LoRA support and a successful LoRARequest; "
+                f"got: {e}"
+            ) from e
+        print(
+            f"[online] vLLM+LoRA rollout_step={rollout_steps}/{total_steps_str} "
+            f"base={ckpt} adapter={adapter_dir}",
+            flush=True,
+        )
+        llm_kw: Dict[str, Any] = {
+            "model": ckpt,
+            "tokenizer": ckpt,
+            "trust_remote_code": True,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "dtype": args.vllm_dtype,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_model_len": args.rollout_max_model_len,
+            "enable_lora": True,
+            "max_lora_rank": args.vllm_max_lora_rank,
+            "max_loras": 1,
+            "max_cpu_loras": 1,
+        }
+    elif hf_updates_so_far > 0:
         vllm_staging_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(vllm_staging_dir)
         tokenizer.save_pretrained(vllm_staging_dir)
         ckpt = str(vllm_staging_dir)
+        print(
+            f"[online] vLLM loading rollout_step={rollout_steps}/{total_steps_str} ckpt={ckpt}",
+            flush=True,
+        )
+        llm_kw = {
+            "model": ckpt,
+            "tokenizer": ckpt,
+            "trust_remote_code": True,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "dtype": args.vllm_dtype,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_model_len": args.rollout_max_model_len,
+        }
     else:
         ckpt = init_model_path
+        print(
+            f"[online] vLLM loading rollout_step={rollout_steps}/{total_steps_str} ckpt={ckpt}",
+            flush=True,
+        )
+        llm_kw = {
+            "model": ckpt,
+            "tokenizer": ckpt,
+            "trust_remote_code": True,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "dtype": args.vllm_dtype,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_model_len": args.rollout_max_model_len,
+        }
 
     model.eval()
     model.to("cpu")
@@ -942,19 +1022,7 @@ def _online_rollout_completions_flat_vllm(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print(
-        f"[online] vLLM loading rollout_step={rollout_steps}/{total_steps_str} ckpt={ckpt}",
-        flush=True,
-    )
-    llm = LLM(
-        model=ckpt,
-        tokenizer=ckpt,
-        trust_remote_code=True,
-        tensor_parallel_size=args.tensor_parallel_size,
-        dtype=args.vllm_dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.rollout_max_model_len,
-    )
+    llm = LLM(**llm_kw)
     sampling_params = SamplingParams(
         n=2,
         temperature=args.temperature,
@@ -962,10 +1030,13 @@ def _online_rollout_completions_flat_vllm(
         max_tokens=args.max_new_tokens,
         seed=args.seed + rollout_steps * 100003,
     )
+    gen_kw: Dict[str, Any] = {"use_tqdm": args.online_vllm_use_tqdm}
+    if lora_request is not None:
+        gen_kw["lora_request"] = lora_request
     outputs = llm.generate(
         prompt_texts,
         sampling_params,
-        use_tqdm=args.online_vllm_use_tqdm,
+        **gen_kw,
     )
     completion_flat: List[str] = []
     for output in outputs:
@@ -1074,7 +1145,8 @@ def _online_run_preference_optimizer_step(
         total_gap_weighted += preference_gap.sum().item()
 
     if args.max_grad_norm > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
     optimizer.step()
 
     mean_gap = total_gap_weighted / batch_size
@@ -1116,6 +1188,15 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         model_kwargs["attn_implementation"] = args.attn_implementation
     model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
 
+    if args.use_lora:
+        if args.online_rollout_backend == "vllm" and args.lora_r > args.vllm_max_lora_rank:
+            raise ValueError(
+                "For vLLM LoRA rollout, --lora-r must be <= --vllm-max-lora-rank "
+                f"(got lora_r={args.lora_r}, vllm_max_lora_rank={args.vllm_max_lora_rank})."
+            )
+        model = wrap_model_with_lora(model, args)
+        model.print_trainable_parameters()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
@@ -1123,7 +1204,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
     prompt_pool = build_prompt_pool(args)
     prompt_rng = random.Random(args.seed + 20260412)
 
@@ -1428,6 +1513,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
+    parser.add_argument(
+        "--use_lora",
+        type=str2bool,
+        default=False,
+        help="Train with PEFT LoRA (HF forward + preference loss); vLLM rollout loads base + adapter.",
+    )
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        help="Comma-separated target module names for LoRA (Qwen/Llama-style attention/MLP).",
+    )
+    parser.add_argument(
+        "--vllm_max_lora_rank",
+        type=int,
+        default=64,
+        help="vLLM max_lora_rank when use_lora=true; must be >= lora_r.",
+    )
     parser.add_argument(
         "--online_init_model_path",
         type=str,
