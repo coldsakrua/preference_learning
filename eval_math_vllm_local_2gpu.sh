@@ -3,7 +3,7 @@
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=24:00:00
 
@@ -19,14 +19,16 @@ mkdir -p logs outputs
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+# 双卡下 custom all-reduce 在部分环境会触发 invalid argument，默认关闭更稳。
+export VLLM_DISABLE_CUSTOM_ALL_REDUCE="${VLLM_DISABLE_CUSTOM_ALL_REDUCE:-1}"
+
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
-# model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260411_085017_job1373318/train/final}
 # 1=关闭 Qwen thinking/CoT（--no-thinking）；0=开启 CoT（与 eval 默认一致）
 NO_THINKING=${NO_THINKING:-1}
 datasets_csv=${DATASETS:-math500,aime24,aime25,aime26,hmmt25}
@@ -42,7 +44,7 @@ max_new_tokens=${MAX_NEW_TOKENS:-4096}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 seed=${SEED:-42}
-tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
+tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 max_model_len=${MAX_MODEL_LEN:-0}
 generate_batch_size=${GENERATE_BATCH_SIZE:-16}
@@ -62,12 +64,13 @@ output_json=${OUTPUT_JSON:-outputs/eval_math_local/${_eval_cot_dir}/eval_${run_t
 
 mkdir -p "$(dirname "${output_json}")"
 
-echo "[EVAL] model_path=${model_path}"
-echo "[EVAL] checkpoint_dir=${checkpoint_dir:-<none>}"
-echo "[EVAL] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
-echo "[EVAL] DATASETS=${datasets_csv}"
-echo "[EVAL] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
-echo "[EVAL] output_json=${output_json}"
+echo "[EVAL-2GPU] model_path=${model_path}"
+echo "[EVAL-2GPU] checkpoint_dir=${checkpoint_dir:-<none>}"
+echo "[EVAL-2GPU] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
+echo "[EVAL-2GPU] DATASETS=${datasets_csv}"
+echo "[EVAL-2GPU] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
+echo "[EVAL-2GPU] TP=${tensor_parallel_size}, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "[EVAL-2GPU] output_json=${output_json}"
 
 cmd=(
   python eval_math_vllm_local.py
@@ -114,4 +117,5 @@ fi
 
 "${cmd[@]}"
 
-echo "[EVAL] done -> ${output_json}"
+echo "[EVAL-2GPU] done -> ${output_json}"
+

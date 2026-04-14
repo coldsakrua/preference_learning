@@ -29,13 +29,12 @@ export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/dapo-math-17k.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
-prompt_file=${PROMPT_FILE:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/config/prompt_candidates_en.txt}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
 online_steps=${ONLINE_STEPS:-30}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
@@ -84,8 +83,7 @@ python train_dapo_preference.py \
   --vllm_dtype "${vllm_dtype}" \
   --gpu_memory_utilization "${gpu_memory_utilization}" \
   --rollout_max_model_len "${rollout_max_model_len}" \
-  --prompt_mode random \
-  --prompt_candidates_file "${prompt_file}" \
+  --prompt_mode none \
   --max_source_samples "${max_source_samples}" \
   --online_steps "${online_steps}" \
   --online-pairs-per-step "${online_pairs_per_step}" \

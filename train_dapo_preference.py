@@ -240,6 +240,8 @@ def apply_qwen_chat_template(
 
 _ANSWER_LINE = re.compile(r"answer\s*[:\uFF1A]\s*(.+)", flags=re.IGNORECASE)
 _ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
+# dapo-math parquet prompt format: "Answer: $Answer"
+_ANSWER_LINE_PARQUET = re.compile(r"^\s*answer\s*[:\uFF1A]\s*\$(.+?)\s*$", flags=re.IGNORECASE)
 _BOXED = re.compile(r"\\boxed\{([^{}]+)\}")
 _LATEX_FRAC = re.compile(r"\\frac\{(-?\d+)\}\{(-?\d+)\}")
 
@@ -285,13 +287,25 @@ def parse_answer_from_line(line: str) -> Optional[str]:
     return answer
 
 
+def parse_answer_from_line_parquet(line: str) -> Optional[str]:
+    normalized_line = normalize_answer_line_for_parse(line)
+    match = _ANSWER_LINE_PARQUET.match(normalized_line)
+    if not match:
+        return None
+    answer = strip_outer_formatting(match.group(1))
+    if not answer:
+        return None
+    return answer
+
+
 def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
     if "</think>" in text:
         text = text.split("</think>")[-1]
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return False, ""
-    answer = parse_answer_from_line(lines[-1])
+    # Strictly follow parquet instruction format: last line must be "Answer: $..."
+    answer = parse_answer_from_line_parquet(lines[-1])
     if answer is None:
         return False, ""
     return True, answer

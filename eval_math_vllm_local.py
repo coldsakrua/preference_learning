@@ -16,31 +16,6 @@ File formats (auto by suffix if ``--data-format auto``):
 Summary JSON includes ``pass_at_k`` (e.g. pass@1/4/8/16): each k counts problems where
 at least one of the first k samples is graded correct.
 
-Example:
-  python eval_math_vllm_local.py \\
-    --model-path /path/to/qwen3-4b \\
-    --data-path data/AIME26/test.parquet \\
-    --val-n 16 --pass-at-k 1,4,8,16 \\
-    --output-json outputs/aime26_eval.json
-
-  python eval_math_vllm_local.py \\
-    --model-path /path/to/qwen3-4b \\
-    --data-path data/AIME26/aime2026.jsonl \\
-    --output-json outputs/aime26_eval.json
-
-  # Multiple local datasets in one vLLM run (JSON has ``metrics_by_dataset``):
-  python eval_math_vllm_local.py \\
-    --model-path /path/to/qwen3-4b \\
-    --data-path data/AIME26/test.parquet \\
-    --data-path data/other/test.parquet \\
-    --output-json outputs/multi_eval.json
-
-  # Base + LoRA adapter (--lora-path same as --checkpoint-dir; may point to .../train, auto uses final/):
-  python eval_math_vllm_local.py \\
-    --model-path /path/to/qwen3-4b \\
-    --lora-path /path/to/lora_adapter \\
-    --dataset math500 \\
-    --output-json outputs/eval_lora.json
 """
 
 from __future__ import annotations
@@ -734,11 +709,22 @@ def main() -> None:
     gbs = args.generate_batch_size
     if gbs <= 0:
         gbs = n_prompts
+    out_path = Path(args.output_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     print(
         f"[eval] generating {n_prompts} prompts x n={gen_n} "
         f"(pass-at-k={pass_at_k_list}, generate_batch_size={gbs}) ..."
     )
-    outputs: List[Any] = []
+
+    results: List[Dict[str, Any]] = []
+    pass_at_k_counts: Dict[int, int] = {k: 0 for k in pass_at_k_list}
+    formatted_total = 0
+    total_solutions = 0
+    total_correct = 0
+    majority_correct = 0
+    processed = 0
+
     use_inner_tqdm = n_prompts <= gbs
     for start in tqdm(
         range(0, n_prompts, gbs),
@@ -747,156 +733,150 @@ def main() -> None:
         disable=n_prompts <= gbs,
     ):
         end = min(start + gbs, n_prompts)
-        chunk = all_prompts[start:end]
+        chunk_prompts = all_prompts[start:end]
+        chunk_examples = examples[start:end]
         if lora_request is not None:
-            part = llm.generate(
-                chunk,
+            chunk_outputs = llm.generate(
+                chunk_prompts,
                 sampling_params,
                 lora_request=lora_request,
                 use_tqdm=use_inner_tqdm,
             )
         else:
-            part = llm.generate(chunk, sampling_params, use_tqdm=use_inner_tqdm)
-        outputs.extend(part)
-    if len(outputs) != n_prompts:
-        raise RuntimeError(f"expected {n_prompts} vLLM outputs, got {len(outputs)}")
+            chunk_outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=use_inner_tqdm)
+        if len(chunk_outputs) != len(chunk_examples):
+            raise RuntimeError(
+                f"expected {len(chunk_examples)} vLLM outputs in batch, got {len(chunk_outputs)}"
+            )
 
-    results: List[Dict[str, Any]] = []
-    pass_at_k_counts: Dict[int, int] = {k: 0 for k in pass_at_k_list}
-    formatted_total = 0
-    total_solutions = 0
-    total_correct = 0
-    majority_correct = 0
+        for ex, output in zip(chunk_examples, chunk_outputs):
+            gt = ex["ground_truth"]
+            generations: List[str] = []
+            preds: List[str] = []
+            correct_flags: List[bool] = []
+            formatted_flags: List[bool] = []
 
-    for ex, output in tqdm(
-        zip(examples, outputs),
-        total=len(examples),
-        desc="grade",
-        dynamic_ncols=True,
-    ):
-        gt = ex["ground_truth"]
-        generations: List[str] = []
-        preds: List[str] = []
-        correct_flags: List[bool] = []
-        formatted_flags: List[bool] = []
+            for o in output.outputs:
+                gen = o.text
+                generations.append(gen)
+                pred = extract_boxed_answer(gen)
+                formatted = pred is not None
+                if pred is None:
+                    preds.append("[no boxed]")
+                else:
+                    preds.append(pred)
+                ok = grade_answer(pred, gt)
+                correct_flags.append(ok)
+                formatted_flags.append(formatted)
+                total_solutions += 1
+                if formatted:
+                    formatted_total += 1
+                if ok:
+                    total_correct += 1
 
-        for o in output.outputs:
-            gen = o.text
-            generations.append(gen)
-            pred = extract_boxed_answer(gen)
-            formatted = pred is not None
-            if pred is None:
-                preds.append("[no boxed]")
-            else:
-                preds.append(pred)
-            ok = grade_answer(pred, gt)
-            correct_flags.append(ok)
-            formatted_flags.append(formatted)
-            total_solutions += 1
-            if formatted:
-                formatted_total += 1
-            if ok:
-                total_correct += 1
+            pass_at_k_problem: Dict[str, bool] = {}
+            for k in pass_at_k_list:
+                ok_k = any(correct_flags[:k])
+                pass_at_k_problem[str(k)] = ok_k
+                if ok_k:
+                    pass_at_k_counts[k] += 1
 
-        pass_at_k_problem: Dict[str, bool] = {}
+            maj_ok = False
+            fpreds = [p for p, f in zip(preds, formatted_flags) if f]
+            if fpreds:
+                top = Counter(fpreds).most_common(1)[0][0]
+                maj_ok = grade_answer(top, gt)
+            if maj_ok:
+                majority_correct += 1
+
+            results.append(
+                {
+                    "dataset_tag": ex.get("dataset_tag", ""),
+                    "dataset_path": ex.get("dataset_path", ""),
+                    "problem_id": ex["id"],
+                    "problem": ex["problem"],
+                    "ground_truth": gt,
+                    "gen_n": gen_n,
+                    "pass_at_k": pass_at_k_problem,
+                    "generations": [
+                        {
+                            "predicted_answer": p,
+                            "full_generation": g,
+                            "correct": c,
+                            "formatted": f,
+                        }
+                        for p, g, c, f in zip(preds, generations, correct_flags, formatted_flags)
+                    ],
+                    "num_correct": sum(correct_flags),
+                    "pass_at_gen_n": bool(any(correct_flags)),
+                    "majority_vote_correct": maj_ok,
+                    "predicted_answer": preds[0],
+                    "full_generation": generations[0],
+                    "correct": correct_flags[0],
+                    "formatted": formatted_flags[0],
+                }
+            )
+
+        processed = len(results)
+        pass_at_k_summary: Dict[str, Dict[str, Any]] = {}
         for k in pass_at_k_list:
-            ok_k = any(correct_flags[:k])
-            pass_at_k_problem[str(k)] = ok_k
-            if ok_k:
-                pass_at_k_counts[k] += 1
-
-        maj_ok = False
-        fpreds = [p for p, f in zip(preds, formatted_flags) if f]
-        if fpreds:
-            top = Counter(fpreds).most_common(1)[0][0]
-            maj_ok = grade_answer(top, gt)
-        if maj_ok:
-            majority_correct += 1
-
-        results.append(
-            {
-                "dataset_tag": ex.get("dataset_tag", ""),
-                "dataset_path": ex.get("dataset_path", ""),
-                "problem_id": ex["id"],
-                "problem": ex["problem"],
-                "ground_truth": gt,
-                "gen_n": gen_n,
-                "pass_at_k": pass_at_k_problem,
-                "generations": [
-                    {
-                        "predicted_answer": p,
-                        "full_generation": g,
-                        "correct": c,
-                        "formatted": f,
-                    }
-                    for p, g, c, f in zip(preds, generations, correct_flags, formatted_flags)
-                ],
-                "num_correct": sum(correct_flags),
-                "pass_at_gen_n": bool(any(correct_flags)),
-                "majority_vote_correct": maj_ok,
-                "predicted_answer": preds[0],
-                "full_generation": generations[0],
-                "correct": correct_flags[0],
-                "formatted": formatted_flags[0],
+            c = pass_at_k_counts[k]
+            pass_at_k_summary[str(k)] = {
+                "count": c,
+                "total": processed,
+                "pct": 100.0 * c / processed if processed else 0.0,
             }
-        )
 
-    n = len(examples)
-    pass_at_k_summary: Dict[str, Dict[str, Any]] = {}
-    for k in pass_at_k_list:
-        c = pass_at_k_counts[k]
-        pass_at_k_summary[str(k)] = {
-            "count": c,
-            "total": n,
-            "pct": 100.0 * c / n if n else 0.0,
+        by_tag: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for r in results:
+            by_tag[str(r.get("dataset_tag", ""))].append(r)
+
+        metrics_by_dataset: Dict[str, Any] = {}
+        for tag, sub in sorted(by_tag.items(), key=lambda x: x[0]):
+            path0 = sub[0].get("dataset_path", "") if sub else ""
+            metrics_by_dataset[tag] = {
+                "dataset_path": path0,
+                **summarize_result_subset(sub, pass_at_k_list, gen_n),
+            }
+
+        summary = {
+            "model_path": args.model_path,
+            "vllm_base_model_path": vllm_model_path,
+            "checkpoint_dir": args.lora_arg,
+            "lora_adapter_dir": lora_dir_str,
+            "max_lora_rank": max_lora_rank,
+            "data_root": str(data_root),
+            "data_paths": [str(p) for p in resolved_paths],
+            "dataset_args": list(args.dataset) if args.dataset else [],
+            "data_format": args.data_format,
+            "enable_thinking": args.enable_thinking,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "max_new_tokens": args.max_new_tokens,
+            "val_n_requested": args.val_n,
+            "gen_n": gen_n,
+            "pass_at_k_list": pass_at_k_list,
+            "pass_at_k": pass_at_k_summary,
+            "metrics_by_dataset": metrics_by_dataset,
+            "num_problems": processed,
+            "num_problems_total": n_prompts,
+            "total_solutions": total_solutions,
+            "average_correct_pct": 100.0 * total_correct / total_solutions if total_solutions else 0.0,
+            "majority_vote_pct": 100.0 * majority_correct / processed if processed else 0.0,
+            "format_rate_pct": 100.0 * formatted_total / total_solutions if total_solutions else 0.0,
+            "math_verify": _HAS_MATH_VERIFY,
+            "generate_batch_size": gbs if args.generate_batch_size > 0 else n_prompts,
+            "generate_batch_size_requested": args.generate_batch_size,
+            "streaming_write": True,
+            "results": results,
         }
+        out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[eval] wrote partial json: {processed}/{n_prompts}")
 
-    by_tag: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in results:
-        by_tag[str(r.get("dataset_tag", ""))].append(r)
-
-    metrics_by_dataset: Dict[str, Any] = {}
-    for tag, sub in sorted(by_tag.items(), key=lambda x: x[0]):
-        path0 = sub[0].get("dataset_path", "") if sub else ""
-        metrics_by_dataset[tag] = {
-            "dataset_path": path0,
-            **summarize_result_subset(sub, pass_at_k_list, gen_n),
-        }
-
-    summary = {
-        "model_path": args.model_path,
-        "vllm_base_model_path": vllm_model_path,
-        "checkpoint_dir": args.lora_arg,
-        "lora_adapter_dir": lora_dir_str,
-        "max_lora_rank": max_lora_rank,
-        "data_root": str(data_root),
-        "data_paths": [str(p) for p in resolved_paths],
-        "dataset_args": list(args.dataset) if args.dataset else [],
-        "data_format": args.data_format,
-        "enable_thinking": args.enable_thinking,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-        "max_new_tokens": args.max_new_tokens,
-        "val_n_requested": args.val_n,
-        "gen_n": gen_n,
-        "pass_at_k_list": pass_at_k_list,
-        "pass_at_k": pass_at_k_summary,
-        "metrics_by_dataset": metrics_by_dataset,
-        "num_problems": n,
-        "total_solutions": total_solutions,
-        "average_correct_pct": 100.0 * total_correct / total_solutions if total_solutions else 0.0,
-        "majority_vote_pct": 100.0 * majority_correct / n if n else 0.0,
-        "format_rate_pct": 100.0 * formatted_total / total_solutions if total_solutions else 0.0,
-        "math_verify": _HAS_MATH_VERIFY,
-        "generate_batch_size": gbs if args.generate_batch_size > 0 else n_prompts,
-        "generate_batch_size_requested": args.generate_batch_size,
-        "results": results,
-    }
-
-    out_path = Path(args.output_json)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    n = len(results)
+    pass_at_k_summary = summary["pass_at_k"]
+    metrics_by_dataset = summary["metrics_by_dataset"]
 
     print("\n" + "=" * 60)
     print("[ALL] combined")
