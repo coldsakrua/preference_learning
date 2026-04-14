@@ -28,18 +28,19 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/dapo-math-17k.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
 online_steps=${ONLINE_STEPS:-30}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-5}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
-learning_rate=${LEARNING_RATE:-2e-6}
+learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.1}
 chosen_ce_weight=${CHOSEN_CE_WEIGHT:-0.02}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
@@ -87,6 +88,7 @@ python train_dapo_preference.py \
   --max_source_samples "${max_source_samples}" \
   --online_steps "${online_steps}" \
   --online-pairs-per-step "${online_pairs_per_step}" \
+  --online_save_every_updates "${online_save_every_updates}" \
   --rollout_n "${rollout_n}" \
   --rollout_batch_size "${rollout_batch_size}" \
   --temperature "${temperature}" \

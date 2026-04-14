@@ -36,6 +36,7 @@ max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-512}
 online_steps=${ONLINE_STEPS:-30}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-5}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
@@ -92,6 +93,7 @@ python train_dapo_preference.py \
   --max_source_samples "${max_source_samples}" \
   --online_steps "${online_steps}" \
   --online-pairs-per-step "${online_pairs_per_step}" \
+  --online_save_every_updates "${online_save_every_updates}" \
   --rollout_n "${rollout_n}" \
   --rollout_batch_size "${rollout_batch_size}" \
   --temperature "${temperature}" \

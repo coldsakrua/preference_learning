@@ -423,6 +423,8 @@ def summarize_result_subset(
     return {
         "num_problems": n_d,
         "pass_at_k": pass_at_k,
+        # Treat n generations as n independent pass@1 trials and average them.
+        "average_pass1_over_gen_n_pct": 100.0 * tot_correct / total_sol if total_sol else 0.0,
         "majority_vote_pct": 100.0 * maj / n_d if n_d else 0.0,
         "average_correct_pct": 100.0 * tot_correct / total_sol if total_sol else 0.0,
         "format_rate_pct": 100.0 * fmt / total_sol if total_sol else 0.0,
@@ -862,6 +864,8 @@ def main() -> None:
             "num_problems": processed,
             "num_problems_total": n_prompts,
             "total_solutions": total_solutions,
+            # Treat pass@gen_n as gen_n independent pass@1 evaluations and average.
+            "average_pass1_over_gen_n_pct": 100.0 * total_correct / total_solutions if total_solutions else 0.0,
             "average_correct_pct": 100.0 * total_correct / total_solutions if total_solutions else 0.0,
             "majority_vote_pct": 100.0 * majority_correct / processed if processed else 0.0,
             "format_rate_pct": 100.0 * formatted_total / total_solutions if total_solutions else 0.0,
@@ -888,6 +892,8 @@ def main() -> None:
         for k in pass_at_k_list:
             s = m["pass_at_k"][str(k)]
             print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})")
+        print(f"  Avg pass@1 over n={gen_n}: {m['average_pass1_over_gen_n_pct']:.2f}%")
+    print(f"Avg pass@1 over n={gen_n}: {summary['average_pass1_over_gen_n_pct']:.2f}%")
     print(f"Avg correct / sample: {summary['average_correct_pct']:.2f}%")
     print(f"Majority vote: {summary['majority_vote_pct']:.2f}%")
     print(f"Boxed format rate: {summary['format_rate_pct']:.2f}%")
