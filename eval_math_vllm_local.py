@@ -532,6 +532,15 @@ def main() -> None:
     )
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument(
+        "--force-base-tokenizer",
+        action="store_true",
+        default=False,
+        help=(
+            "Always load tokenizer/chat template from --model-path (vLLM base), "
+            "even when LoRA adapter dir contains tokenizer files."
+        ),
+    )
+    parser.add_argument(
         "--generate-batch-size",
         type=int,
         default=0,
@@ -658,8 +667,13 @@ def main() -> None:
     )
 
     tokenizer_src = vllm_model_path
-    if lora_dir is not None and (lora_dir / "tokenizer_config.json").is_file():
+    if (
+        not args.force_base_tokenizer
+        and lora_dir is not None
+        and (lora_dir / "tokenizer_config.json").is_file()
+    ):
         tokenizer_src = str(lora_dir.resolve())
+    print(f"[eval] tokenizer_source={tokenizer_src}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
 
     lora_request = None

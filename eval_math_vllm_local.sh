@@ -34,7 +34,7 @@ data_format=${DATA_FORMAT:-auto}
 # LoRA: set CHECKPOINT_DIR or LORA_PATH (adapter dir, or .../train — eval picks final/ or lora_adapter/).
 checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260414_090601_job1375309/train/vllm_rollout_ckpt/lora_adapter}}
 max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-64}}
-use_lora=${USE_LORA:-1}
+use_lora=${USE_LORA:-0}
 num_samples=${NUM_SAMPLES:-0}
 val_n=${VAL_N:-16}
 pass_at_k=${PASS_AT_K:-1,4,8,16}
@@ -46,6 +46,7 @@ tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 max_model_len=${MAX_MODEL_LEN:-0}
 generate_batch_size=${GENERATE_BATCH_SIZE:-16}
+force_base_tokenizer=${FORCE_BASE_TOKENIZER:-1}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -67,6 +68,7 @@ echo "[EVAL] checkpoint_dir=${checkpoint_dir:-<none>}"
 echo "[EVAL] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
 echo "[EVAL] DATASETS=${datasets_csv}"
 echo "[EVAL] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
+echo "[EVAL] FORCE_BASE_TOKENIZER=${force_base_tokenizer} (1=base tokenizer/chat_template)"
 echo "[EVAL] output_json=${output_json}"
 
 cmd=(
@@ -110,6 +112,10 @@ fi
 
 if [[ "${NO_THINKING}" == "1" ]]; then
   cmd+=(--no-thinking)
+fi
+
+if [[ "${force_base_tokenizer}" == "1" ]]; then
+  cmd+=(--force-base-tokenizer)
 fi
 
 "${cmd[@]}"
