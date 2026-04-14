@@ -54,16 +54,16 @@ Supported arguments:
 - `--prompt_candidates_file config/prompt_candidates_en.txt`
 - `--use_default_prompt_candidates true`
 - `--prompt_fixed_index 0`
-- `--sample_rejected_requires_final_answer true` (default): reject truncated/no-final-answer negatives at sampling time
-- `--sample_chosen_requires_final_answer false` (optional stricter filter)
+- `--sample_rejected_requires_final_answer true` (default): enforce DAPO final-line format (`Answer: ...`) for rejected samples
+- `--sample_chosen_requires_final_answer true` (default): enforce DAPO final-line format (`Answer: ...`) for chosen samples
 - `--pref_weight_rarity_floor 0.25`: rarity bonus floor in entropy-rarity weighting
 - `--full_correct_sft_weight 1.0`: per-prompt objective weight for the all-correct SFT branch
 
-Answer parsing in sampling is robust to markdown variants, for example:
+Answer parsing in sampling follows DAPO-style last-line extraction:
 
-- `Answer: 10`
-- `**Answer:** 10`
-- `**Answer: 10**`
+- only the last non-empty line is used
+- it must start with `Answer:` (case-insensitive, `：` also accepted)
+- both `Answer: 10` and `Answer: $10` are accepted
 
 In online mode, sampled pairs are logged to `<output_dir>/online_pairs.jsonl`.
 

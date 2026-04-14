@@ -33,15 +33,15 @@ from tqdm import tqdm
 DEFAULT_SYSTEM_PROMPT = (
     "You are a precise math reasoning assistant. "
     "Solve the problem step by step, then end with exactly one final line in the format: "
-    "Answer: <final_answer>."
+    "Answer: $<final_answer>."
 )
 
 DEFAULT_PROMPT_CANDIDATES = [
-    "You are a careful math tutor. Show concise but correct reasoning and finish with: Answer: <final_answer>.",
-    "Solve the math problem with rigorous steps. Keep reasoning structured and end with: Answer: <final_answer>.",
-    "You are an expert competition-math assistant. Verify key steps and finish with: Answer: <final_answer>.",
-    "Reason clearly and avoid arithmetic mistakes. The last line must be: Answer: <final_answer>.",
-    "Produce a correct step-by-step solution, then output one final line: Answer: <final_answer>.",
+    "You are a careful math tutor. Show concise but correct reasoning and finish with: Answer: $<final_answer>.",
+    "Solve the math problem with rigorous steps. Keep reasoning structured and end with: Answer: $<final_answer>.",
+    "You are an expert competition-math assistant. Verify key steps and finish with: Answer: $<final_answer>.",
+    "Reason clearly and avoid arithmetic mistakes. The last line must be: Answer: $<final_answer>.",
+    "Produce a correct step-by-step solution, then output one final line: Answer: $<final_answer>.",
 ]
 
 
@@ -240,8 +240,8 @@ def apply_qwen_chat_template(
 
 _ANSWER_LINE = re.compile(r"answer\s*[:\uFF1A]\s*(.+)", flags=re.IGNORECASE)
 _ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
-# dapo-math parquet prompt format: "Answer: $Answer"
-_ANSWER_LINE_PARQUET = re.compile(r"^\s*answer\s*[:\uFF1A]\s*\$(.+?)\s*$", flags=re.IGNORECASE)
+# DAPO prompt contract: last line should start with "Answer:" (allow optional leading "$").
+_ANSWER_LINE_PARQUET = re.compile(r"^\s*answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
 _BOXED = re.compile(r"\\boxed\{([^{}]+)\}")
 _LATEX_FRAC = re.compile(r"\\frac\{(-?\d+)\}\{(-?\d+)\}")
 
@@ -288,11 +288,18 @@ def parse_answer_from_line(line: str) -> Optional[str]:
 
 
 def parse_answer_from_line_parquet(line: str) -> Optional[str]:
-    normalized_line = normalize_answer_line_for_parse(line)
-    match = _ANSWER_LINE_PARQUET.match(normalized_line)
+    raw_line = line.strip()
+    match = _ANSWER_LINE_PARQUET.match(raw_line)
     if not match:
         return None
-    answer = strip_outer_formatting(match.group(1))
+    answer = match.group(1).strip()
+    # DAPO prompt text uses "$Answer" as a placeholder. Accept both
+    # "Answer: 42" and "Answer: $42" by removing one optional leading "$".
+    if answer.startswith("$"):
+        answer = answer[1:].strip()
+    answer = strip_outer_formatting(answer)
+    if answer.startswith("$"):
+        answer = answer[1:].strip()
     if not answer:
         return None
     return answer
@@ -304,7 +311,7 @@ def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return False, ""
-    # Strictly follow parquet instruction format: last line must be "Answer: $..."
+    # Strictly follow DAPO prompt contract: last line must be "Answer: ...".
     answer = parse_answer_from_line_parquet(lines[-1])
     if answer is None:
         return False, ""
@@ -313,31 +320,9 @@ def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
 
 def extract_final_answer_robust(text: str) -> str:
     has_last, answer_last = extract_final_answer_if_last_line(text)
-    if has_last:
-        return answer_last
-
-    if "</think>" in text:
-        text = text.split("</think>")[-1]
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in reversed(lines[-4:]):
-        answer = parse_answer_from_line(line)
-        if answer:
-            return answer
-        match = _ANSWER_LINE.search(normalize_answer_line_for_parse(line))
-        if match:
-            fallback = strip_outer_formatting(match.group(1))
-            if fallback:
-                return fallback
-
-    boxed_matches = _BOXED.findall(text)
-    if boxed_matches:
-        answer = strip_outer_formatting(boxed_matches[-1])
-        if answer:
-            return answer
-
-    if lines:
-        return strip_outer_formatting(lines[-1])
-    return text.strip()
+    if not has_last:
+        return ""
+    return answer_last
 
 
 def extract_final_answer(text: str) -> str:
@@ -419,7 +404,7 @@ def choose_preference_pair(
     rejected_final_answer = ""
     for candidate in candidates:
         has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
-        parsed_answer = parsed_last_answer if has_final_answer_line else extract_final_answer_robust(candidate)
+        parsed_answer = parsed_last_answer if has_final_answer_line else ""
         is_correct = answer_text_matches(parsed_answer, ground_truth)
 
         if is_correct:
@@ -453,8 +438,9 @@ def build_preference_jsonl_record(
     pair: Dict[str, str],
 ) -> Dict[str, Any]:
     """JSONL row: chosen/rejected plus raw rollouts (n=rollout_n) and per-rollout correctness."""
-    responses_final_answers = [extract_final_answer_robust(c) for c in candidates]
-    responses_has_final_answer_line = [extract_final_answer_if_last_line(c)[0] for c in candidates]
+    parsed = [extract_final_answer_if_last_line(c) for c in candidates]
+    responses_has_final_answer_line = [p[0] for p in parsed]
+    responses_final_answers = [p[1] if p[0] else "" for p in parsed]
     return {
         "sample_id": sample_id,
         "prompt": prompt,
@@ -498,7 +484,7 @@ def split_rollout_candidates_for_training(
     wrong_kept: List[str] = []
     for candidate in candidates:
         has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
-        parsed_answer = parsed_last_answer if has_final_answer_line else extract_final_answer_robust(candidate)
+        parsed_answer = parsed_last_answer if has_final_answer_line else ""
         is_correct = answer_text_matches(parsed_answer, ground_truth)
         responses_has_final_answer_line.append(has_final_answer_line)
         responses_final_answers.append(parsed_answer)
@@ -789,10 +775,23 @@ def _compute_sequence_logps_batch(
     seq_lens = attention_mask.sum(dim=1).tolist()
 
     for i, seq_len in enumerate(seq_lens):
+        seq_len = int(seq_len)
+        if seq_len <= 0:
+            continue
+
         prompt_len = len(prompt_ids[i])
-        start = min(prompt_len, seq_len)
-        if start < seq_len:
-            labels[i, start:seq_len] = input_ids[i, start:seq_len]
+        # Use attention_mask to locate the actual non-pad span so labeling is
+        # correct for both left-padding and right-padding.
+        non_pad_positions = attention_mask[i].nonzero(as_tuple=False)
+        if non_pad_positions.numel() == 0:
+            continue
+        content_start = int(non_pad_positions[0].item())
+        content_end = content_start + seq_len
+        completion_start = min(content_start + prompt_len, content_end)
+        if completion_start < content_end:
+            labels[i, completion_start:content_end] = input_ids[
+                i, completion_start:content_end
+            ]
 
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     shifted_logits = logits[:, :-1, :]
@@ -2054,16 +2053,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=True,
         help=(
-            "Sampling filter: rejected response must have a parseable final answer on LAST line "
-            "(supports markdown variants like '**Answer:** 10'). Truncated/no-final-answer rejected "
-            "responses are dropped."
+            "Sampling filter: rejected response must satisfy DAPO last-line format "
+            "'Answer: ...' (optional leading '$') on the LAST line."
         ),
     )
     parser.add_argument(
         "--sample_chosen_requires_final_answer",
         type=str2bool,
-        default=False,
-        help="Sampling filter: if true, chosen response also needs a parseable final answer on LAST line.",
+        default=True,
+        help=(
+            "Sampling filter: chosen response must satisfy DAPO last-line format "
+            "'Answer: ...' (optional leading '$') on the LAST line."
+        ),
     )
 
     # shared chat format

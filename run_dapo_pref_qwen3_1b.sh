@@ -104,7 +104,7 @@ python train_dapo_preference.py \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --sample_rejected_requires_final_answer true \
-  --sample_chosen_requires_final_answer false \
+  --sample_chosen_requires_final_answer true \
   --enable_thinking false
 
 echo "[DAPO-PREF] done"
