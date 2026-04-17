@@ -88,6 +88,60 @@ class OnlineStepLossStats:
     mean_gap: float
     pref_pairs_used: int
     sft_samples_used: int
+    lora_mean_abs: float
+    lora_max_abs: float
+    lora_nan_ratio: float
+    lora_inf_ratio: float
+    grad_norm: float
+    update_applied: bool
+    skip_reason: str
+
+
+def _compute_lora_param_health(model: object) -> Dict[str, float]:
+    """Compute lightweight LoRA parameter health metrics after each update."""
+    named_params = getattr(model, "named_parameters", None)
+    if not callable(named_params):
+        return {
+            "lora_mean_abs": 0.0,
+            "lora_max_abs": 0.0,
+            "lora_nan_ratio": 0.0,
+            "lora_inf_ratio": 0.0,
+        }
+
+    total_numel = 0
+    nan_numel = 0
+    inf_numel = 0
+    abs_sum = 0.0
+    abs_max = 0.0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_" not in name:
+                continue
+            if param is None:
+                continue
+            tensor = param.detach()
+            if tensor.numel() == 0:
+                continue
+            total_numel += tensor.numel()
+            nan_numel += int(torch.isnan(tensor).sum().item())
+            inf_numel += int(torch.isinf(tensor).sum().item())
+            abs_tensor = torch.abs(tensor)
+            abs_sum += float(abs_tensor.sum().item())
+            abs_max = max(abs_max, float(abs_tensor.max().item()))
+
+    if total_numel == 0:
+        return {
+            "lora_mean_abs": 0.0,
+            "lora_max_abs": 0.0,
+            "lora_nan_ratio": 0.0,
+            "lora_inf_ratio": 0.0,
+        }
+    return {
+        "lora_mean_abs": abs_sum / total_numel,
+        "lora_max_abs": abs_max,
+        "lora_nan_ratio": nan_numel / total_numel,
+        "lora_inf_ratio": inf_numel / total_numel,
+    }
 
 
 @dataclass
@@ -469,6 +523,25 @@ def compute_entropy_rarity_weight(
     entropy = -(r * math.log(r + eps) + (1.0 - r) * math.log(1.0 - r + eps))
     rarity_bonus = max(1.0 - r, rarity_floor)
     return r, entropy, rarity_bonus, entropy * rarity_bonus
+
+
+def compute_single_pair_weight(
+    base_weight: float,
+    n_correct: int,
+    n_wrong: int,
+    mode: str,
+) -> float:
+    """Scale single selected pref pair by correctness composition."""
+    pair_count_product = float(max(1, n_correct * n_wrong))
+    if mode == "none":
+        return float(base_weight)
+    if mode == "sum":
+        return float(base_weight) * float(max(1, n_correct + n_wrong))
+    if mode == "sqrt_product":
+        return float(base_weight) * math.sqrt(pair_count_product)
+    if mode in {"product", "n_right_mul_n_wrong"}:
+        return float(base_weight) * pair_count_product
+    raise ValueError(f"Unsupported single-pair count weight mode: {mode}")
 
 
 def split_rollout_candidates_for_training(
@@ -1514,6 +1587,13 @@ def _online_run_preference_optimizer_step(
             mean_gap=0.0,
             pref_pairs_used=0,
             sft_samples_used=0,
+            lora_mean_abs=0.0,
+            lora_max_abs=0.0,
+            lora_nan_ratio=0.0,
+            lora_inf_ratio=0.0,
+            grad_norm=0.0,
+            update_applied=False,
+            skip_reason="zero_total_weight",
         )
     mb_pref = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(pref_batch, 1)
     mb_sft = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(sft_batch, 1)
@@ -1552,11 +1632,49 @@ def _online_run_preference_optimizer_step(
             preference_gap = chosen_logps - rejected_logps
             pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (pref_loss_vec * w).sum() / total_weight
+            loss_chunk_val = float(loss_chunk.detach().item())
             if not loss_chunk.requires_grad:
                 raise RuntimeError(
                     "Online preference loss has no grad_fn. "
                     "If use_lora=true with gradient_checkpointing=true, "
                     "ensure input grads are enabled for checkpointing."
+                )
+            if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
+                optimizer.zero_grad(set_to_none=True)
+                return OnlineStepLossStats(
+                    total_loss=0.0,
+                    pref_loss=0.0,
+                    sft_loss=0.0,
+                    mean_gap=0.0,
+                    pref_pairs_used=0,
+                    sft_samples_used=0,
+                    lora_mean_abs=0.0,
+                    lora_max_abs=0.0,
+                    lora_nan_ratio=0.0,
+                    lora_inf_ratio=0.0,
+                    grad_norm=0.0,
+                    update_applied=False,
+                    skip_reason=f"nonfinite_pref_loss_chunk(start={start},end={end})",
+                )
+            if args.online_loss_value_cap > 0 and abs(loss_chunk_val) > args.online_loss_value_cap:
+                optimizer.zero_grad(set_to_none=True)
+                return OnlineStepLossStats(
+                    total_loss=0.0,
+                    pref_loss=0.0,
+                    sft_loss=0.0,
+                    mean_gap=0.0,
+                    pref_pairs_used=0,
+                    sft_samples_used=0,
+                    lora_mean_abs=0.0,
+                    lora_max_abs=0.0,
+                    lora_nan_ratio=0.0,
+                    lora_inf_ratio=0.0,
+                    grad_norm=0.0,
+                    update_applied=False,
+                    skip_reason=(
+                        f"pref_loss_chunk_too_large(value={loss_chunk_val:.4f},"
+                        f"cap={args.online_loss_value_cap:.4f})"
+                    ),
                 )
             loss_chunk.backward()
             pref_loss_weighted_sum += (pref_loss_vec * w).sum().item()
@@ -1580,18 +1698,100 @@ def _online_run_preference_optimizer_step(
             )
             sft_loss_vec = -logps
             loss_chunk = (sft_loss_vec * w).sum() / total_weight
+            loss_chunk_val = float(loss_chunk.detach().item())
             if not loss_chunk.requires_grad:
                 raise RuntimeError(
                     "Online SFT loss has no grad_fn. "
                     "If use_lora=true with gradient_checkpointing=true, "
                     "ensure input grads are enabled for checkpointing."
                 )
+            if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
+                optimizer.zero_grad(set_to_none=True)
+                return OnlineStepLossStats(
+                    total_loss=0.0,
+                    pref_loss=0.0,
+                    sft_loss=0.0,
+                    mean_gap=0.0,
+                    pref_pairs_used=0,
+                    sft_samples_used=0,
+                    lora_mean_abs=0.0,
+                    lora_max_abs=0.0,
+                    lora_nan_ratio=0.0,
+                    lora_inf_ratio=0.0,
+                    grad_norm=0.0,
+                    update_applied=False,
+                    skip_reason=f"nonfinite_sft_loss_chunk(start={start},end={end})",
+                )
+            if args.online_loss_value_cap > 0 and abs(loss_chunk_val) > args.online_loss_value_cap:
+                optimizer.zero_grad(set_to_none=True)
+                return OnlineStepLossStats(
+                    total_loss=0.0,
+                    pref_loss=0.0,
+                    sft_loss=0.0,
+                    mean_gap=0.0,
+                    pref_pairs_used=0,
+                    sft_samples_used=0,
+                    lora_mean_abs=0.0,
+                    lora_max_abs=0.0,
+                    lora_nan_ratio=0.0,
+                    lora_inf_ratio=0.0,
+                    grad_norm=0.0,
+                    update_applied=False,
+                    skip_reason=(
+                        f"sft_loss_chunk_too_large(value={loss_chunk_val:.4f},"
+                        f"cap={args.online_loss_value_cap:.4f})"
+                    ),
+                )
             loss_chunk.backward()
             sft_loss_weighted_sum += (sft_loss_vec * w).sum().item()
 
+    trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+        total_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+    else:
+        grad_norm_parts = [torch.linalg.vector_norm(p.grad.detach(), ord=2) for p in trainable if p.grad is not None]
+        if grad_norm_parts:
+            total_norm = torch.linalg.vector_norm(torch.stack(grad_norm_parts), ord=2)
+        else:
+            total_norm = torch.tensor(0.0, device=device)
+    grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
+    if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
+        optimizer.zero_grad(set_to_none=True)
+        return OnlineStepLossStats(
+            total_loss=0.0,
+            pref_loss=0.0,
+            sft_loss=0.0,
+            mean_gap=0.0,
+            pref_pairs_used=0,
+            sft_samples_used=0,
+            lora_mean_abs=0.0,
+            lora_max_abs=0.0,
+            lora_nan_ratio=0.0,
+            lora_inf_ratio=0.0,
+            grad_norm=grad_norm,
+            update_applied=False,
+            skip_reason="nonfinite_grad_norm",
+        )
+    if args.online_hard_grad_norm_cap > 0 and grad_norm > args.online_hard_grad_norm_cap:
+        optimizer.zero_grad(set_to_none=True)
+        return OnlineStepLossStats(
+            total_loss=0.0,
+            pref_loss=0.0,
+            sft_loss=0.0,
+            mean_gap=0.0,
+            pref_pairs_used=0,
+            sft_samples_used=0,
+            lora_mean_abs=0.0,
+            lora_max_abs=0.0,
+            lora_nan_ratio=0.0,
+            lora_inf_ratio=0.0,
+            grad_norm=grad_norm,
+            update_applied=False,
+            skip_reason=(
+                f"grad_norm_too_large(value={grad_norm:.4f},"
+                f"cap={args.online_hard_grad_norm_cap:.4f})"
+            ),
+        )
     optimizer.step()
 
     mean_gap = gap_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
@@ -1599,6 +1799,12 @@ def _online_run_preference_optimizer_step(
     sft_weight_sum = float(sum(sft_weights))
     sft_loss = sft_loss_weighted_sum / sft_weight_sum if sft_weight_sum > 0 else 0.0
     total_loss = (pref_loss_weighted_sum + sft_loss_weighted_sum) / total_weight
+    lora_health = _compute_lora_param_health(model)
+    if args.online_abort_on_lora_nan and lora_health["lora_nan_ratio"] > 0:
+        raise RuntimeError(
+            "Detected NaN in LoRA params after optimizer.step: "
+            f"lora_nan_ratio={lora_health['lora_nan_ratio']:.6f}"
+        )
     return OnlineStepLossStats(
         total_loss=total_loss,
         pref_loss=pref_loss,
@@ -1606,6 +1812,13 @@ def _online_run_preference_optimizer_step(
         mean_gap=mean_gap,
         pref_pairs_used=pref_batch,
         sft_samples_used=sft_batch,
+        lora_mean_abs=lora_health["lora_mean_abs"],
+        lora_max_abs=lora_health["lora_max_abs"],
+        lora_nan_ratio=lora_health["lora_nan_ratio"],
+        lora_inf_ratio=lora_health["lora_inf_ratio"],
+        grad_norm=grad_norm,
+        update_applied=True,
+        skip_reason="",
     )
 
 
@@ -1868,13 +2081,29 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                             pair_count = len(objective.correct) * len(objective.wrong)
                             if pair_count <= 0:
                                 continue
-                            pair_weight = objective.pair_weight / pair_count
-                            for c in objective.correct:
-                                for w in objective.wrong:
-                                    pref_train_prompts_raw.append(objective.train_prompt)
-                                    pref_chosen_raw.append(c)
-                                    pref_rejected_raw.append(w)
-                                    pref_weights_raw.append(pair_weight)
+                            if args.pref_pair_mode == "all_pairs":
+                                pair_weight = objective.pair_weight / pair_count
+                                for c in objective.correct:
+                                    for w in objective.wrong:
+                                        pref_train_prompts_raw.append(objective.train_prompt)
+                                        pref_chosen_raw.append(c)
+                                        pref_rejected_raw.append(w)
+                                        pref_weights_raw.append(pair_weight)
+                            elif args.pref_pair_mode == "single_pair":
+                                c = prompt_rng.choice(objective.correct)
+                                w = prompt_rng.choice(objective.wrong)
+                                pair_weight = compute_single_pair_weight(
+                                    base_weight=objective.pair_weight,
+                                    n_correct=len(objective.correct),
+                                    n_wrong=len(objective.wrong),
+                                    mode=args.pref_single_pair_count_weight,
+                                )
+                                pref_train_prompts_raw.append(objective.train_prompt)
+                                pref_chosen_raw.append(c)
+                                pref_rejected_raw.append(w)
+                                pref_weights_raw.append(pair_weight)
+                            else:
+                                raise ValueError(f"Unsupported --pref_pair_mode: {args.pref_pair_mode}")
                         elif objective.objective_type == "sft":
                             sample_count = len(objective.correct)
                             if sample_count <= 0:
@@ -1949,6 +2178,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         sft_completions=sft_completions,
                         sft_weights=sft_weights,
                     )
+                    if not loss_stats.update_applied:
+                        print(
+                            f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                            f"skip optimizer update reason={loss_stats.skip_reason} "
+                            f"grad_norm={loss_stats.grad_norm:.4f}"
+                        )
+                        continue
                     updates += 1
                     updates_in_rollout += 1
                     consumed_pref_pairs_in_rollout += loss_stats.pref_pairs_used
@@ -1962,7 +2198,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         f"loss={loss_stats.total_loss:.4f} "
                         f"pref_loss={loss_stats.pref_loss:.4f} "
                         f"sft_loss={loss_stats.sft_loss:.4f} "
-                        f"gap={loss_stats.mean_gap:.4f}"
+                        f"gap={loss_stats.mean_gap:.4f} "
+                        f"grad_norm={loss_stats.grad_norm:.4f} "
+                        f"lora_mean_abs={loss_stats.lora_mean_abs:.6e} "
+                        f"lora_max_abs={loss_stats.lora_max_abs:.6e} "
+                        f"lora_nan_ratio={loss_stats.lora_nan_ratio:.6f} "
+                        f"lora_inf_ratio={loss_stats.lora_inf_ratio:.6f}"
                     )
 
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
@@ -2122,7 +2363,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.02,
         help=(
             "Deprecated compatibility flag (kept for old run scripts). "
-            "The online objective now uses weighted all-pairs preference + full-correct SFT."
+            "The online objective now uses configurable pair selection + full-correct SFT."
+        ),
+    )
+    parser.add_argument(
+        "--pref_pair_mode",
+        type=str,
+        default="single_pair",
+        choices=["single_pair", "all_pairs"],
+        help=(
+            "Preference pair construction mode for mixed correct/wrong prompts. "
+            "'single_pair': sample one (correct, wrong) pair; "
+            "'all_pairs': use full cartesian product."
+        ),
+    )
+    parser.add_argument(
+        "--pref_single_pair_count_weight",
+        type=str,
+        default="product",
+        choices=["none", "sum", "sqrt_product", "product", "n_right_mul_n_wrong"],
+        help=(
+            "When --pref_pair_mode=single_pair, scale selected pair weight by "
+            "correct/wrong counts. "
+            "'product' and 'n_right_mul_n_wrong' are equivalent (n_correct * n_wrong)."
         ),
     )
     parser.add_argument(
@@ -2157,6 +2420,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--length_average", type=str2bool, default=True)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--online_hard_grad_norm_cap",
+        type=float,
+        default=5.0,
+        help=(
+            "Online only: hard cap for pre-step grad norm. "
+            "If grad_norm > cap, skip this optimizer update. Use <=0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--online_loss_value_cap",
+        type=float,
+        default=20.0,
+        help=(
+            "Online only: hard cap for each micro-batch loss_chunk absolute value. "
+            "If exceeded, skip this optimizer update. Use <=0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--online_skip_nonfinite_loss",
+        type=str2bool,
+        default=True,
+        help="Online only: skip update when loss chunk or grad norm is non-finite.",
+    )
+    parser.add_argument(
+        "--online_abort_on_lora_nan",
+        type=str2bool,
+        default=True,
+        help="Online only: immediately stop if LoRA params become NaN after optimizer step.",
+    )
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
@@ -2194,7 +2487,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Online only: number of rollout batches to run. Each batch rolls out "
             "rollout_batch_size prompts with --rollout_n samples each; prompt-level "
-            "objectives (weighted mixed all-pairs + full-correct SFT) are consumed "
+            "objectives (mixed-pair preference + full-correct SFT) are consumed "
             "immediately in this rollout step (no cross-step cache). "
             "Use 0 for no limit (until source samples exhausted)."
         ),

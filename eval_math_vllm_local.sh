@@ -24,21 +24,21 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 # model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260411_085017_job1373318/train/final}
 # 1=关闭 Qwen thinking/CoT（--no-thinking）；0=开启 CoT（与 eval 默认一致）
 NO_THINKING=${NO_THINKING:-1}
-datasets_csv=${DATASETS:-aime24}
+datasets_csv=${DATASETS:-math500,aime24,aime25,aime26}
 data_format=${DATA_FORMAT:-auto}
 # LoRA: set CHECKPOINT_DIR or LORA_PATH (adapter dir, or .../train — eval picks final/ or lora_adapter/).
-checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260414_090601_job1375309/train/vllm_rollout_ckpt/lora_adapter}}
+checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260416_174529_job1377661/train/final}}
 max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-64}}
 use_lora=${USE_LORA:-0}
 num_samples=${NUM_SAMPLES:-0}
 val_n=${VAL_N:-16}
 pass_at_k=${PASS_AT_K:-1,4,8,16}
-max_new_tokens=${MAX_NEW_TOKENS:-4096}
+max_new_tokens=${MAX_NEW_TOKENS:-8192}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 seed=${SEED:-42}
