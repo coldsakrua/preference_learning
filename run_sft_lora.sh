@@ -27,31 +27,29 @@ dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/pref
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 seed=${SEED:-42}
-max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-scan_batch_size=${SCAN_BATCH_SIZE:-1024}
 system_prompt=${SYSTEM_PROMPT:-}
 enable_thinking=${ENABLE_THINKING:-true}
 answer_prefix=${ANSWER_PREFIX:-Answer: }
 
 max_length=${MAX_LENGTH:-2048}
-eval_ratio=${EVAL_RATIO:-0.02}
+eval_ratio=${EVAL_RATIO:-0}
 per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
 per_device_eval_batch_size=${PER_DEVICE_EVAL_BATCH_SIZE:-2}
-gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS:-8}
-learning_rate=${LEARNING_RATE:-2e-4}
+gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS:-512}
+max_steps=${MAX_STEPS:-20}
+learning_rate=${LEARNING_RATE:-5e-5}
 weight_decay=${WEIGHT_DECAY:-0.0}
-num_train_epochs=${NUM_TRAIN_EPOCHS:-1}
 warmup_ratio=${WARMUP_RATIO:-0.03}
-logging_steps=${LOGGING_STEPS:-10}
+logging_steps=${LOGGING_STEPS:-1}
 save_steps=${SAVE_STEPS:-200}
 eval_steps=${EVAL_STEPS:-200}
 
 torch_dtype=${TORCH_DTYPE:-bfloat16}
-attn_implementation=${ATTN_IMPLEMENTATION:-flash_attention_2}
+attn_implementation=${ATTN_IMPLEMENTATION:-sdpa}
 gradient_checkpointing=${GRADIENT_CHECKPOINTING:-true}
 
-lora_r=${LORA_R:-16}
-lora_alpha=${LORA_ALPHA:-32}
+lora_r=${LORA_R:-64}
+lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 lora_target_modules=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
 
@@ -69,15 +67,14 @@ mkdir -p "${train_out}"
 echo "[SFT-LoRA] run_root=${run_root}"
 echo "[SFT-LoRA] dataset_path=${dataset_path}"
 echo "[SFT-LoRA] model_path=${model_path}"
+echo "[SFT-LoRA] per_device_train_batch_size=${per_device_train_batch_size} gradient_accumulation_steps=${gradient_accumulation_steps} max_steps=${max_steps} eval_ratio=${eval_ratio}"
 echo "[SFT-LoRA] lora_r=${lora_r} lora_alpha=${lora_alpha} lora_dropout=${lora_dropout}"
 
-python train_sft_lora.py \
+python run_sft_lora.py \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
   --output_dir "${train_out}" \
   --seed "${seed}" \
-  --scan_batch_size "${scan_batch_size}" \
-  --max_source_samples "${max_source_samples}" \
   --system_prompt "${system_prompt}" \
   --enable_thinking "${enable_thinking}" \
   --answer_prefix "${answer_prefix}" \
@@ -86,9 +83,9 @@ python train_sft_lora.py \
   --per_device_train_batch_size "${per_device_train_batch_size}" \
   --per_device_eval_batch_size "${per_device_eval_batch_size}" \
   --gradient_accumulation_steps "${gradient_accumulation_steps}" \
+  --max_steps "${max_steps}" \
   --learning_rate "${learning_rate}" \
   --weight_decay "${weight_decay}" \
-  --num_train_epochs "${num_train_epochs}" \
   --warmup_ratio "${warmup_ratio}" \
   --logging_steps "${logging_steps}" \
   --save_steps "${save_steps}" \

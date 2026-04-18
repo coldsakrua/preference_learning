@@ -159,35 +159,59 @@ class SFTPromptMaskDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        rec = self.records[idx]
-        prompt_text = rec["prompt_text"]
-        completion_text = rec["completion_text"]
-        full_text = prompt_text + completion_text
+    def _encode_prompt_completion(self, prompt_text: str, completion_text: str) -> Optional[Dict[str, List[int]]]:
+        """Tokenize prompt and completion separately, concat, then truncate.
 
-        full_ids = self.tokenizer(
-            full_text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.max_length,
-        )["input_ids"]
-        prompt_ids = self.tokenizer(
+        Separate calls on `prompt` vs `prompt+completion` break subword alignment and
+        can yield labels that are all -100 after truncation, which makes loss nan/inf.
+        """
+        tok = self.tokenizer
+        prompt_ids: List[int] = tok(
             prompt_text,
             add_special_tokens=False,
-            truncation=True,
-            max_length=self.max_length,
+            truncation=False,
         )["input_ids"]
-
-        prompt_len = min(len(prompt_ids), len(full_ids))
+        completion_ids: List[int] = tok(
+            completion_text,
+            add_special_tokens=False,
+            truncation=False,
+        )["input_ids"]
+        if not completion_ids:
+            return None
+        max_len = self.max_length
+        while len(prompt_ids) + len(completion_ids) > max_len:
+            if len(prompt_ids) > 0:
+                prompt_ids = prompt_ids[1:]
+            else:
+                if len(completion_ids) <= 1:
+                    break
+                completion_ids = completion_ids[:-1]
+        if not completion_ids:
+            return None
+        full_ids = prompt_ids + completion_ids
+        prompt_len = len(prompt_ids)
+        if prompt_len > len(full_ids):
+            prompt_len = 0
         labels = [-100] * prompt_len + full_ids[prompt_len:]
         labels = labels[: len(full_ids)]
-
+        supervised = sum(1 for x in labels if x != -100)
+        if supervised == 0:
+            return None
         attention_mask = [1] * len(full_ids)
         return {
             "input_ids": full_ids,
             "labels": labels,
             "attention_mask": attention_mask,
         }
+
+    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
+        for k in range(len(self.records)):
+            j = (idx + k) % len(self.records)
+            r = self.records[j]
+            out = self._encode_prompt_completion(r["prompt_text"], r["completion_text"])
+            if out is not None:
+                return out
+        raise RuntimeError("No sample with non-empty supervised labels.")
 
 
 class DataCollatorForPromptMaskedSFT:
@@ -220,7 +244,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--scan_batch_size", type=int, default=1024)
-    parser.add_argument("--max_source_samples", type=int, default=0)
+    parser.add_argument(
+        "--max_source_samples",
+        type=int,
+        default=0,
+        help="Cap parquet rows loaded (0: if max_steps>0, use max_steps*per_device_batch*grad_accum; else load all).",
+    )
     parser.add_argument("--system_prompt", type=str, default="")
     parser.add_argument("--enable_thinking", type=str2bool, default=True)
     parser.add_argument("--answer_prefix", type=str, default="Answer: ")
@@ -233,6 +262,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--num_train_epochs", type=float, default=1.0)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="If > 0, run exactly this many optimizer steps (overrides num_train_epochs).",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
@@ -259,7 +294,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     if args.max_source_samples == 0:
-        args.max_source_samples = None
+        if args.max_steps > 0:
+            args.max_source_samples = (
+                args.max_steps * args.per_device_train_batch_size * args.gradient_accumulation_steps
+            )
+        else:
+            args.max_source_samples = None
 
     dtype_map = {
         "float16": torch.float16,
@@ -327,9 +367,10 @@ def main() -> None:
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    training_args = TrainingArguments(
+    training_args_kwargs = dict(
         output_dir=args.output_dir,
         overwrite_output_dir=True,
+        max_grad_norm=1.0,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -350,6 +391,18 @@ def main() -> None:
         remove_unused_columns=False,
         evaluation_strategy="steps" if eval_dataset is not None else "no",
     )
+    if args.max_steps > 0:
+        training_args_kwargs["max_steps"] = args.max_steps
+    if args.gradient_checkpointing:
+        training_args_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+    try:
+        training_args = TrainingArguments(**training_args_kwargs)
+    except TypeError as exc:
+        # Compatibility for some transformers versions that use `eval_strategy`.
+        if "evaluation_strategy" not in str(exc):
+            raise
+        training_args_kwargs["eval_strategy"] = training_args_kwargs.pop("evaluation_strategy")
+        training_args = TrainingArguments(**training_args_kwargs)
 
     trainer = Trainer(
         model=model,

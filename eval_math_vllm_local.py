@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 try:
     from math_verify import parse, verify
@@ -37,6 +37,18 @@ try:
     _HAS_MATH_VERIFY = True
 except ImportError:
     _HAS_MATH_VERIFY = False
+
+
+def max_seq_len_from_model_config(model_path: str) -> Optional[int]:
+    """Return max context from config.json (vLLM refuses max_model_len above this unless env override)."""
+    try:
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        m = getattr(cfg, "max_position_embeddings", None)
+        if m is None:
+            m = getattr(cfg, "model_max_length", None)
+        return int(m) if m is not None else None
+    except Exception:
+        return None
 
 
 def extract_boxed_answer(text: str) -> Optional[str]:
@@ -655,6 +667,11 @@ def main() -> None:
         if lora_dir is not None and not _adapter_dir_has_weights(lora_dir):
             print(f"[warn] LoRA dir {lora_dir} has no adapter weights; eval runs base model only.")
         print(f"[eval] vLLM model={vllm_model_path}")
+
+    cfg_max = max_seq_len_from_model_config(vllm_model_path)
+    if cfg_max is not None and max_model_len > cfg_max:
+        print(f"[eval] capping max_model_len {max_model_len} -> {cfg_max} (base model max_position_embeddings)")
+        max_model_len = cfg_max
 
     llm = build_llm(
         vllm_model_path,
