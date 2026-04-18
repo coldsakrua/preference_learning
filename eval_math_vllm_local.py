@@ -906,30 +906,45 @@ def main() -> None:
             "streaming_write": True,
             "results": results,
         }
-        out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[eval] wrote partial json: {processed}/{n_prompts}")
+        # Avoid rewriting the full generations blob every batch (O(n²) I/O, huge last write).
+        # Checkpoint only scalars + metrics; full `results` is written once after the loop.
+        disk_summary = {k: v for k, v in summary.items() if k != "results"}
+        disk_summary["partial_only"] = True
+        disk_summary["results_count"] = len(results)
+        out_path.write_text(json.dumps(disk_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[eval] wrote partial metrics json: {processed}/{n_prompts}", flush=True)
 
     n = len(results)
     pass_at_k_summary = summary["pass_at_k"]
     metrics_by_dataset = summary["metrics_by_dataset"]
 
-    print("\n" + "=" * 60)
-    print("[ALL] combined")
+    print(
+        "[eval] writing final JSON with all generations (can take minutes on large n × problems) ...",
+        flush=True,
+    )
+    out_path.write_text(
+        json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    print(f"[eval] wrote final json -> {out_path}", flush=True)
+
+    print("\n" + "=" * 60, flush=True)
+    print("[ALL] combined", flush=True)
     for k in pass_at_k_list:
         s = pass_at_k_summary[str(k)]
-        print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{n})")
+        print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{n})", flush=True)
     for tag, m in metrics_by_dataset.items():
-        print(f"[{tag}] n={m['num_problems']}")
+        print(f"[{tag}] n={m['num_problems']}", flush=True)
         for k in pass_at_k_list:
             s = m["pass_at_k"][str(k)]
-            print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})")
-        print(f"  Avg pass@1 over n={gen_n}: {m['average_pass1_over_gen_n_pct']:.2f}%")
-    print(f"Avg pass@1 over n={gen_n}: {summary['average_pass1_over_gen_n_pct']:.2f}%")
-    print(f"Avg correct / sample: {summary['average_correct_pct']:.2f}%")
-    print(f"Majority vote: {summary['majority_vote_pct']:.2f}%")
-    print(f"Boxed format rate: {summary['format_rate_pct']:.2f}%")
-    print(f"Wrote {out_path}")
-    print("=" * 60)
+            print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})", flush=True)
+        print(f"  Avg pass@1 over n={gen_n}: {m['average_pass1_over_gen_n_pct']:.2f}%", flush=True)
+    print(f"Avg pass@1 over n={gen_n}: {summary['average_pass1_over_gen_n_pct']:.2f}%", flush=True)
+    print(f"Avg correct / sample: {summary['average_correct_pct']:.2f}%", flush=True)
+    print(f"Majority vote: {summary['majority_vote_pct']:.2f}%", flush=True)
+    print(f"Boxed format rate: {summary['format_rate_pct']:.2f}%", flush=True)
+    print(f"Wrote {out_path}", flush=True)
+    print("=" * 60, flush=True)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,13 @@
 #!/bin/bash
-#SBATCH -o logs/eval_math_sft_local.%j.out
+#SBATCH -o logs/eval_math_sft_local_2gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=24:00:00
+
+
 set -eo pipefail
 nvidia-smi
 
@@ -18,11 +20,13 @@ mkdir -p logs outputs
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+export VLLM_DISABLE_CUSTOM_ALL_REDUCE="${VLLM_DISABLE_CUSTOM_ALL_REDUCE:-1}"
+
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 NO_THINKING=${NO_THINKING:-1}
@@ -38,7 +42,7 @@ max_new_tokens=${MAX_NEW_TOKENS:-4096}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 seed=${SEED:-42}
-tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
+tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 max_model_len=${MAX_MODEL_LEN:-0}
 generate_batch_size=${GENERATE_BATCH_SIZE:-16}
@@ -55,17 +59,18 @@ if [[ "${NO_THINKING}" == "1" ]]; then
 else
   _eval_cot_dir=cot
 fi
-output_json=${OUTPUT_JSON:-outputs/eval_math_sft_local/${_eval_cot_dir}/eval_sft_${run_tag}.json}
+output_json=${OUTPUT_JSON:-outputs/eval_math_sft_local_2gpu/${_eval_cot_dir}/eval_sft_${run_tag}.json}
 
 mkdir -p "$(dirname "${output_json}")"
 
-echo "[EVAL-SFT] model_path=${model_path}"
-echo "[EVAL-SFT] checkpoint_dir=${checkpoint_dir:-<none>}"
-echo "[EVAL-SFT] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
-echo "[EVAL-SFT] DATASETS=${datasets_csv}"
-echo "[EVAL-SFT] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
-echo "[EVAL-SFT] FORCE_BASE_TOKENIZER=${force_base_tokenizer} (1=base tokenizer/chat_template)"
-echo "[EVAL-SFT] output_json=${output_json}"
+echo "[EVAL-SFT-2GPU] model_path=${model_path}"
+echo "[EVAL-SFT-2GPU] checkpoint_dir=${checkpoint_dir:-<none>}"
+echo "[EVAL-SFT-2GPU] USE_LORA=${use_lora}"
+echo "[EVAL-SFT-2GPU] DATASETS=${datasets_csv}"
+echo "[EVAL-SFT-2GPU] NO_THINKING=${NO_THINKING} -> subdir=${_eval_cot_dir}"
+echo "[EVAL-SFT-2GPU] tensor_parallel_size=${tensor_parallel_size} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "[EVAL-SFT-2GPU] FORCE_BASE_TOKENIZER=${force_base_tokenizer}"
+echo "[EVAL-SFT-2GPU] output_json=${output_json}"
 
 cmd=(
   python eval_math_vllm_local.py
@@ -116,4 +121,4 @@ fi
 
 "${cmd[@]}"
 
-echo "[EVAL-SFT] done -> ${output_json}"
+echo "[EVAL-SFT-2GPU] done -> ${output_json}"
