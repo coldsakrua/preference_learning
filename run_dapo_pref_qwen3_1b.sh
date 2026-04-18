@@ -42,7 +42,6 @@ top_p=${TOP_P:-0.95}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.1}
-chosen_ce_weight=${CHOSEN_CE_WEIGHT:-0.02}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
@@ -75,10 +74,9 @@ echo "[DAPO-PREF] online mode: vLLM rollout + HF preference update"
 python train_dapo_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
-  --online_init_model_path "${model_path}" \
-  --rollout_model_path "${model_path}" \
-  --train_model_path "${model_path}" \
+  --model_path "${model_path}" \
   --output_dir "${train_out}" \
+  --require_gold_rationale_for_all_wrong true \
   --online_rollout_backend vllm \
   --tensor_parallel_size "${tensor_parallel_size}" \
   --vllm_dtype "${vllm_dtype}" \
@@ -96,7 +94,6 @@ python train_dapo_preference.py \
   --max_new_tokens "${max_new_tokens}" \
   --learning_rate "${learning_rate}" \
   --beta "${beta}" \
-  --chosen_ce_weight "${chosen_ce_weight}" \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
   --use_lora "${use_lora}" \
@@ -105,8 +102,6 @@ python train_dapo_preference.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --sample_rejected_requires_final_answer true \
-  --sample_chosen_requires_final_answer true \
   --enable_thinking false
 
 echo "[DAPO-PREF] done"

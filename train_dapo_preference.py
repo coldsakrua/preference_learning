@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Online (on-policy) preference training for DAPO math data.
+Online (on-policy) self-bootstrapping training for DAPO math data.
 
 For each rollout step:
-  - Use vLLM/HF to sample N responses per prompt (--rollout_n, default 8).
-  - If mixed correct/wrong: use all (correct x wrong) pairs with pairwise mean loss.
-  - If all correct: use full SFT loss on all sampled responses.
-  - If all wrong: skip for now.
+  - Sample N responses per prompt with current policy.
+  - Split prompt into mixed / all-correct / all-wrong by verifier.
+  - Mixed: rarity-weighted correct MLE + hidden-NN preference.
+  - All-correct: rarity-weighted correct MLE only.
+  - All-wrong: GT-positive preference only.
 """
 
 from __future__ import annotations
@@ -18,17 +19,27 @@ import gc
 import json
 import math
 import random
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from utils import (
+    DapoSample,
+    answer_text_matches,
+    build_parser as build_cli_parser,
+    compute_prompt_rarity_weight,
+    compute_smoothed_correct_rate,
+    extract_final_answer_from_any_line,
+    extract_final_answer_if_last_line,
+    iter_dapo_samples,
+    set_seed,
+    str2bool,
+    strip_prompt_prefix_from_text,
+)
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a precise math reasoning assistant. "
@@ -45,49 +56,47 @@ DEFAULT_PROMPT_CANDIDATES = [
 ]
 
 
-def str2bool(v: str) -> bool:
-    if isinstance(v, bool):
-        return v
-    value = v.strip().lower()
-    if value in {"1", "true", "t", "yes", "y"}:
-        return True
-    if value in {"0", "false", "f", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-@dataclass
-class DapoSample:
-    prompt: str
-    ground_truth: str
-    sample_id: str
-
 
 @dataclass
 class OnlinePendingObjective:
-    """One prompt-level objective queued for immediate rollout-step updates."""
+    """One prompt-level objective queued for immediate rollout-step update."""
 
+    sample_id: str
+    ground_truth: str
     train_prompt: str
-    correct: List[str]
-    wrong: List[str]
-    objective_type: str  # "pref" or "sft"
-    pair_weight: float
+    objective_type: str  # "mixed" | "all_correct" | "all_wrong"
+    rho_hat: float
+    prompt_weight: float
+    correct: List["RolloutTrajectory"]
+    wrong: List["RolloutTrajectory"]
+    correct_traj_weights: List[float]
+    mixed_pref_pairs: List[Tuple[int, int]]  # (correct_idx, wrong_idx)
+    gt_positive: Optional["RolloutTrajectory"]
+
+
+@dataclass
+class RolloutTrajectory:
+    response_text: str
+    token_ids: List[int]
+    is_correct: bool
+    fail_type: str
+    has_final_answer_line: bool
+    final_answer: str
+    avg_logprob: float
+    avg_nll: float
+    hidden_vec: List[float]
 
 
 @dataclass
 class OnlineStepLossStats:
     total_loss: float
+    mle_loss: float
     pref_loss: float
-    sft_loss: float
+    gt_pref_loss: float
     mean_gap: float
     pref_pairs_used: int
-    sft_samples_used: int
+    gt_pref_pairs_used: int
+    mle_samples_used: int
     lora_mean_abs: float
     lora_max_abs: float
     lora_nan_ratio: float
@@ -149,59 +158,11 @@ class RolloutCandidateSplit:
     responses_has_final_answer_line: List[bool]
     responses_final_answers: List[str]
     responses_correct: List[bool]
+    responses_fail_type: List[str]
+    correct_kept_indices: List[int]
+    wrong_kept_indices: List[int]
     correct_kept: List[str]
     wrong_kept: List[str]
-
-
-def extract_user_prompt(messages: object) -> str:
-    if not isinstance(messages, list) or not messages:
-        return ""
-    user_contents: List[str] = []
-    for message in messages:
-        if isinstance(message, dict) and message.get("role") == "user":
-            content = str(message.get("content", "")).strip()
-            if content:
-                user_contents.append(content)
-    if user_contents:
-        return user_contents[-1]
-    for message in reversed(messages):
-        if isinstance(message, dict):
-            content = str(message.get("content", "")).strip()
-            if content:
-                return content
-    return ""
-
-
-def iter_dapo_samples(
-    parquet_path: str,
-    scan_batch_size: int,
-    max_source_samples: Optional[int],
-) -> Iterator[DapoSample]:
-    parquet_file = pq.ParquetFile(parquet_path)
-    yielded = 0
-    columns = ["prompt", "reward_model", "extra_info"]
-    for record_batch in parquet_file.iter_batches(batch_size=scan_batch_size, columns=columns):
-        prompt_col = record_batch.column("prompt").to_pylist()
-        reward_col = record_batch.column("reward_model").to_pylist()
-        extra_col = record_batch.column("extra_info").to_pylist()
-        for prompt_obj, reward_obj, extra_obj in zip(prompt_col, reward_col, extra_col):
-            prompt_text = extract_user_prompt(prompt_obj)
-            if not prompt_text:
-                continue
-            ground_truth = ""
-            if isinstance(reward_obj, dict):
-                ground_truth = str(reward_obj.get("ground_truth", "")).strip()
-            if not ground_truth:
-                continue
-            sample_id = ""
-            if isinstance(extra_obj, dict):
-                sample_id = str(extra_obj.get("index", "")).strip()
-            if not sample_id:
-                sample_id = f"row-{yielded}"
-            yield DapoSample(prompt=prompt_text, ground_truth=ground_truth, sample_id=sample_id)
-            yielded += 1
-            if max_source_samples is not None and yielded >= max_source_samples:
-                return
 
 
 def load_prompt_candidates_from_file(prompt_file: str) -> List[str]:
@@ -292,543 +253,160 @@ def apply_qwen_chat_template(
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-_ANSWER_LINE = re.compile(r"answer\s*[:\uFF1A]\s*(.+)", flags=re.IGNORECASE)
-_ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
-# DAPO prompt contract: last line should start with "Answer:" (allow optional leading "$").
-_ANSWER_LINE_PARQUET = re.compile(r"^\s*answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
-_BOXED = re.compile(r"\\boxed\{([^{}]+)\}")
-_LATEX_FRAC = re.compile(r"\\frac\{(-?\d+)\}\{(-?\d+)\}")
-
-
-def strip_outer_formatting(text: str) -> str:
-    s = text.strip()
-    wrappers = [
-        ("**", "**"),
-        ("*", "*"),
-        ("`", "`"),
-        ("$", "$"),
-        ("\\(", "\\)"),
-        ("\\[", "\\]"),
-    ]
-    changed = True
-    while changed and s:
-        changed = False
-        for left, right in wrappers:
-            if s.startswith(left) and s.endswith(right) and len(s) > len(left) + len(right):
-                s = s[len(left) : -len(right)].strip()
-                changed = True
-    return s
-
-
-def normalize_answer_line_for_parse(line: str) -> str:
-    s = line.strip()
-    # Remove common markdown quote/list prefixes.
-    s = re.sub(r"^[>\-\*\#\s]+", "", s)
-    # Remove common markdown emphasis wrappers.
-    s = s.replace("**", "").replace("__", "").replace("`", "")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def parse_answer_from_line(line: str) -> Optional[str]:
-    normalized_line = normalize_answer_line_for_parse(line)
-    match = _ANSWER_LINE_CANONICAL.match(normalized_line)
-    if not match:
-        return None
-    answer = strip_outer_formatting(match.group(1))
-    if not answer:
-        return None
-    return answer
-
-
-def parse_answer_from_line_parquet(line: str) -> Optional[str]:
-    raw_line = line.strip()
-    match = _ANSWER_LINE_PARQUET.match(raw_line)
-    if not match:
-        return None
-    answer = match.group(1).strip()
-    # DAPO prompt text uses "$Answer" as a placeholder. Accept both
-    # "Answer: 42" and "Answer: $42" by removing one optional leading "$".
-    if answer.startswith("$"):
-        answer = answer[1:].strip()
-    answer = strip_outer_formatting(answer)
-    if answer.startswith("$"):
-        answer = answer[1:].strip()
-    if not answer:
-        return None
-    return answer
-
-
-def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
-    if "</think>" in text:
-        text = text.split("</think>")[-1]
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return False, ""
-    # Strictly follow DAPO prompt contract: last line must be "Answer: ...".
-    answer = parse_answer_from_line_parquet(lines[-1])
-    if answer is None:
-        return False, ""
-    return True, answer
-
-
-def extract_final_answer_robust(text: str) -> str:
-    has_last, answer_last = extract_final_answer_if_last_line(text)
-    if not has_last:
-        return ""
-    return answer_last
-
-
-def extract_final_answer(text: str) -> str:
-    return extract_final_answer_robust(text)
-
-
-def normalize_answer(answer: str) -> str:
-    answer = answer.strip()
-    answer = _BOXED.sub(r"\1", answer)
-    answer = _LATEX_FRAC.sub(r"\1/\2", answer)
-    answer = answer.replace("$", "")
-    answer = answer.replace(",", "")
-    answer = answer.replace("\u3002", "")
-    answer = re.sub(r"\s+", "", answer)
-    answer = answer.rstrip(".")
-    answer = answer.strip("()[]{}")
-    return answer.lower()
-
-
-def to_number_if_simple(answer: str) -> Optional[float]:
-    if re.fullmatch(r"-?\d+(\.\d+)?", answer):
-        return float(answer)
-    if re.fullmatch(r"-?\d+/-?\d+", answer):
-        numerator, denominator = answer.split("/")
-        denominator_value = float(denominator)
-        if abs(denominator_value) < 1e-12:
-            return None
-        return float(numerator) / denominator_value
-    return None
-
-
-def answers_match(predicted_text: str, ground_truth: str) -> bool:
-    predicted = normalize_answer(extract_final_answer_robust(predicted_text))
-    target = normalize_answer(ground_truth)
-    if predicted and predicted == target:
-        return True
-    predicted_num = to_number_if_simple(predicted)
-    target_num = to_number_if_simple(target)
-    if predicted_num is not None and target_num is not None:
-        return abs(predicted_num - target_num) <= 1e-6
-    return False
-
-
-def answer_text_matches(predicted_answer: str, ground_truth: str) -> bool:
-    predicted = normalize_answer(predicted_answer)
-    target = normalize_answer(ground_truth)
-    if predicted and predicted == target:
-        return True
-    predicted_num = to_number_if_simple(predicted)
-    target_num = to_number_if_simple(target)
-    if predicted_num is not None and target_num is not None:
-        return abs(predicted_num - target_num) <= 1e-6
-    return False
-
-
-def extract_normalized_final_answer(text: str) -> str:
-    return normalize_answer(extract_final_answer_robust(text))
-
-def candidates_share_same_final_answer(candidates: Sequence[str]) -> bool:
-    normalized_answers = [extract_normalized_final_answer(candidate) for candidate in candidates]
-    normalized_answers = [answer for answer in normalized_answers if answer]
-    if len(normalized_answers) < 2:
-        return False
-    return len(set(normalized_answers)) == 1
-
-def choose_preference_pair(
-    candidates: Sequence[str],
-    ground_truth: str,
-    require_rejected_final_answer: bool,
-    require_chosen_final_answer: bool,
-) -> Optional[Dict[str, str]]:
-    # Skip pairs with identical final answers (different reasoning but same answer => no preference signal).
-    if candidates_share_same_final_answer(candidates):
-        return None
-
-    chosen = None
-    chosen_final_answer = ""
-    rejected = None
-    rejected_final_answer = ""
-    for candidate in candidates:
-        has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
-        parsed_answer = parsed_last_answer if has_final_answer_line else ""
-        is_correct = answer_text_matches(parsed_answer, ground_truth)
-
-        if is_correct:
-            if require_chosen_final_answer and not has_final_answer_line:
-                continue
-            if chosen is None:
-                chosen = candidate
-                chosen_final_answer = parsed_answer
-        else:
-            if require_rejected_final_answer and not has_final_answer_line:
-                continue
-            if rejected is None:
-                rejected = candidate
-                rejected_final_answer = parsed_last_answer if has_final_answer_line else parsed_answer
-    if chosen is None or rejected is None:
-        return None
-    return {
-        "chosen": chosen,
-        "rejected": rejected,
-        "chosen_final_answer": chosen_final_answer,
-        "rejected_final_answer": rejected_final_answer,
-    }
-
-
-def build_preference_jsonl_record(
-    sample_id: str,
-    prompt: str,
-    system_prompt: str,
-    ground_truth: str,
-    candidates: Sequence[str],
-    pair: Dict[str, str],
-) -> Dict[str, Any]:
-    """JSONL row: chosen/rejected plus raw rollouts (n=rollout_n) and per-rollout correctness."""
-    parsed = [extract_final_answer_if_last_line(c) for c in candidates]
-    responses_has_final_answer_line = [p[0] for p in parsed]
-    responses_final_answers = [p[1] if p[0] else "" for p in parsed]
-    return {
-        "sample_id": sample_id,
-        "prompt": prompt,
-        "system_prompt": system_prompt,
-        "ground_truth": ground_truth,
-        "chosen": pair["chosen"],
-        "rejected": pair["rejected"],
-        "chosen_final_answer": pair.get("chosen_final_answer", ""),
-        "rejected_final_answer": pair.get("rejected_final_answer", ""),
-        "responses": [str(c) for c in candidates],
-        "responses_final_answers": responses_final_answers,
-        "responses_has_final_answer_line": responses_has_final_answer_line,
-        "responses_correct": [answers_match(c, ground_truth) for c in candidates],
-    }
-
-
-def compute_entropy_rarity_weight(
-    n_correct: int,
-    n_total: int,
-    rarity_floor: float,
-    eps: float,
-) -> tuple[float, float, float, float]:
-    if n_total <= 0:
-        return 0.0, 0.0, rarity_floor, 0.0
-    r = n_correct / n_total
-    entropy = -(r * math.log(r + eps) + (1.0 - r) * math.log(1.0 - r + eps))
-    rarity_bonus = max(1.0 - r, rarity_floor)
-    return r, entropy, rarity_bonus, entropy * rarity_bonus
-
-
-def compute_single_pair_weight(
-    base_weight: float,
-    n_correct: int,
-    n_wrong: int,
-    mode: str,
-) -> float:
-    """Scale single selected pref pair by correctness composition."""
-    pair_count_product = float(max(1, n_correct * n_wrong))
-    if mode == "none":
-        return float(base_weight)
-    if mode == "sum":
-        return float(base_weight) * float(max(1, n_correct + n_wrong))
-    if mode == "sqrt_product":
-        return float(base_weight) * math.sqrt(pair_count_product)
-    if mode in {"product", "n_right_mul_n_wrong"}:
-        return float(base_weight) * pair_count_product
-    raise ValueError(f"Unsupported single-pair count weight mode: {mode}")
-
-
 def split_rollout_candidates_for_training(
     candidates: Sequence[str],
     ground_truth: str,
-    require_rejected_final_answer: bool,
-    require_chosen_final_answer: bool,
 ) -> RolloutCandidateSplit:
     responses_has_final_answer_line: List[bool] = []
     responses_final_answers: List[str] = []
     responses_correct: List[bool] = []
+    responses_fail_type: List[str] = []
+    correct_kept_indices: List[int] = []
+    wrong_kept_indices: List[int] = []
     correct_kept: List[str] = []
     wrong_kept: List[str] = []
-    for candidate in candidates:
+    for idx, candidate in enumerate(candidates):
         has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
         parsed_answer = parsed_last_answer if has_final_answer_line else ""
         is_correct = answer_text_matches(parsed_answer, ground_truth)
         responses_has_final_answer_line.append(has_final_answer_line)
         responses_final_answers.append(parsed_answer)
         responses_correct.append(is_correct)
+        if is_correct:
+            responses_fail_type.append("correct")
+        elif not has_final_answer_line:
+            responses_fail_type.append("no_final_answer")
+        elif not parsed_answer:
+            responses_fail_type.append("empty_final_answer")
+        else:
+            responses_fail_type.append("wrong_answer")
 
         if is_correct:
-            if require_chosen_final_answer and not has_final_answer_line:
-                continue
+            correct_kept_indices.append(idx)
             correct_kept.append(str(candidate))
         else:
-            if require_rejected_final_answer and not has_final_answer_line:
-                continue
+            wrong_kept_indices.append(idx)
             wrong_kept.append(str(candidate))
     return RolloutCandidateSplit(
         responses_has_final_answer_line=responses_has_final_answer_line,
         responses_final_answers=responses_final_answers,
         responses_correct=responses_correct,
+        responses_fail_type=responses_fail_type,
+        correct_kept_indices=correct_kept_indices,
+        wrong_kept_indices=wrong_kept_indices,
         correct_kept=correct_kept,
         wrong_kept=wrong_kept,
     )
 
 
-def build_online_objective_jsonl_record(
+def compute_correct_trajectory_weights(
+    correct_trajs: Sequence[RolloutTrajectory],
+    mode: str,
+    tau: float,
+) -> List[float]:
+    count = len(correct_trajs)
+    if count == 0:
+        return []
+    if mode == "uniform":
+        return [1.0 / count for _ in range(count)]
+    if mode != "nll_softmax":
+        raise ValueError(f"Unsupported positive weight mode: {mode}")
+    nll = torch.tensor([float(t.avg_nll) for t in correct_trajs], dtype=torch.float32)
+    logits = float(tau) * nll
+    weights = torch.softmax(logits, dim=0)
+    return [float(x) for x in weights.tolist()]
+
+
+def build_hidden_nn_pairs(
+    correct_trajs: Sequence[RolloutTrajectory],
+    wrong_trajs: Sequence[RolloutTrajectory],
+) -> List[Tuple[int, int]]:
+    if not correct_trajs or not wrong_trajs:
+        return []
+    correct_h = torch.tensor([t.hidden_vec for t in correct_trajs], dtype=torch.float32)
+    wrong_h = torch.tensor([t.hidden_vec for t in wrong_trajs], dtype=torch.float32)
+    # hidden_vec has already been L2-normalized; dot product equals cosine.
+    sim = wrong_h @ correct_h.transpose(0, 1)
+    nn_correct_idx = sim.argmax(dim=1).tolist()
+    return [(int(c_idx), int(w_idx)) for w_idx, c_idx in enumerate(nn_correct_idx)]
+
+
+def rollout_trajectory_to_json(traj: RolloutTrajectory) -> Dict[str, Any]:
+    return {
+        "response_text": traj.response_text,
+        "token_ids": [int(t) for t in traj.token_ids],
+        "is_correct": bool(traj.is_correct),
+        "fail_type": traj.fail_type,
+        "has_final_answer_line": bool(traj.has_final_answer_line),
+        "final_answer": traj.final_answer,
+        "avg_logprob": float(traj.avg_logprob),
+        "avg_nll": float(traj.avg_nll),
+        "hidden_vec": [float(v) for v in traj.hidden_vec],
+    }
+
+
+def build_online_bootstrap_jsonl_record(
+    *,
     sample_id: str,
     prompt: str,
     system_prompt: str,
     ground_truth: str,
     candidates: Sequence[str],
     split: RolloutCandidateSplit,
-    objective_type: str,
-    r: float,
-    entropy: float,
-    rarity_bonus: float,
-    weight: float,
+    objective: Optional[OnlinePendingObjective],
+    prompt_weight: float,
+    rho_hat: float,
+    all_trajectories: Sequence[RolloutTrajectory],
 ) -> Dict[str, Any]:
-    chosen_preview = str(split.correct_kept[0]) if split.correct_kept else ""
-    rejected_preview = str(split.wrong_kept[0]) if split.wrong_kept else ""
     n_correct_total = int(sum(1 for x in split.responses_correct if x))
     n_total = len(candidates)
-    return {
+    n_wrong_total = n_total - n_correct_total
+    objective_type = "skip" if objective is None else objective.objective_type
+    record: Dict[str, Any] = {
         "sample_id": sample_id,
         "prompt": prompt,
         "system_prompt": system_prompt,
         "ground_truth": ground_truth,
-        "chosen": chosen_preview,
-        "rejected": rejected_preview,
         "responses": [str(c) for c in candidates],
         "responses_final_answers": [str(a) for a in split.responses_final_answers],
         "responses_has_final_answer_line": [bool(v) for v in split.responses_has_final_answer_line],
         "responses_correct": [bool(v) for v in split.responses_correct],
-        "correct_kept": [str(c) for c in split.correct_kept],
-        "wrong_kept": [str(w) for w in split.wrong_kept],
+        "responses_fail_type": [str(v) for v in split.responses_fail_type],
+        "correct_kept_indices": [int(i) for i in split.correct_kept_indices],
+        "wrong_kept_indices": [int(i) for i in split.wrong_kept_indices],
         "n_total": n_total,
         "n_correct_total": n_correct_total,
-        "n_wrong_total": n_total - n_correct_total,
+        "n_wrong_total": n_wrong_total,
         "n_correct_kept": len(split.correct_kept),
         "n_wrong_kept": len(split.wrong_kept),
-        "r": float(r),
-        "entropy": float(entropy),
-        "rarity_bonus": float(rarity_bonus),
-        "weight": float(weight),
+        "rho_hat": float(rho_hat),
+        "prompt_weight": float(prompt_weight),
         "objective_type": objective_type,
+        "rollouts": [rollout_trajectory_to_json(t) for t in all_trajectories],
     }
+    if objective is not None:
+        record["correct_traj_weights"] = [float(v) for v in objective.correct_traj_weights]
+        record["mixed_pref_pairs"] = [
+            {"correct_idx": int(c_idx), "wrong_idx": int(w_idx)}
+            for c_idx, w_idx in objective.mixed_pref_pairs
+        ]
+        if objective.gt_positive is not None:
+            record["gt_positive"] = rollout_trajectory_to_json(objective.gt_positive)
+    return record
 
 
-def generate_preference_pairs(args: argparse.Namespace) -> int:
-    from vllm import LLM, SamplingParams
-    from transformers import AutoTokenizer
-
-    output_path = Path(args.preference_pairs_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.rollout_model_path, trust_remote_code=True)
-
-    llm = LLM(
-        model=args.rollout_model_path,
-        tokenizer=args.rollout_model_path,
-        trust_remote_code=True,
-        tensor_parallel_size=args.tensor_parallel_size,
-        dtype=args.vllm_dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.rollout_max_model_len,
-    )
-    sampling_params = SamplingParams(
-        n=args.rollout_n,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_new_tokens,
-        seed=args.seed,
-    )
-    prompt_pool = build_prompt_pool(args)
-    prompt_rng = random.Random(args.seed + 20260410)
-    if args.prompt_mode != "none" and not prompt_pool:
-        raise ValueError(
-            "Prompt mode is not 'none' but prompt pool is empty. "
-            "Set --system_prompt or --prompt_candidate/--prompt_candidates_file, "
-            "or use --use_default_prompt_candidates true."
-        )
-    print(f"[generate] prompt_mode={args.prompt_mode}, prompt_pool_size={len(prompt_pool)}")
-
-    processed = 0
-    saved_pairs = 0
-    same_answer_skipped = 0
-    buffer: List[DapoSample] = []
-
-    source_iter = iter_dapo_samples(
-        parquet_path=args.dataset_path,
-        scan_batch_size=args.scan_batch_size,
-        max_source_samples=args.max_source_samples,
-    )
-
-    with output_path.open("w", encoding="utf-8") as fout:
-        pbar = tqdm(total=args.target_pairs, desc="collect preference pairs", dynamic_ncols=True)
-        for sample in source_iter:
-            buffer.append(sample)
-            processed += 1
-
-            should_flush = len(buffer) >= args.rollout_batch_size
-            if not should_flush:
-                if args.target_pairs is not None and saved_pairs >= args.target_pairs:
-                    break
-                continue
-
-            system_prompts = [
-                choose_system_prompt(
-                    prompt_pool=prompt_pool,
-                    prompt_mode=args.prompt_mode,
-                    prompt_fixed_index=args.prompt_fixed_index,
-                    rng=prompt_rng,
-                )
-                for _ in buffer
-            ]
-            prompts = [
-                apply_qwen_chat_template(
-                    tokenizer,
-                    s.prompt,
-                    enable_thinking=args.enable_thinking,
-                    system_prompt=sp,
-                )
-                for s, sp in zip(buffer, system_prompts)
-            ]
-            outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-            for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
-                candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(
-                    candidates,
-                    sample_obj.ground_truth,
-                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
-                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
-                )
-                if pair is None:
-                    if candidates_share_same_final_answer(candidates):
-                        same_answer_skipped += 1
-                    continue
-                record = build_preference_jsonl_record(
-                    sample_obj.sample_id,
-                    sample_obj.prompt,
-                    system_prompt,
-                    sample_obj.ground_truth,
-                    candidates,
-                    pair,
-                )
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                saved_pairs += 1
-                pbar.update(1)
-                if args.target_pairs is not None and saved_pairs >= args.target_pairs:
-                    break
-
-            buffer = []
-            if args.target_pairs is not None and saved_pairs >= args.target_pairs:
-                break
-
-        if buffer and (args.target_pairs is None or saved_pairs < args.target_pairs):
-            system_prompts = [
-                choose_system_prompt(
-                    prompt_pool=prompt_pool,
-                    prompt_mode=args.prompt_mode,
-                    prompt_fixed_index=args.prompt_fixed_index,
-                    rng=prompt_rng,
-                )
-                for _ in buffer
-            ]
-            prompts = [
-                apply_qwen_chat_template(
-                    tokenizer,
-                    s.prompt,
-                    enable_thinking=args.enable_thinking,
-                    system_prompt=sp,
-                )
-                for s, sp in zip(buffer, system_prompts)
-            ]
-            outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-            for sample_obj, output, system_prompt in zip(buffer, outputs, system_prompts):
-                candidates = [candidate.text for candidate in output.outputs]
-                pair = choose_preference_pair(
-                    candidates,
-                    sample_obj.ground_truth,
-                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
-                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
-                )
-                if pair is None:
-                    if candidates_share_same_final_answer(candidates):
-                        same_answer_skipped += 1
-                    continue
-                record = build_preference_jsonl_record(
-                    sample_obj.sample_id,
-                    sample_obj.prompt,
-                    system_prompt,
-                    sample_obj.ground_truth,
-                    candidates,
-                    pair,
-                )
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                saved_pairs += 1
-                pbar.update(1)
-                if args.target_pairs is not None and saved_pairs >= args.target_pairs:
-                    break
-        pbar.close()
-
-    kept_ratio = (saved_pairs / processed) if processed else 0.0
-    print(
-        f"[generate] processed={processed}, saved_pairs={saved_pairs}, "
-        f"same_answer_skipped={same_answer_skipped}, keep_ratio={kept_ratio:.4f}, output={output_path}"
-    )
-    return saved_pairs
-
-
-class PreferenceDataset(Dataset):
-    def __init__(self, jsonl_path: str, max_pairs: Optional[int] = None) -> None:
-        self.items: List[Dict[str, str]] = []
-        with Path(jsonl_path).open("r", encoding="utf-8") as fin:
-            for line in fin:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                if "prompt" not in item or "chosen" not in item or "rejected" not in item:
-                    continue
-                self.items.append(item)
-                if max_pairs is not None and len(self.items) >= max_pairs:
-                    break
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def __getitem__(self, idx: int) -> Dict[str, str]:
-        return self.items[idx]
-
-
-def collate_batch(batch: List[Dict[str, str]]) -> Dict[str, List[str]]:
-    return {
-        "sample_id": [str(item.get("sample_id", "")).strip() for item in batch],
-        "prompt": [item["prompt"] for item in batch],
-        "system_prompt": [str(item.get("system_prompt", "")).strip() for item in batch],
-        "chosen": [item["chosen"] for item in batch],
-        "rejected": [item["rejected"] for item in batch],
-    }
-
-
-def _compute_sequence_logps_batch(
-    model: object,
+def _labeled_batch_tensors(
     tokenizer: object,
     prompt_texts: Sequence[str],
     completion_texts: Sequence[str],
     max_length: int,
     device: torch.device,
-    length_average: bool,
-) -> torch.Tensor:
-    full_texts = [prompt + completion for prompt, completion in zip(prompt_texts, completion_texts)]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prompts = list(prompt_texts)
+    completions = list(completion_texts)
+    full_texts = [p + c for p, c in zip(prompts, completions)]
     prompt_ids = tokenizer(
-        list(prompt_texts),
+        prompts,
         add_special_tokens=False,
         padding=False,
         truncation=False,
@@ -843,18 +421,13 @@ def _compute_sequence_logps_batch(
     )
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
-
     labels = torch.full_like(input_ids, -100)
     seq_lens = attention_mask.sum(dim=1).tolist()
-
     for i, seq_len in enumerate(seq_lens):
         seq_len = int(seq_len)
         if seq_len <= 0:
             continue
-
         prompt_len = len(prompt_ids[i])
-        # Use attention_mask to locate the actual non-pad span so labeling is
-        # correct for both left-padding and right-padding.
         non_pad_positions = attention_mask[i].nonzero(as_tuple=False)
         if non_pad_positions.numel() == 0:
             continue
@@ -862,253 +435,134 @@ def _compute_sequence_logps_batch(
         content_end = content_start + seq_len
         completion_start = min(content_start + prompt_len, content_end)
         if completion_start < content_end:
-            labels[i, completion_start:content_end] = input_ids[
-                i, completion_start:content_end
-            ]
+            labels[i, completion_start:content_end] = input_ids[i, completion_start:content_end]
+    return input_ids, attention_mask, labels
 
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+def _seq_logps_from_logits_labels(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
     shifted_logits = logits[:, :-1, :]
     shifted_labels = labels[:, 1:]
-
     valid_mask = shifted_labels.ne(-100)
     safe_labels = shifted_labels.masked_fill(~valid_mask, 0)
     token_logps = F.log_softmax(shifted_logits, dim=-1).gather(
         dim=-1, index=safe_labels.unsqueeze(-1)
     ).squeeze(-1)
     seq_logps = (token_logps * valid_mask).sum(dim=-1)
-
-    if length_average:
-        token_counts = valid_mask.sum(dim=-1).clamp_min(1)
-        seq_logps = seq_logps / token_counts
+    seq_logps = seq_logps / valid_mask.sum(dim=-1).clamp_min(1)
     return seq_logps
 
 
-def compute_sequence_logps(
+def _compute_sequence_logps_batch(
     model: object,
     tokenizer: object,
     prompt_texts: Sequence[str],
     completion_texts: Sequence[str],
     max_length: int,
     device: torch.device,
-    length_average: bool,
 ) -> torch.Tensor:
-    prompts = list(prompt_texts)
-    completions = list(completion_texts)
-    if len(prompts) == 0:
-        return torch.empty(0, device=device, dtype=torch.float32)
-    return _compute_sequence_logps_batch(
-        model,
-        tokenizer,
-        prompts,
-        completions,
-        max_length,
-        device,
-        length_average,
+    input_ids, attention_mask, labels = _labeled_batch_tensors(
+        tokenizer, prompt_texts, completion_texts, max_length, device
     )
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    return _seq_logps_from_logits_labels(logits, labels)
 
 
-def resolve_train_sample_log_path(args: argparse.Namespace, output_dir: Path) -> Path:
-    if str(args.train_sample_log_path).strip():
-        return Path(args.train_sample_log_path)
-    return output_dir / "train_sampled_pairs.jsonl"
-
-
-def train_with_preference_loss(args: argparse.Namespace) -> None:
-    from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
-
-    dataset = PreferenceDataset(args.preference_pairs_path, max_pairs=args.max_train_pairs)
-    if len(dataset) == 0:
-        raise RuntimeError(
-            f"No preference pairs found in {args.preference_pairs_path}. "
-            "Run generation first or check pair filtering."
-        )
-
-    tokenizer = AutoTokenizer.from_pretrained(args.train_model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    prompt_pool = build_prompt_pool(args)
-    prompt_rng = random.Random(args.seed + 20260411)
-    if args.prompt_mode != "none" and len(prompt_pool) == 0:
-        print(
-            "[train] prompt_mode is not 'none' but prompt pool is empty; "
-            "falling back to no system prompt."
-        )
-
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    if args.torch_dtype not in dtype_map:
-        raise ValueError(f"Unsupported torch dtype: {args.torch_dtype}")
-
-    model_kwargs = {
-        "trust_remote_code": True,
-        "torch_dtype": dtype_map[args.torch_dtype],
-    }
-    if args.attn_implementation:
-        model_kwargs["attn_implementation"] = args.attn_implementation
-
-    model = AutoModelForCausalLM.from_pretrained(args.train_model_path, **model_kwargs)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        model.config.use_cache = False
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=collate_batch,
-        drop_last=False,
+def _compute_sequence_logps_and_hidden_batch(
+    model: object,
+    tokenizer: object,
+    prompt_texts: Sequence[str],
+    completion_texts: Sequence[str],
+    max_length: int,
+    device: torch.device,
+    hidden_layer_offset: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_ids, attention_mask, labels = _labeled_batch_tensors(
+        tokenizer, prompt_texts, completion_texts, max_length, device
     )
-
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    total_update_steps = math.ceil(len(dataloader) / args.gradient_accumulation_steps) * args.num_epochs
-    warmup_steps = int(total_update_steps * args.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_update_steps,
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
     )
+    seq_logps = _seq_logps_from_logits_labels(outputs.logits, labels)
+    hidden_states = outputs.hidden_states
+    if hidden_states is None or len(hidden_states) == 0:
+        raise RuntimeError("Model did not return hidden_states; cannot run hidden-state pair mining.")
+    layer_idx = len(hidden_states) - int(hidden_layer_offset)
+    layer_idx = max(0, min(layer_idx, len(hidden_states) - 1))
+    layer_hidden = hidden_states[layer_idx]
+    completion_mask = labels.ne(-100).to(layer_hidden.dtype)
+    denom = completion_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+    pooled = (layer_hidden * completion_mask.unsqueeze(-1)).sum(dim=1) / denom
+    hidden_vec = F.normalize(pooled, p=2, dim=-1, eps=1e-12)
+    return seq_logps, hidden_vec
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    record_train_samples = bool(args.record_train_samples)
-    train_sample_log_path = resolve_train_sample_log_path(args, output_dir)
-    train_sample_log_path.parent.mkdir(parents=True, exist_ok=True)
-    train_sample_log_fout = None
-    logged_records = 0
-    max_log_records = args.train_sample_log_max_records
 
-    global_step = 0
-    running_loss = 0.0
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
+def build_rollout_trajectories_for_prompt(
+    model: object,
+    tokenizer: object,
+    device: torch.device,
+    train_prompt: str,
+    candidates: Sequence[str],
+    split: RolloutCandidateSplit,
+    args: argparse.Namespace,
+) -> List[RolloutTrajectory]:
+    if not candidates:
+        return []
 
-    try:
-        if record_train_samples:
-            train_sample_log_fout = train_sample_log_path.open("w", encoding="utf-8")
+    token_ids_all = tokenizer(
+        list(candidates),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )["input_ids"]
+    prompt_texts = [train_prompt for _ in candidates]
+    avg_logprobs: List[float] = []
+    hidden_vecs: List[List[float]] = []
+    mb = args.rollout_feature_micro_batch_size if args.rollout_feature_micro_batch_size > 0 else len(candidates)
 
-        for epoch in range(args.num_epochs):
-            epoch_iterator = tqdm(
-                dataloader,
-                desc=f"train epoch {epoch + 1}/{args.num_epochs}",
-                dynamic_ncols=True,
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(candidates), mb):
+            end = min(start + mb, len(candidates))
+            batch_prompts = prompt_texts[start:end]
+            batch_completions = list(candidates[start:end])
+            seq_logps, batch_hidden = _compute_sequence_logps_and_hidden_batch(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_texts=batch_prompts,
+                completion_texts=batch_completions,
+                max_length=args.max_length,
+                device=device,
+                hidden_layer_offset=args.hidden_layer_offset,
             )
-            for step, batch in enumerate(epoch_iterator, start=1):
-                sample_ids = batch["sample_id"]
-                raw_prompts = batch["prompt"]
-                raw_system_prompts = batch["system_prompt"]
-                chosen = batch["chosen"]
-                rejected = batch["rejected"]
+            avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
+            hidden_vecs.extend([[float(x) for x in row] for row in batch_hidden.detach().cpu().tolist()])
+    if was_training:
+        model.train()
 
-                if record_train_samples and train_sample_log_fout is not None:
-                    if max_log_records is None or logged_records < max_log_records:
-                        for idx, (sample_id, raw_prompt, raw_system_prompt, chosen_text, rejected_text) in enumerate(
-                            zip(sample_ids, raw_prompts, raw_system_prompts, chosen, rejected)
-                        ):
-                            if max_log_records is not None and logged_records >= max_log_records:
-                                break
-                            record = {
-                                "epoch": epoch + 1,
-                                "step_in_epoch": step,
-                                "global_optimizer_step": global_step,
-                                "sample_index_in_batch": idx,
-                                "sample_id": sample_id,
-                                "prompt": raw_prompt,
-                                "system_prompt": raw_system_prompt,
-                                "chosen": chosen_text,
-                                "rejected": rejected_text,
-                            }
-                            train_sample_log_fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                            logged_records += 1
-
-                prompt_texts = [
-                    apply_qwen_chat_template(
-                        tokenizer,
-                        prompt,
-                        enable_thinking=args.enable_thinking,
-                        system_prompt=choose_system_prompt(
-                            prompt_pool=prompt_pool,
-                            prompt_mode=args.prompt_mode,
-                            prompt_fixed_index=args.prompt_fixed_index,
-                            rng=prompt_rng,
-                            explicit_prompt=record_system_prompt,
-                        ),
-                    )
-                    for prompt, record_system_prompt in zip(raw_prompts, raw_system_prompts)
-                ]
-
-                all_prompts = prompt_texts + prompt_texts
-                all_completions = chosen + rejected
-                all_logps = compute_sequence_logps(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt_texts=all_prompts,
-                    completion_texts=all_completions,
-                    max_length=args.max_length,
-                    device=device,
-                    length_average=args.length_average,
-                )
-
-                batch_size = len(prompt_texts)
-                chosen_logps = all_logps[:batch_size]
-                rejected_logps = all_logps[batch_size:]
-                preference_gap = chosen_logps - rejected_logps
-                pref_loss = -F.logsigmoid(args.beta * preference_gap).mean()
-                chosen_ce_loss = (-chosen_logps).mean()
-                loss = pref_loss + args.chosen_ce_weight * chosen_ce_loss
-
-                scaled_loss = loss / args.gradient_accumulation_steps
-                scaled_loss.backward()
-                running_loss += loss.item()
-
-                should_update = (step % args.gradient_accumulation_steps == 0) or (step == len(dataloader))
-                if should_update:
-                    if args.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
-
-                    avg_loss = running_loss / max(1, args.gradient_accumulation_steps)
-                    epoch_iterator.set_postfix(
-                        loss=f"{avg_loss:.4f}",
-                        pref=f"{pref_loss.item():.4f}",
-                        ce=f"{chosen_ce_loss.item():.4f}",
-                        gap=f"{preference_gap.mean().item():.4f}",
-                        step=global_step,
-                    )
-                    running_loss = 0.0
-
-            if args.save_every_epoch:
-                epoch_dir = output_dir / f"checkpoint-epoch-{epoch + 1}"
-                epoch_dir.mkdir(parents=True, exist_ok=True)
-                model.save_pretrained(epoch_dir)
-                tokenizer.save_pretrained(epoch_dir)
-                print(f"[train] saved checkpoint to {epoch_dir}")
-    finally:
-        if train_sample_log_fout is not None:
-            train_sample_log_fout.close()
-
-    final_dir = output_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    print(f"[train] finished. final model saved to {final_dir}")
-    if record_train_samples:
-        suffix = ""
-        if max_log_records is not None:
-            suffix = f" (max={max_log_records})"
-        print(
-            f"[train] sampled training records saved: {logged_records} -> "
-            f"{train_sample_log_path}{suffix}"
+    trajectories: List[RolloutTrajectory] = []
+    for idx, response_text in enumerate(candidates):
+        avg_logprob = float(avg_logprobs[idx])
+        trajectories.append(
+            RolloutTrajectory(
+                response_text=str(response_text),
+                token_ids=[int(tid) for tid in token_ids_all[idx]],
+                is_correct=bool(split.responses_correct[idx]),
+                fail_type=str(split.responses_fail_type[idx]),
+                has_final_answer_line=bool(split.responses_has_final_answer_line[idx]),
+                final_answer=str(split.responses_final_answers[idx]),
+                avg_logprob=avg_logprob,
+                avg_nll=-avg_logprob,
+                hidden_vec=list(hidden_vecs[idx]),
+            )
         )
+    return trajectories
 
 
 def wrap_model_with_lora(model: Any, args: argparse.Namespace) -> Any:
@@ -1336,85 +790,6 @@ class PairTruncationStats:
     dropped_rejected_too_long: int
 
 
-def filter_pairs_without_truncation(
-    tokenizer: object,
-    train_prompts: Sequence[str],
-    chosen: Sequence[str],
-    rejected: Sequence[str],
-    max_length: int,
-) -> tuple[List[str], List[str], List[str], PairTruncationStats]:
-    """Drop pairs that would be truncated by max_length in log-prob computation."""
-    total = len(train_prompts)
-    if total == 0:
-        stats = PairTruncationStats(
-            total_pairs=0,
-            kept_pairs=0,
-            dropped_pairs=0,
-            dropped_prompt_too_long=0,
-            dropped_chosen_too_long=0,
-            dropped_rejected_too_long=0,
-        )
-        return [], [], [], stats
-
-    prompt_ids = tokenizer(
-        list(train_prompts),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    chosen_ids = tokenizer(
-        list(chosen),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    rejected_ids = tokenizer(
-        list(rejected),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-
-    keep_prompts: List[str] = []
-    keep_chosen: List[str] = []
-    keep_rejected: List[str] = []
-    dropped_prompt_too_long = 0
-    dropped_chosen_too_long = 0
-    dropped_rejected_too_long = 0
-
-    for prompt, ch, rj, p_ids, ch_ids, rj_ids in zip(
-        train_prompts, chosen, rejected, prompt_ids, chosen_ids, rejected_ids
-    ):
-        prompt_len = len(p_ids)
-        budget = max_length - prompt_len
-        if budget <= 0:
-            dropped_prompt_too_long += 1
-            continue
-        chosen_ok = len(ch_ids) <= budget
-        rejected_ok = len(rj_ids) <= budget
-        if not chosen_ok:
-            dropped_chosen_too_long += 1
-        if not rejected_ok:
-            dropped_rejected_too_long += 1
-        if not chosen_ok or not rejected_ok:
-            continue
-        keep_prompts.append(str(prompt))
-        keep_chosen.append(str(ch))
-        keep_rejected.append(str(rj))
-
-    kept = len(keep_prompts)
-    dropped = total - kept
-    stats = PairTruncationStats(
-        total_pairs=total,
-        kept_pairs=kept,
-        dropped_pairs=dropped,
-        dropped_prompt_too_long=dropped_prompt_too_long,
-        dropped_chosen_too_long=dropped_chosen_too_long,
-        dropped_rejected_too_long=dropped_rejected_too_long,
-    )
-    return keep_prompts, keep_chosen, keep_rejected, stats
-
-
 @dataclass
 class SftTruncationStats:
     total_samples: int
@@ -1433,69 +808,18 @@ def filter_weighted_pairs_without_truncation(
     max_length: int,
 ) -> tuple[List[str], List[str], List[str], List[float], PairTruncationStats]:
     total = len(train_prompts)
-    if total == 0:
-        stats = PairTruncationStats(
-            total_pairs=0,
-            kept_pairs=0,
-            dropped_pairs=0,
-            dropped_prompt_too_long=0,
-            dropped_chosen_too_long=0,
-            dropped_rejected_too_long=0,
-        )
-        return [], [], [], [], stats
-
-    prompt_ids = tokenizer(
-        list(train_prompts),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    chosen_ids = tokenizer(
-        list(chosen),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    rejected_ids = tokenizer(
-        list(rejected),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    keep_prompts: List[str] = []
-    keep_chosen: List[str] = []
-    keep_rejected: List[str] = []
-    keep_weights: List[float] = []
-    dropped_prompt_too_long = 0
-    dropped_chosen_too_long = 0
-    dropped_rejected_too_long = 0
-    for prompt, ch, rj, w, p_ids, ch_ids, rj_ids in zip(
-        train_prompts, chosen, rejected, weights, prompt_ids, chosen_ids, rejected_ids
-    ):
-        budget = max_length - len(p_ids)
-        if budget <= 0:
-            dropped_prompt_too_long += 1
-            continue
-        chosen_ok = len(ch_ids) <= budget
-        rejected_ok = len(rj_ids) <= budget
-        if not chosen_ok:
-            dropped_chosen_too_long += 1
-        if not rejected_ok:
-            dropped_rejected_too_long += 1
-        if not chosen_ok or not rejected_ok:
-            continue
-        keep_prompts.append(str(prompt))
-        keep_chosen.append(str(ch))
-        keep_rejected.append(str(rj))
-        keep_weights.append(float(w))
-    kept = len(keep_prompts)
+    keep_prompts: List[str] = [str(prompt) for prompt in train_prompts]
+    keep_chosen: List[str] = [str(ch) for ch in chosen]
+    keep_rejected: List[str] = [str(rj) for rj in rejected]
+    keep_weights: List[float] = [float(w) for w in weights]
+    kept = total
     stats = PairTruncationStats(
         total_pairs=total,
         kept_pairs=kept,
-        dropped_pairs=total - kept,
-        dropped_prompt_too_long=dropped_prompt_too_long,
-        dropped_chosen_too_long=dropped_chosen_too_long,
-        dropped_rejected_too_long=dropped_rejected_too_long,
+        dropped_pairs=0,
+        dropped_prompt_too_long=0,
+        dropped_chosen_too_long=0,
+        dropped_rejected_too_long=0,
     )
     return keep_prompts, keep_chosen, keep_rejected, keep_weights, stats
 
@@ -1508,55 +832,16 @@ def filter_weighted_sft_without_truncation(
     max_length: int,
 ) -> tuple[List[str], List[str], List[float], SftTruncationStats]:
     total = len(train_prompts)
-    if total == 0:
-        stats = SftTruncationStats(
-            total_samples=0,
-            kept_samples=0,
-            dropped_samples=0,
-            dropped_prompt_too_long=0,
-            dropped_completion_too_long=0,
-        )
-        return [], [], [], stats
-
-    prompt_ids = tokenizer(
-        list(train_prompts),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    completion_ids = tokenizer(
-        list(completions),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-
-    keep_prompts: List[str] = []
-    keep_completions: List[str] = []
-    keep_weights: List[float] = []
-    dropped_prompt_too_long = 0
-    dropped_completion_too_long = 0
-    for prompt, completion, w, p_ids, c_ids in zip(
-        train_prompts, completions, weights, prompt_ids, completion_ids
-    ):
-        budget = max_length - len(p_ids)
-        if budget <= 0:
-            dropped_prompt_too_long += 1
-            continue
-        if len(c_ids) > budget:
-            dropped_completion_too_long += 1
-            continue
-        keep_prompts.append(str(prompt))
-        keep_completions.append(str(completion))
-        keep_weights.append(float(w))
-
-    kept = len(keep_prompts)
+    keep_prompts: List[str] = [str(prompt) for prompt in train_prompts]
+    keep_completions: List[str] = [str(completion) for completion in completions]
+    keep_weights: List[float] = [float(w) for w in weights]
+    kept = total
     stats = SftTruncationStats(
         total_samples=total,
         kept_samples=kept,
-        dropped_samples=total - kept,
-        dropped_prompt_too_long=dropped_prompt_too_long,
-        dropped_completion_too_long=dropped_completion_too_long,
+        dropped_samples=0,
+        dropped_prompt_too_long=0,
+        dropped_completion_too_long=0,
     )
     return keep_prompts, keep_completions, keep_weights, stats
 
@@ -1571,38 +856,79 @@ def _online_run_preference_optimizer_step(
     pref_chosen: List[str],
     pref_rejected: List[str],
     pref_weights: List[float],
-    sft_train_prompts: List[str],
-    sft_completions: List[str],
-    sft_weights: List[float],
+    gt_pref_train_prompts: List[str],
+    gt_pref_chosen: List[str],
+    gt_pref_rejected: List[str],
+    gt_pref_weights: List[float],
+    mle_train_prompts: List[str],
+    mle_completions: List[str],
+    mle_weights: List[float],
 ) -> OnlineStepLossStats:
-    """Single optimizer.step() on weighted preference and SFT samples."""
+    """Single optimizer.step() on weighted mixed-pref + gt-pref + MLE samples."""
     pref_batch = len(pref_train_prompts)
-    sft_batch = len(sft_train_prompts)
-    total_weight = float(sum(pref_weights) + sum(sft_weights))
-    if total_weight <= 0:
+    gt_pref_batch = len(gt_pref_train_prompts)
+    mle_batch = len(mle_train_prompts)
+    total_weight = float(sum(pref_weights) + sum(gt_pref_weights) + sum(mle_weights))
+
+    def _build_zero_stats(reason: str, grad_norm_value: float = 0.0) -> OnlineStepLossStats:
         return OnlineStepLossStats(
             total_loss=0.0,
+            mle_loss=0.0,
             pref_loss=0.0,
-            sft_loss=0.0,
+            gt_pref_loss=0.0,
             mean_gap=0.0,
             pref_pairs_used=0,
-            sft_samples_used=0,
+            gt_pref_pairs_used=0,
+            mle_samples_used=0,
             lora_mean_abs=0.0,
             lora_max_abs=0.0,
             lora_nan_ratio=0.0,
             lora_inf_ratio=0.0,
-            grad_norm=0.0,
+            grad_norm=grad_norm_value,
             update_applied=False,
-            skip_reason="zero_total_weight",
+            skip_reason=reason,
         )
+
+    if total_weight <= 0:
+        return _build_zero_stats("zero_total_weight")
     mb_pref = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(pref_batch, 1)
-    mb_sft = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(sft_batch, 1)
+    mb_gt_pref = (
+        args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(gt_pref_batch, 1)
+    )
+    mb_mle = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(mle_batch, 1)
 
     optimizer.zero_grad(set_to_none=True)
     pref_loss_weighted_sum = 0.0
-    sft_loss_weighted_sum = 0.0
+    gt_pref_loss_weighted_sum = 0.0
+    mle_loss_weighted_sum = 0.0
     gap_weighted_sum = 0.0
     pref_weight_sum = 0.0
+    gt_pref_weight_sum = 0.0
+    gap_weight_sum = 0.0
+
+    def _check_chunk_and_backward(
+        loss_chunk: torch.Tensor,
+        loss_chunk_val: float,
+        skip_prefix: str,
+        start: int,
+        end: int,
+    ) -> Optional[OnlineStepLossStats]:
+        if not loss_chunk.requires_grad:
+            raise RuntimeError(
+                "Online loss has no grad_fn. If use_lora=true with gradient_checkpointing=true, "
+                "ensure input grads are enabled for checkpointing."
+            )
+        if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
+            optimizer.zero_grad(set_to_none=True)
+            return _build_zero_stats(f"nonfinite_{skip_prefix}_loss_chunk(start={start},end={end})")
+        if args.online_loss_value_cap > 0 and abs(loss_chunk_val) > args.online_loss_value_cap:
+            optimizer.zero_grad(set_to_none=True)
+            return _build_zero_stats(
+                f"{skip_prefix}_loss_chunk_too_large(value={loss_chunk_val:.4f},"
+                f"cap={args.online_loss_value_cap:.4f})"
+            )
+        loss_chunk.backward()
+        return None
 
     if pref_batch > 0:
         for start in range(0, pref_batch, mb_pref):
@@ -1618,7 +944,6 @@ def _online_run_preference_optimizer_step(
                 ch,
                 args.max_length,
                 device,
-                args.length_average,
             )
             rejected_logps = _compute_sequence_logps_batch(
                 model,
@@ -1627,66 +952,72 @@ def _online_run_preference_optimizer_step(
                 rj,
                 args.max_length,
                 device,
-                args.length_average,
             )
             preference_gap = chosen_logps - rejected_logps
             pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
-            if not loss_chunk.requires_grad:
-                raise RuntimeError(
-                    "Online preference loss has no grad_fn. "
-                    "If use_lora=true with gradient_checkpointing=true, "
-                    "ensure input grads are enabled for checkpointing."
-                )
-            if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
-                optimizer.zero_grad(set_to_none=True)
-                return OnlineStepLossStats(
-                    total_loss=0.0,
-                    pref_loss=0.0,
-                    sft_loss=0.0,
-                    mean_gap=0.0,
-                    pref_pairs_used=0,
-                    sft_samples_used=0,
-                    lora_mean_abs=0.0,
-                    lora_max_abs=0.0,
-                    lora_nan_ratio=0.0,
-                    lora_inf_ratio=0.0,
-                    grad_norm=0.0,
-                    update_applied=False,
-                    skip_reason=f"nonfinite_pref_loss_chunk(start={start},end={end})",
-                )
-            if args.online_loss_value_cap > 0 and abs(loss_chunk_val) > args.online_loss_value_cap:
-                optimizer.zero_grad(set_to_none=True)
-                return OnlineStepLossStats(
-                    total_loss=0.0,
-                    pref_loss=0.0,
-                    sft_loss=0.0,
-                    mean_gap=0.0,
-                    pref_pairs_used=0,
-                    sft_samples_used=0,
-                    lora_mean_abs=0.0,
-                    lora_max_abs=0.0,
-                    lora_nan_ratio=0.0,
-                    lora_inf_ratio=0.0,
-                    grad_norm=0.0,
-                    update_applied=False,
-                    skip_reason=(
-                        f"pref_loss_chunk_too_large(value={loss_chunk_val:.4f},"
-                        f"cap={args.online_loss_value_cap:.4f})"
-                    ),
-                )
-            loss_chunk.backward()
+            failed = _check_chunk_and_backward(
+                loss_chunk=loss_chunk,
+                loss_chunk_val=loss_chunk_val,
+                skip_prefix="pref",
+                start=start,
+                end=end,
+            )
+            if failed is not None:
+                return failed
             pref_loss_weighted_sum += (pref_loss_vec * w).sum().item()
             gap_weighted_sum += (preference_gap * w).sum().item()
             pref_weight_sum += w.sum().item()
+            gap_weight_sum += w.sum().item()
 
-    if sft_batch > 0:
-        for start in range(0, sft_batch, mb_sft):
-            end = min(start + mb_sft, sft_batch)
-            tp = sft_train_prompts[start:end]
-            cp = sft_completions[start:end]
-            w = torch.tensor(sft_weights[start:end], device=device, dtype=torch.float32)
+    if gt_pref_batch > 0:
+        for start in range(0, gt_pref_batch, mb_gt_pref):
+            end = min(start + mb_gt_pref, gt_pref_batch)
+            tp = gt_pref_train_prompts[start:end]
+            ch = gt_pref_chosen[start:end]
+            rj = gt_pref_rejected[start:end]
+            w = torch.tensor(gt_pref_weights[start:end], device=device, dtype=torch.float32)
+            chosen_logps = _compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                tp,
+                ch,
+                args.max_length,
+                device,
+            )
+            rejected_logps = _compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                tp,
+                rj,
+                args.max_length,
+                device,
+            )
+            preference_gap = chosen_logps - rejected_logps
+            gt_pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
+            loss_chunk = (gt_pref_loss_vec * w).sum() / total_weight
+            loss_chunk_val = float(loss_chunk.detach().item())
+            failed = _check_chunk_and_backward(
+                loss_chunk=loss_chunk,
+                loss_chunk_val=loss_chunk_val,
+                skip_prefix="gt_pref",
+                start=start,
+                end=end,
+            )
+            if failed is not None:
+                return failed
+            gt_pref_loss_weighted_sum += (gt_pref_loss_vec * w).sum().item()
+            gap_weighted_sum += (preference_gap * w).sum().item()
+            gt_pref_weight_sum += w.sum().item()
+            gap_weight_sum += w.sum().item()
+
+    if mle_batch > 0:
+        for start in range(0, mle_batch, mb_mle):
+            end = min(start + mb_mle, mle_batch)
+            tp = mle_train_prompts[start:end]
+            cp = mle_completions[start:end]
+            w = torch.tensor(mle_weights[start:end], device=device, dtype=torch.float32)
             logps = _compute_sequence_logps_batch(
                 model,
                 tokenizer,
@@ -1694,56 +1025,20 @@ def _online_run_preference_optimizer_step(
                 cp,
                 args.max_length,
                 device,
-                args.length_average,
             )
-            sft_loss_vec = -logps
-            loss_chunk = (sft_loss_vec * w).sum() / total_weight
+            mle_loss_vec = -logps
+            loss_chunk = (mle_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
-            if not loss_chunk.requires_grad:
-                raise RuntimeError(
-                    "Online SFT loss has no grad_fn. "
-                    "If use_lora=true with gradient_checkpointing=true, "
-                    "ensure input grads are enabled for checkpointing."
-                )
-            if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
-                optimizer.zero_grad(set_to_none=True)
-                return OnlineStepLossStats(
-                    total_loss=0.0,
-                    pref_loss=0.0,
-                    sft_loss=0.0,
-                    mean_gap=0.0,
-                    pref_pairs_used=0,
-                    sft_samples_used=0,
-                    lora_mean_abs=0.0,
-                    lora_max_abs=0.0,
-                    lora_nan_ratio=0.0,
-                    lora_inf_ratio=0.0,
-                    grad_norm=0.0,
-                    update_applied=False,
-                    skip_reason=f"nonfinite_sft_loss_chunk(start={start},end={end})",
-                )
-            if args.online_loss_value_cap > 0 and abs(loss_chunk_val) > args.online_loss_value_cap:
-                optimizer.zero_grad(set_to_none=True)
-                return OnlineStepLossStats(
-                    total_loss=0.0,
-                    pref_loss=0.0,
-                    sft_loss=0.0,
-                    mean_gap=0.0,
-                    pref_pairs_used=0,
-                    sft_samples_used=0,
-                    lora_mean_abs=0.0,
-                    lora_max_abs=0.0,
-                    lora_nan_ratio=0.0,
-                    lora_inf_ratio=0.0,
-                    grad_norm=0.0,
-                    update_applied=False,
-                    skip_reason=(
-                        f"sft_loss_chunk_too_large(value={loss_chunk_val:.4f},"
-                        f"cap={args.online_loss_value_cap:.4f})"
-                    ),
-                )
-            loss_chunk.backward()
-            sft_loss_weighted_sum += (sft_loss_vec * w).sum().item()
+            failed = _check_chunk_and_backward(
+                loss_chunk=loss_chunk,
+                loss_chunk_val=loss_chunk_val,
+                skip_prefix="mle",
+                start=start,
+                end=end,
+            )
+            if failed is not None:
+                return failed
+            mle_loss_weighted_sum += (mle_loss_vec * w).sum().item()
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
@@ -1757,48 +1052,24 @@ def _online_run_preference_optimizer_step(
     grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
     if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
         optimizer.zero_grad(set_to_none=True)
-        return OnlineStepLossStats(
-            total_loss=0.0,
-            pref_loss=0.0,
-            sft_loss=0.0,
-            mean_gap=0.0,
-            pref_pairs_used=0,
-            sft_samples_used=0,
-            lora_mean_abs=0.0,
-            lora_max_abs=0.0,
-            lora_nan_ratio=0.0,
-            lora_inf_ratio=0.0,
-            grad_norm=grad_norm,
-            update_applied=False,
-            skip_reason="nonfinite_grad_norm",
-        )
+        return _build_zero_stats("nonfinite_grad_norm", grad_norm_value=grad_norm)
     if args.online_hard_grad_norm_cap > 0 and grad_norm > args.online_hard_grad_norm_cap:
         optimizer.zero_grad(set_to_none=True)
-        return OnlineStepLossStats(
-            total_loss=0.0,
-            pref_loss=0.0,
-            sft_loss=0.0,
-            mean_gap=0.0,
-            pref_pairs_used=0,
-            sft_samples_used=0,
-            lora_mean_abs=0.0,
-            lora_max_abs=0.0,
-            lora_nan_ratio=0.0,
-            lora_inf_ratio=0.0,
-            grad_norm=grad_norm,
-            update_applied=False,
-            skip_reason=(
+        return _build_zero_stats(
+            (
                 f"grad_norm_too_large(value={grad_norm:.4f},"
                 f"cap={args.online_hard_grad_norm_cap:.4f})"
             ),
+            grad_norm_value=grad_norm,
         )
     optimizer.step()
 
-    mean_gap = gap_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
+    mean_gap = gap_weighted_sum / gap_weight_sum if gap_weight_sum > 0 else 0.0
     pref_loss = pref_loss_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
-    sft_weight_sum = float(sum(sft_weights))
-    sft_loss = sft_loss_weighted_sum / sft_weight_sum if sft_weight_sum > 0 else 0.0
-    total_loss = (pref_loss_weighted_sum + sft_loss_weighted_sum) / total_weight
+    gt_pref_loss = gt_pref_loss_weighted_sum / gt_pref_weight_sum if gt_pref_weight_sum > 0 else 0.0
+    mle_weight_sum = float(sum(mle_weights))
+    mle_loss = mle_loss_weighted_sum / mle_weight_sum if mle_weight_sum > 0 else 0.0
+    total_loss = (pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum) / total_weight
     lora_health = _compute_lora_param_health(model)
     if args.online_abort_on_lora_nan and lora_health["lora_nan_ratio"] > 0:
         raise RuntimeError(
@@ -1807,11 +1078,13 @@ def _online_run_preference_optimizer_step(
         )
     return OnlineStepLossStats(
         total_loss=total_loss,
+        mle_loss=mle_loss,
         pref_loss=pref_loss,
-        sft_loss=sft_loss,
+        gt_pref_loss=gt_pref_loss,
         mean_gap=mean_gap,
         pref_pairs_used=pref_batch,
-        sft_samples_used=sft_batch,
+        gt_pref_pairs_used=gt_pref_batch,
+        mle_samples_used=mle_batch,
         lora_mean_abs=lora_health["lora_mean_abs"],
         lora_max_abs=lora_health["lora_max_abs"],
         lora_nan_ratio=lora_health["lora_nan_ratio"],
@@ -1829,9 +1102,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     online_pairs_path = output_root / "online_pairs.jsonl"
 
-    model_path = args.online_init_model_path.strip()
-    if not model_path:
-        model_path = args.train_model_path.strip() or args.rollout_model_path.strip()
+    model_path = args.model_path.strip()
     if not model_path:
         raise ValueError("Online mode requires a valid initial model path.")
 
@@ -1887,17 +1158,21 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         parquet_path=args.dataset_path,
         scan_batch_size=args.scan_batch_size,
         max_source_samples=args.max_source_samples,
+        gold_rationale_key_paths=args.gold_rationale_key,
+        require_gold_rationale=args.require_gold_rationale_for_all_wrong,
     )
 
     updates = 0
     rollout_steps = 0
     scanned = 0
     kept_pref_pairs = 0
-    kept_sft_samples = 0
+    kept_gt_pref_pairs = 0
+    kept_mle_samples = 0
     skipped_all_wrong = 0
-    skipped_mixed_after_filter = 0
-    logged_pref_objectives = 0
-    logged_sft_objectives = 0
+    skipped_after_filter = 0
+    logged_mixed_objectives = 0
+    logged_all_correct_objectives = 0
+    logged_all_wrong_objectives = 0
     buffer: List[DapoSample] = []
     k = args.online_pairs_per_step
 
@@ -1906,10 +1181,14 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"[online] rollout_backend={args.online_rollout_backend}, "
         f"rollout_batch_size={args.rollout_batch_size} "
         f"({args.rollout_n} samples per prompt via n={args.rollout_n}), "
-        f"online_pairs_per_step={k} (chunk size within one rollout step; no cross-step cache), "
+        f"online_pairs_per_step={k} (chunk size within one rollout step), "
         f"online_steps={total_steps_str}, max_source_samples={args.max_source_samples}, "
         f"vllm_enforce_eager={args.online_vllm_enforce_eager}, "
-        f"rarity_floor={args.pref_weight_rarity_floor}"
+        f"prompt_smoothing=({args.prompt_smoothing_alpha},{args.prompt_smoothing_beta}), "
+        f"prompt_gamma={args.prompt_weight_gamma}, "
+        f"prompt_weight_clip=[{args.prompt_weight_min},{args.prompt_weight_max}], "
+        f"pos_weight_mode={args.positive_weight_mode}, "
+        f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}"
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
@@ -1965,10 +1244,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             model.train()
 
             rollout_objectives: List[OnlinePendingObjective] = []
-            pref_objectives_in_rollout = 0
-            sft_objectives_in_rollout = 0
+            mixed_objectives_in_rollout = 0
+            all_correct_objectives_in_rollout = 0
+            all_wrong_objectives_in_rollout = 0
             skipped_all_wrong_in_rollout = 0
-            skipped_mixed_after_filter_in_rollout = 0
+            skipped_after_filter_in_rollout = 0
             for idx, sample_obj in enumerate(buffer):
                 start = idx * args.rollout_n
                 end = start + args.rollout_n
@@ -1982,89 +1262,182 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 split = split_rollout_candidates_for_training(
                     candidates,
                     sample_obj.ground_truth,
-                    require_rejected_final_answer=args.sample_rejected_requires_final_answer,
-                    require_chosen_final_answer=args.sample_chosen_requires_final_answer,
                 )
                 n_total = len(candidates)
                 n_correct_total = sum(1 for x in split.responses_correct if x)
-                r, entropy, rarity_bonus, weight = compute_entropy_rarity_weight(
-                    n_correct=n_correct_total,
-                    n_total=n_total,
-                    rarity_floor=args.pref_weight_rarity_floor,
-                    eps=args.pref_weight_eps,
+                rho_hat = compute_smoothed_correct_rate(
+                    r_cnt=n_correct_total,
+                    total=n_total,
+                    alpha=args.prompt_smoothing_alpha,
+                    beta=args.prompt_smoothing_beta,
+                )
+                prompt_weight = compute_prompt_rarity_weight(
+                    rho_hat=rho_hat,
+                    gamma=args.prompt_weight_gamma,
+                    w_min=args.prompt_weight_min,
+                    w_max=args.prompt_weight_max,
                 )
 
-                objective_type = "skip"
-                if n_correct_total == 0:
-                    skipped_all_wrong += 1
-                    skipped_all_wrong_in_rollout += 1
-                elif n_correct_total == n_total:
-                    if split.correct_kept:
-                        objective_type = "sft"
-                        rollout_objectives.append(
-                            OnlinePendingObjective(
+                trajectories = build_rollout_trajectories_for_prompt(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    train_prompt=prompt_texts[idx],
+                    candidates=candidates,
+                    split=split,
+                    args=args,
+                )
+                correct_trajs = [trajectories[i] for i in split.correct_kept_indices]
+                wrong_trajs = [trajectories[i] for i in split.wrong_kept_indices]
+                objective: Optional[OnlinePendingObjective] = None
+
+                if n_correct_total > 0 and n_correct_total < n_total:
+                    if correct_trajs and wrong_trajs:
+                        correct_weights = compute_correct_trajectory_weights(
+                            correct_trajs=correct_trajs,
+                            mode=args.positive_weight_mode,
+                            tau=args.positive_weight_tau,
+                        )
+                        mixed_pairs = build_hidden_nn_pairs(correct_trajs, wrong_trajs)
+                        if mixed_pairs:
+                            objective = OnlinePendingObjective(
+                                sample_id=sample_obj.sample_id,
+                                ground_truth=sample_obj.ground_truth,
                                 train_prompt=prompt_texts[idx],
-                                correct=split.correct_kept,
-                                wrong=[],
-                                objective_type=objective_type,
-                                pair_weight=args.full_correct_sft_weight,
+                                objective_type="mixed",
+                                rho_hat=rho_hat,
+                                prompt_weight=prompt_weight,
+                                correct=correct_trajs,
+                                wrong=wrong_trajs,
+                                correct_traj_weights=correct_weights,
+                                mixed_pref_pairs=mixed_pairs,
+                                gt_positive=None,
                             )
-                        )
-                        sft_objectives_in_rollout += 1
-                        logged_sft_objectives += 1
+                            rollout_objectives.append(objective)
+                            mixed_objectives_in_rollout += 1
+                            logged_mixed_objectives += 1
+                        else:
+                            skipped_after_filter += 1
+                            skipped_after_filter_in_rollout += 1
                     else:
-                        skipped_mixed_after_filter += 1
-                        skipped_mixed_after_filter_in_rollout += 1
-                elif split.correct_kept and split.wrong_kept:
-                    objective_type = "pref"
-                    rollout_objectives.append(
-                        OnlinePendingObjective(
-                            train_prompt=prompt_texts[idx],
-                            correct=split.correct_kept,
-                            wrong=split.wrong_kept,
-                            objective_type=objective_type,
-                            pair_weight=weight,
+                        skipped_after_filter += 1
+                        skipped_after_filter_in_rollout += 1
+                elif n_correct_total == n_total:
+                    if correct_trajs:
+                        correct_weights = compute_correct_trajectory_weights(
+                            correct_trajs=correct_trajs,
+                            mode=args.positive_weight_mode,
+                            tau=args.positive_weight_tau,
                         )
-                    )
-                    pref_objectives_in_rollout += 1
-                    logged_pref_objectives += 1
+                        objective = OnlinePendingObjective(
+                            sample_id=sample_obj.sample_id,
+                            ground_truth=sample_obj.ground_truth,
+                            train_prompt=prompt_texts[idx],
+                            objective_type="all_correct",
+                            rho_hat=rho_hat,
+                            prompt_weight=prompt_weight,
+                            correct=correct_trajs,
+                            wrong=[],
+                            correct_traj_weights=correct_weights,
+                            mixed_pref_pairs=[],
+                            gt_positive=None,
+                        )
+                        rollout_objectives.append(objective)
+                        all_correct_objectives_in_rollout += 1
+                        logged_all_correct_objectives += 1
+                    else:
+                        skipped_after_filter += 1
+                        skipped_after_filter_in_rollout += 1
                 else:
-                    skipped_mixed_after_filter += 1
-                    skipped_mixed_after_filter_in_rollout += 1
+                    gt_positive: Optional[RolloutTrajectory] = None
+                    if args.use_all_wrong_gt_preference and wrong_trajs:
+                        gt_text = strip_prompt_prefix_from_text(
+                            sample_obj.prompt,
+                            sample_obj.gold_rationale,
+                        )
+                        if gt_text:
+                            gt_final_answer = extract_final_answer_from_any_line(gt_text)
+                            gt_has_final = bool(gt_final_answer)
+                            gt_is_correct = answer_text_matches(
+                                gt_final_answer if gt_has_final else "",
+                                sample_obj.ground_truth,
+                            )
+                            gt_split = RolloutCandidateSplit(
+                                responses_has_final_answer_line=[gt_has_final],
+                                responses_final_answers=[gt_final_answer if gt_has_final else ""],
+                                responses_correct=[gt_is_correct],
+                                responses_fail_type=["correct" if gt_is_correct else "wrong_answer"],
+                                correct_kept_indices=[0] if gt_is_correct else [],
+                                wrong_kept_indices=[] if gt_is_correct else [0],
+                                correct_kept=[gt_text] if gt_is_correct else [],
+                                wrong_kept=[] if gt_is_correct else [gt_text],
+                            )
+                            gt_trajectories = build_rollout_trajectories_for_prompt(
+                                model=model,
+                                tokenizer=tokenizer,
+                                device=device,
+                                train_prompt=prompt_texts[idx],
+                                candidates=[gt_text],
+                                split=gt_split,
+                                args=args,
+                            )
+                            if gt_trajectories and gt_is_correct:
+                                gt_positive = gt_trajectories[0]
 
-                if objective_type != "skip":
-                    record = build_online_objective_jsonl_record(
-                        sample_id=sample_obj.sample_id,
-                        prompt=sample_obj.prompt,
-                        system_prompt=system_prompts[idx],
-                        ground_truth=sample_obj.ground_truth,
-                        candidates=candidates,
-                        split=split,
-                        objective_type=objective_type,
-                        r=r,
-                        entropy=entropy,
-                        rarity_bonus=rarity_bonus,
-                        weight=(args.full_correct_sft_weight if objective_type == "sft" else weight),
-                    )
-                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    if gt_positive is not None and wrong_trajs:
+                        objective = OnlinePendingObjective(
+                            sample_id=sample_obj.sample_id,
+                            ground_truth=sample_obj.ground_truth,
+                            train_prompt=prompt_texts[idx],
+                            objective_type="all_wrong",
+                            rho_hat=rho_hat,
+                            prompt_weight=prompt_weight,
+                            correct=[],
+                            wrong=wrong_trajs,
+                            correct_traj_weights=[],
+                            mixed_pref_pairs=[],
+                            gt_positive=gt_positive,
+                        )
+                        rollout_objectives.append(objective)
+                        all_wrong_objectives_in_rollout += 1
+                        logged_all_wrong_objectives += 1
+                    else:
+                        skipped_all_wrong += 1
+                        skipped_all_wrong_in_rollout += 1
 
-            if rollout_objectives:
-                fout.flush()
+                record = build_online_bootstrap_jsonl_record(
+                    sample_id=sample_obj.sample_id,
+                    prompt=sample_obj.prompt,
+                    system_prompt=system_prompts[idx],
+                    ground_truth=sample_obj.ground_truth,
+                    candidates=candidates,
+                    split=split,
+                    objective=objective,
+                    prompt_weight=prompt_weight,
+                    rho_hat=rho_hat,
+                    all_trajectories=trajectories,
+                )
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            fout.flush()
 
             print(
                 f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
-                f"pref_objectives_in_rollout={pref_objectives_in_rollout} "
-                f"sft_objectives_in_rollout={sft_objectives_in_rollout} "
+                f"mixed_in_rollout={mixed_objectives_in_rollout} "
+                f"all_correct_in_rollout={all_correct_objectives_in_rollout} "
+                f"all_wrong_in_rollout={all_wrong_objectives_in_rollout} "
                 f"skipped_all_wrong_in_rollout={skipped_all_wrong_in_rollout} "
-                f"skipped_after_filter_in_rollout={skipped_mixed_after_filter_in_rollout} "
+                f"skipped_after_filter_in_rollout={skipped_after_filter_in_rollout} "
                 f"objectives_ready_for_update={len(rollout_objectives)}"
             )
 
             updates_in_rollout = 0
             consumed_pref_pairs_in_rollout = 0
-            consumed_sft_samples_in_rollout = 0
+            consumed_gt_pref_pairs_in_rollout = 0
+            consumed_mle_samples_in_rollout = 0
             dropped_pref_pairs_by_truncation_in_rollout = 0
-            dropped_sft_by_truncation_in_rollout = 0
+            dropped_gt_pref_pairs_by_truncation_in_rollout = 0
+            dropped_mle_by_truncation_in_rollout = 0
             if rollout_objectives:
                 for chunk_start in range(0, len(rollout_objectives), k):
                     chunk = rollout_objectives[chunk_start : chunk_start + k]
@@ -2072,47 +1445,45 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     pref_chosen_raw: List[str] = []
                     pref_rejected_raw: List[str] = []
                     pref_weights_raw: List[float] = []
-                    sft_train_prompts_raw: List[str] = []
-                    sft_completions_raw: List[str] = []
-                    sft_weights_raw: List[float] = []
+                    gt_pref_train_prompts_raw: List[str] = []
+                    gt_pref_chosen_raw: List[str] = []
+                    gt_pref_rejected_raw: List[str] = []
+                    gt_pref_weights_raw: List[float] = []
+                    mle_train_prompts_raw: List[str] = []
+                    mle_completions_raw: List[str] = []
+                    mle_weights_raw: List[float] = []
 
                     for objective in chunk:
-                        if objective.objective_type == "pref":
-                            pair_count = len(objective.correct) * len(objective.wrong)
-                            if pair_count <= 0:
-                                continue
-                            if args.pref_pair_mode == "all_pairs":
-                                pair_weight = objective.pair_weight / pair_count
-                                for c in objective.correct:
-                                    for w in objective.wrong:
-                                        pref_train_prompts_raw.append(objective.train_prompt)
-                                        pref_chosen_raw.append(c)
-                                        pref_rejected_raw.append(w)
-                                        pref_weights_raw.append(pair_weight)
-                            elif args.pref_pair_mode == "single_pair":
-                                c = prompt_rng.choice(objective.correct)
-                                w = prompt_rng.choice(objective.wrong)
-                                pair_weight = compute_single_pair_weight(
-                                    base_weight=objective.pair_weight,
-                                    n_correct=len(objective.correct),
-                                    n_wrong=len(objective.wrong),
-                                    mode=args.pref_single_pair_count_weight,
+                        if objective.objective_type == "mixed":
+                            for traj, traj_weight in zip(objective.correct, objective.correct_traj_weights):
+                                mle_train_prompts_raw.append(objective.train_prompt)
+                                mle_completions_raw.append(traj.response_text)
+                                mle_weights_raw.append(
+                                    float(args.lambda_mle) * float(objective.prompt_weight) * float(traj_weight)
                                 )
-                                pref_train_prompts_raw.append(objective.train_prompt)
-                                pref_chosen_raw.append(c)
-                                pref_rejected_raw.append(w)
-                                pref_weights_raw.append(pair_weight)
-                            else:
-                                raise ValueError(f"Unsupported --pref_pair_mode: {args.pref_pair_mode}")
-                        elif objective.objective_type == "sft":
-                            sample_count = len(objective.correct)
-                            if sample_count <= 0:
+                            if objective.mixed_pref_pairs:
+                                pair_weight = float(args.lambda_pref) / float(len(objective.mixed_pref_pairs))
+                                for c_idx, w_idx in objective.mixed_pref_pairs:
+                                    pref_train_prompts_raw.append(objective.train_prompt)
+                                    pref_chosen_raw.append(objective.correct[c_idx].response_text)
+                                    pref_rejected_raw.append(objective.wrong[w_idx].response_text)
+                                    pref_weights_raw.append(pair_weight)
+                        elif objective.objective_type == "all_correct":
+                            for traj, traj_weight in zip(objective.correct, objective.correct_traj_weights):
+                                mle_train_prompts_raw.append(objective.train_prompt)
+                                mle_completions_raw.append(traj.response_text)
+                                mle_weights_raw.append(
+                                    float(args.lambda_mle) * float(objective.prompt_weight) * float(traj_weight)
+                                )
+                        elif objective.objective_type == "all_wrong":
+                            if objective.gt_positive is None or not objective.wrong:
                                 continue
-                            sample_weight = objective.pair_weight / sample_count
-                            for c in objective.correct:
-                                sft_train_prompts_raw.append(objective.train_prompt)
-                                sft_completions_raw.append(c)
-                                sft_weights_raw.append(sample_weight)
+                            pair_weight = float(args.lambda_gt) / float(len(objective.wrong))
+                            for wrong_traj in objective.wrong:
+                                gt_pref_train_prompts_raw.append(objective.train_prompt)
+                                gt_pref_chosen_raw.append(objective.gt_positive.response_text)
+                                gt_pref_rejected_raw.append(wrong_traj.response_text)
+                                gt_pref_weights_raw.append(pair_weight)
 
                     (
                         pref_train_prompts,
@@ -2129,39 +1500,40 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         max_length=args.max_length,
                     )
                     dropped_pref_pairs_by_truncation_in_rollout += pref_trunc_stats.dropped_pairs
-                    if pref_trunc_stats.dropped_pairs > 0:
-                        print(
-                            f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                            f"truncation_filter_pref dropped_pairs={pref_trunc_stats.dropped_pairs}/{pref_trunc_stats.total_pairs} "
-                            f"(prompt_too_long={pref_trunc_stats.dropped_prompt_too_long}, "
-                            f"chosen_too_long={pref_trunc_stats.dropped_chosen_too_long}, "
-                            f"rejected_too_long={pref_trunc_stats.dropped_rejected_too_long})"
-                        )
 
                     (
-                        sft_train_prompts,
-                        sft_completions,
-                        sft_weights,
-                        sft_trunc_stats,
-                    ) = filter_weighted_sft_without_truncation(
+                        gt_pref_train_prompts,
+                        gt_pref_chosen,
+                        gt_pref_rejected,
+                        gt_pref_weights,
+                        gt_pref_trunc_stats,
+                    ) = filter_weighted_pairs_without_truncation(
                         tokenizer=tokenizer,
-                        train_prompts=sft_train_prompts_raw,
-                        completions=sft_completions_raw,
-                        weights=sft_weights_raw,
+                        train_prompts=gt_pref_train_prompts_raw,
+                        chosen=gt_pref_chosen_raw,
+                        rejected=gt_pref_rejected_raw,
+                        weights=gt_pref_weights_raw,
                         max_length=args.max_length,
                     )
-                    dropped_sft_by_truncation_in_rollout += sft_trunc_stats.dropped_samples
-                    if sft_trunc_stats.dropped_samples > 0:
-                        print(
-                            f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                            f"truncation_filter_sft dropped_samples={sft_trunc_stats.dropped_samples}/{sft_trunc_stats.total_samples} "
-                            f"(prompt_too_long={sft_trunc_stats.dropped_prompt_too_long}, "
-                            f"completion_too_long={sft_trunc_stats.dropped_completion_too_long})"
-                        )
+                    dropped_gt_pref_pairs_by_truncation_in_rollout += gt_pref_trunc_stats.dropped_pairs
 
-                    if not pref_train_prompts and not sft_train_prompts:
+                    (
+                        mle_train_prompts,
+                        mle_completions,
+                        mle_weights,
+                        mle_trunc_stats,
+                    ) = filter_weighted_sft_without_truncation(
+                        tokenizer=tokenizer,
+                        train_prompts=mle_train_prompts_raw,
+                        completions=mle_completions_raw,
+                        weights=mle_weights_raw,
+                        max_length=args.max_length,
+                    )
+                    dropped_mle_by_truncation_in_rollout += mle_trunc_stats.dropped_samples
+
+                    if not pref_train_prompts and not gt_pref_train_prompts and not mle_train_prompts:
                         continue
-                    if (sum(pref_weights) + sum(sft_weights)) <= 0:
+                    if (sum(pref_weights) + sum(gt_pref_weights) + sum(mle_weights)) <= 0:
                         continue
 
                     loss_stats = _online_run_preference_optimizer_step(
@@ -2174,9 +1546,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         pref_chosen=pref_chosen,
                         pref_rejected=pref_rejected,
                         pref_weights=pref_weights,
-                        sft_train_prompts=sft_train_prompts,
-                        sft_completions=sft_completions,
-                        sft_weights=sft_weights,
+                        gt_pref_train_prompts=gt_pref_train_prompts,
+                        gt_pref_chosen=gt_pref_chosen,
+                        gt_pref_rejected=gt_pref_rejected,
+                        gt_pref_weights=gt_pref_weights,
+                        mle_train_prompts=mle_train_prompts,
+                        mle_completions=mle_completions,
+                        mle_weights=mle_weights,
                     )
                     if not loss_stats.update_applied:
                         print(
@@ -2188,16 +1564,20 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     updates += 1
                     updates_in_rollout += 1
                     consumed_pref_pairs_in_rollout += loss_stats.pref_pairs_used
-                    consumed_sft_samples_in_rollout += loss_stats.sft_samples_used
+                    consumed_gt_pref_pairs_in_rollout += loss_stats.gt_pref_pairs_used
+                    consumed_mle_samples_in_rollout += loss_stats.mle_samples_used
                     kept_pref_pairs += loss_stats.pref_pairs_used
-                    kept_sft_samples += loss_stats.sft_samples_used
+                    kept_gt_pref_pairs += loss_stats.gt_pref_pairs_used
+                    kept_mle_samples += loss_stats.mle_samples_used
                     print(
                         f"[online] rollout_step={rollout_steps}/{total_steps_str} "
                         f"optimizer_step={updates} pref_pairs={loss_stats.pref_pairs_used} "
-                        f"sft_samples={loss_stats.sft_samples_used} "
+                        f"gt_pref_pairs={loss_stats.gt_pref_pairs_used} "
+                        f"mle_samples={loss_stats.mle_samples_used} "
                         f"loss={loss_stats.total_loss:.4f} "
+                        f"mle_loss={loss_stats.mle_loss:.4f} "
                         f"pref_loss={loss_stats.pref_loss:.4f} "
-                        f"sft_loss={loss_stats.sft_loss:.4f} "
+                        f"gt_pref_loss={loss_stats.gt_pref_loss:.4f} "
                         f"gap={loss_stats.mean_gap:.4f} "
                         f"grad_norm={loss_stats.grad_norm:.4f} "
                         f"lora_mean_abs={loss_stats.lora_mean_abs:.6e} "
@@ -2216,16 +1596,18 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             if rollout_objectives and updates_in_rollout == 0:
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    "no optimizer update (all mixed/sft samples filtered out)"
+                    "no optimizer update (all samples filtered by truncation/weight)"
                 )
             elif rollout_objectives:
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
                     f"updates_in_rollout={updates_in_rollout} "
                     f"consumed_pref_pairs_in_rollout={consumed_pref_pairs_in_rollout} "
-                    f"consumed_sft_samples_in_rollout={consumed_sft_samples_in_rollout} "
+                    f"consumed_gt_pref_pairs_in_rollout={consumed_gt_pref_pairs_in_rollout} "
+                    f"consumed_mle_samples_in_rollout={consumed_mle_samples_in_rollout} "
                     f"dropped_pref_pairs_by_truncation_in_rollout={dropped_pref_pairs_by_truncation_in_rollout} "
-                    f"dropped_sft_by_truncation_in_rollout={dropped_sft_by_truncation_in_rollout}"
+                    f"dropped_gt_pref_pairs_by_truncation_in_rollout={dropped_gt_pref_pairs_by_truncation_in_rollout} "
+                    f"dropped_mle_by_truncation_in_rollout={dropped_mle_by_truncation_in_rollout}"
                 )
 
             buffer = []
@@ -2241,301 +1623,18 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     tokenizer.save_pretrained(final_dir)
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
-        f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, kept_sft_samples={kept_sft_samples}, "
-        f"logged_pref_objectives={logged_pref_objectives}, logged_sft_objectives={logged_sft_objectives}, "
-        f"skipped_all_wrong={skipped_all_wrong}, skipped_after_filter={skipped_mixed_after_filter}, "
+        f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, "
+        f"kept_gt_pref_pairs={kept_gt_pref_pairs}, kept_mle_samples={kept_mle_samples}, "
+        f"logged_mixed_objectives={logged_mixed_objectives}, "
+        f"logged_all_correct_objectives={logged_all_correct_objectives}, "
+        f"logged_all_wrong_objectives={logged_all_wrong_objectives}, "
+        f"skipped_all_wrong={skipped_all_wrong}, skipped_after_filter={skipped_after_filter}, "
         f"objectives_log={online_pairs_path}, final_model={final_dir}"
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Online DAPO preference training with vLLM rollout.")
-
-    # pipeline control
-    parser.add_argument(
-        "--stage",
-        type=str,
-        default="online",
-        choices=["online"],
-        help="Only online mode is supported.",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-
-    # io
-    parser.add_argument("--dataset_path", type=str, default="/path/to/dapo-math-17k.parquet")
-    parser.add_argument("--rollout_model_path", type=str, default="/path/to/Qwen3-4B")
-    parser.add_argument("--train_model_path", type=str, default="/path/to/Qwen3-4B")
-    parser.add_argument("--output_dir", type=str, default="./outputs/qwen3-4b-pref")
-
-    # online rollout
-    parser.add_argument("--scan_batch_size", type=int, default=1024)
-    parser.add_argument("--rollout_batch_size", type=int, default=128)
-    parser.add_argument(
-        "--max_source_samples",
-        type=int,
-        default=17000,
-        help="Maximum source prompts scanned for online objective mining.",
-    )
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument(
-        "--rollout_n",
-        type=int,
-        default=8,
-        help="Number of sampled responses per prompt during rollout.",
-    )
-    parser.add_argument("--max_new_tokens", type=int, default=8192)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--vllm_dtype", type=str, default="bfloat16")
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
-    parser.add_argument("--rollout_max_model_len", type=int, default=32768)
-    parser.add_argument(
-        "--sample_rejected_requires_final_answer",
-        type=str2bool,
-        default=True,
-        help=(
-            "Sampling filter: rejected response must satisfy DAPO last-line format "
-            "'Answer: ...' (optional leading '$') on the LAST line."
-        ),
-    )
-    parser.add_argument(
-        "--sample_chosen_requires_final_answer",
-        type=str2bool,
-        default=True,
-        help=(
-            "Sampling filter: chosen response must satisfy DAPO last-line format "
-            "'Answer: ...' (optional leading '$') on the LAST line."
-        ),
-    )
-
-    # shared chat format
-    parser.add_argument(
-        "--prompt_mode",
-        type=str,
-        default="fixed",
-        choices=["none", "fixed", "random"],
-        help="System prompt strategy. 'random' picks one prompt per sample from pool.",
-    )
-    parser.add_argument(
-        "--system_prompt",
-        type=str,
-        default=DEFAULT_SYSTEM_PROMPT,
-        help="Single English system prompt. Used directly when prompt_mode=fixed (unless index points elsewhere).",
-    )
-    parser.add_argument(
-        "--prompt_candidate",
-        action="append",
-        default=[],
-        help="Add one candidate system prompt. Repeat this argument for multiple candidates.",
-    )
-    parser.add_argument(
-        "--prompt_candidates_file",
-        type=str,
-        default="",
-        help="TXT/JSON file containing candidate English system prompts.",
-    )
-    parser.add_argument(
-        "--use_default_prompt_candidates",
-        type=str2bool,
-        default=False,
-        help="Append built-in English prompt candidates to the prompt pool.",
-    )
-    parser.add_argument(
-        "--prompt_fixed_index",
-        type=int,
-        default=0,
-        help="Prompt index used when prompt_mode=fixed.",
-    )
-    parser.add_argument(
-        "--enable_thinking",
-        type=str2bool,
-        default=True,
-        help="Whether to enable Qwen thinking mode when building chat template.",
-    )
-
-    # online optimization
-    parser.add_argument("--learning_rate", type=float, default=2e-6)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument(
-        "--chosen_ce_weight",
-        type=float,
-        default=0.02,
-        help=(
-            "Deprecated compatibility flag (kept for old run scripts). "
-            "The online objective now uses configurable pair selection + full-correct SFT."
-        ),
-    )
-    parser.add_argument(
-        "--pref_pair_mode",
-        type=str,
-        default="single_pair",
-        choices=["single_pair", "all_pairs"],
-        help=(
-            "Preference pair construction mode for mixed correct/wrong prompts. "
-            "'single_pair': sample one (correct, wrong) pair; "
-            "'all_pairs': use full cartesian product."
-        ),
-    )
-    parser.add_argument(
-        "--pref_single_pair_count_weight",
-        type=str,
-        default="product",
-        choices=["none", "sum", "sqrt_product", "product", "n_right_mul_n_wrong"],
-        help=(
-            "When --pref_pair_mode=single_pair, scale selected pair weight by "
-            "correct/wrong counts. "
-            "'product' and 'n_right_mul_n_wrong' are equivalent (n_correct * n_wrong)."
-        ),
-    )
-    parser.add_argument(
-        "--pref_weight_rarity_floor",
-        type=float,
-        default=0.25,
-        help="Rarity floor alpha in weight = entropy(r) * max(1-r, alpha) for mixed (correct/wrong) prompts.",
-    )
-    parser.add_argument(
-        "--pref_weight_eps",
-        type=float,
-        default=1e-6,
-        help="Numerical epsilon used in entropy(r) for mixed-prompt weighting.",
-    )
-    parser.add_argument(
-        "--full_correct_sft_weight",
-        type=float,
-        default=1.0,
-        help="Per-prompt objective weight used when all rollout samples are correct (full SFT branch).",
-    )
-    parser.add_argument("--max_length", type=int, default=4096)
-    parser.add_argument(
-        "--logprob_micro_batch_size",
-        type=int,
-        default=8,
-        help=(
-            "Online only: number of preference pairs per step for logp computation. "
-            "Each step runs chosen then rejected LM forward on the same prompts; "
-            "uses scaled backward() per chunk to cap peak VRAM (avoids huge logits). "
-            "Use 0 to process all pairs in one go (may OOM on long completions)."
-        ),
-    )
-    parser.add_argument("--length_average", type=str2bool, default=True)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument(
-        "--online_hard_grad_norm_cap",
-        type=float,
-        default=5.0,
-        help=(
-            "Online only: hard cap for pre-step grad norm. "
-            "If grad_norm > cap, skip this optimizer update. Use <=0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--online_loss_value_cap",
-        type=float,
-        default=20.0,
-        help=(
-            "Online only: hard cap for each micro-batch loss_chunk absolute value. "
-            "If exceeded, skip this optimizer update. Use <=0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--online_skip_nonfinite_loss",
-        type=str2bool,
-        default=True,
-        help="Online only: skip update when loss chunk or grad norm is non-finite.",
-    )
-    parser.add_argument(
-        "--online_abort_on_lora_nan",
-        type=str2bool,
-        default=True,
-        help="Online only: immediately stop if LoRA params become NaN after optimizer step.",
-    )
-    parser.add_argument("--torch_dtype", type=str, default="bfloat16")
-    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
-    parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
-    parser.add_argument(
-        "--use_lora",
-        type=str2bool,
-        default=False,
-        help="Train with PEFT LoRA (HF forward + preference loss); vLLM rollout loads base + adapter.",
-    )
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling.")
-    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
-    parser.add_argument(
-        "--lora_target_modules",
-        type=str,
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        help="Comma-separated target module names for LoRA (Qwen/Llama-style attention/MLP).",
-    )
-    parser.add_argument(
-        "--vllm_max_lora_rank",
-        type=int,
-        default=64,
-        help="vLLM max_lora_rank when use_lora=true; must be >= lora_r.",
-    )
-    parser.add_argument(
-        "--online_init_model_path",
-        type=str,
-        default="",
-        help="Initial model path for online training. Defaults to train/rollout model path.",
-    )
-    parser.add_argument(
-        "--online_steps",
-        type=int,
-        default=0,
-        help=(
-            "Online only: number of rollout batches to run. Each batch rolls out "
-            "rollout_batch_size prompts with --rollout_n samples each; prompt-level "
-            "objectives (mixed-pair preference + full-correct SFT) are consumed "
-            "immediately in this rollout step (no cross-step cache). "
-            "Use 0 for no limit (until source samples exhausted)."
-        ),
-    )
-    parser.add_argument(
-        "--online-pairs-per-step",
-        type=int,
-        default=16,
-        dest="online_pairs_per_step",
-        help=(
-            "Online only: number of prompt-level objectives per optimizer chunk inside one rollout step. "
-            "If a rollout yields fewer objectives, it still updates once with all available objectives."
-        ),
-    )
-    parser.add_argument(
-        "--online_save_every_updates",
-        type=int,
-        default=0,
-        help="Save checkpoint every N online updates. Use 0 to disable periodic checkpoints.",
-    )
-    parser.add_argument(
-        "--online_rollout_backend",
-        type=str,
-        default="vllm",
-        choices=["vllm", "hf"],
-        help="Online: rollout engine - vLLM (default) or Hugging Face generate.",
-    )
-    parser.add_argument(
-        "--online_vllm_use_tqdm",
-        type=str2bool,
-        default=True,
-        help="Online + vLLM: show tqdm progress in llm.generate.",
-    )
-    parser.add_argument(
-        "--online_vllm_enforce_eager",
-        type=str2bool,
-        default=True,
-        help=(
-            "Online + vLLM: use eager mode to reduce per-rollout engine init overhead "
-            "when the engine is recreated frequently."
-        ),
-    )
-
-    return parser
-
-
 def main() -> None:
-    parser = build_parser()
+    parser = build_cli_parser(DEFAULT_SYSTEM_PROMPT)
     args = parser.parse_args()
     set_seed(args.seed)
 
@@ -2548,12 +1647,22 @@ def main() -> None:
         raise SystemExit("error: --online-pairs-per-step must be >= 1")
     if args.rollout_n < 2:
         raise SystemExit("error: --rollout_n must be >= 2")
-    if args.pref_weight_rarity_floor < 0:
-        raise SystemExit("error: --pref_weight_rarity_floor must be >= 0")
-    if args.pref_weight_eps <= 0:
-        raise SystemExit("error: --pref_weight_eps must be > 0")
-    if args.full_correct_sft_weight < 0:
-        raise SystemExit("error: --full_correct_sft_weight must be >= 0")
+    if args.beta <= 0:
+        raise SystemExit("error: --beta must be > 0")
+    if args.lambda_mle < 0 or args.lambda_pref < 0 or args.lambda_gt < 0:
+        raise SystemExit("error: --lambda_mle/--lambda_pref/--lambda_gt must be >= 0")
+    if args.prompt_smoothing_alpha < 0 or args.prompt_smoothing_beta < 0:
+        raise SystemExit("error: --prompt_smoothing_alpha/--prompt_smoothing_beta must be >= 0")
+    if args.prompt_weight_gamma < 0:
+        raise SystemExit("error: --prompt_weight_gamma must be >= 0")
+    if args.prompt_weight_min < 0 or args.prompt_weight_max <= 0:
+        raise SystemExit("error: --prompt_weight_min must be >=0 and --prompt_weight_max must be >0")
+    if args.prompt_weight_min > args.prompt_weight_max:
+        raise SystemExit("error: --prompt_weight_min must be <= --prompt_weight_max")
+    if args.hidden_layer_offset < 1:
+        raise SystemExit("error: --hidden_layer_offset must be >= 1")
+    if args.rollout_feature_micro_batch_size < 0:
+        raise SystemExit("error: --rollout_feature_micro_batch_size must be >= 0")
     run_online_preference_training(args)
 
 
