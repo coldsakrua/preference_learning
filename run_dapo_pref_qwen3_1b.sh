@@ -43,6 +43,7 @@ max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.1}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
+online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
@@ -95,6 +96,7 @@ python train_dapo_preference.py \
   --beta "${beta}" \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
+  --online_gap_clip_abs "${online_gap_clip_abs}" \
   --use_lora "${use_lora}" \
   --lora_r "${lora_r}" \
   --lora_alpha "${lora_alpha}" \

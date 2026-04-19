@@ -218,8 +218,8 @@ def iter_math_hf_samples(
     gold_rationale_key_paths: Sequence[str],
     require_gold_rationale: bool,
 ) -> Iterator[DapoSample]:
-    """HF MATH-style parquet: columns ``problem`` (string) and ``solution`` (string)."""
     del gold_rationale_key_paths  # API symmetry with ``iter_dapo_samples``; unused here.
+    del require_gold_rationale  # API symmetry with ``iter_dapo_samples``; unused here.
     parquet_file = pq.ParquetFile(parquet_path)
     yielded = 0
     cols = ["problem", "solution"]
@@ -230,8 +230,6 @@ def iter_math_hf_samples(
             prompt_text = str(problem_obj or "").strip()
             solution_text = str(solution_obj or "").strip()
             if not prompt_text or not solution_text:
-                continue
-            if require_gold_rationale and not solution_text:
                 continue
             ground_truth = ground_truth_from_math_solution(solution_text)
             if not ground_truth:
@@ -332,13 +330,6 @@ def extract_rollout_scored_answer(text: str) -> tuple[bool, str]:
     return False, ""
 
 
-def extract_final_answer_robust(text: str) -> str:
-    has_last, answer_last = extract_final_answer_if_last_line(text)
-    if not has_last:
-        return ""
-    return answer_last
-
-
 def extract_final_answer_from_any_line(text: str) -> str:
     if "</think>" in text:
         text = text.split("</think>")[-1]
@@ -423,7 +414,6 @@ def compute_prompt_rarity_weight(
 
 def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Online DAPO preference training with vLLM rollout.")
-    parser.add_argument("--stage", type=str, default="online", choices=["online"], help="Only online mode is supported.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_path", type=str, default="/path/to/dapo-math-17k.parquet")
     parser.add_argument(
@@ -452,13 +442,7 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--gold_rationale_key",
         action="append",
-        default=[
-            "reward_model.gold_rationale",
-            "reward_model.rationale",
-            "reward_model.solution",
-            "reward_model.reference_solution",
-            "extra_info.gold_rationale",
-        ],
+        default=list(DEFAULT_GOLD_RATIONALE_KEY_PATHS),
         help=(
             "Dotted key path for gold rationale text. "
             "Repeat this arg for fallback lookup order, e.g. --gold_rationale_key reward_model.solution."
@@ -551,6 +535,15 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--online_hard_grad_norm_cap", type=float, default=5.0, help="Online only: hard cap for pre-step grad norm. If grad_norm > cap, skip this optimizer update. Use <=0 to disable.")
     parser.add_argument("--online_loss_value_cap", type=float, default=20.0, help="Online only: hard cap for each micro-batch loss_chunk absolute value. If exceeded, skip this optimizer update. Use <=0 to disable.")
+    parser.add_argument(
+        "--online_gap_clip_abs",
+        type=float,
+        default=0.0,
+        help=(
+            "Online only: if >0, clamp preference gap (chosen_logp - rejected_logp) to "
+            "[-online_gap_clip_abs, +online_gap_clip_abs] before preference loss."
+        ),
+    )
     parser.add_argument("--online_skip_nonfinite_loss", type=str2bool, default=True, help="Online only: skip update when loss chunk or grad norm is non-finite.")
     parser.add_argument("--online_abort_on_lora_nan", type=str2bool, default=True, help="Online only: immediately stop if LoRA params become NaN after optimizer step.")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")

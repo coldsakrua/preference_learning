@@ -21,12 +21,11 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from tqdm import tqdm
 from utils import (
     DEFAULT_MATH_HF_USER_CONTENT_SUFFIX,
     DapoSample,
@@ -40,7 +39,6 @@ from utils import (
     iter_dapo_samples,
     iter_math_hf_samples,
     set_seed,
-    str2bool,
     strip_prompt_prefix_from_text,
 )
 
@@ -980,6 +978,8 @@ def _online_run_preference_optimizer_step(
                 device,
             )
             preference_gap = chosen_logps - rejected_logps
+            if args.online_gap_clip_abs > 0:
+                preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
             pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
@@ -1032,6 +1032,8 @@ def _online_run_preference_optimizer_step(
                 device,
             )
             preference_gap = chosen_logps - rejected_logps
+            if args.online_gap_clip_abs > 0:
+                preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
             gt_pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (gt_pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
@@ -1286,7 +1288,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"prompt_gamma={args.prompt_weight_gamma}, "
         f"prompt_weight_clip=[{args.prompt_weight_min},{args.prompt_weight_max}], "
         f"pos_weight_mode={args.positive_weight_mode}, "
-        f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}"
+        f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
+        f"gap_clip_abs={args.online_gap_clip_abs}"
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
