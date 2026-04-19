@@ -40,13 +40,13 @@ rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
-learning_rate=${LEARNING_RATE:-1e-6}
-beta=${BETA:-0.1}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
+learning_rate=${LEARNING_RATE:-2e-6}
+beta=${BETA:-0.3}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-16}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
@@ -104,7 +104,9 @@ python train_dapo_preference.py \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --enable_thinking false \
-  --use_all_wrong_gt_preference false
+  --use_all_wrong_gt_preference false \
+  --online_pref_min_avg_logprob_chosen -3 \
+  --online_pref_min_avg_logprob_rejected -3 \
 
 echo "[DAPO-PREF] done"
 echo "train_output=${train_out}"

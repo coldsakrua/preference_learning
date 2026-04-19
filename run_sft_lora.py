@@ -242,7 +242,7 @@ def parse_args() -> argparse.Namespace:
         "--max_source_samples",
         type=int,
         default=0,
-        help="Cap parquet rows loaded (0: if max_steps>0, use max_steps*per_device_batch*grad_accum; else load all).",
+        help="Cap parquet rows loaded (0: load all; >0: at most this many rows).",
     )
     parser.add_argument("--system_prompt", type=str, default="")
     parser.add_argument(
@@ -300,12 +300,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     if args.max_source_samples == 0:
-        if args.max_steps > 0:
-            args.max_source_samples = (
-                args.max_steps * args.per_device_train_batch_size * args.gradient_accumulation_steps
-            )
-        else:
-            args.max_source_samples = None
+        args.max_source_samples = None
 
     dtype_map = {
         "float16": torch.float16,

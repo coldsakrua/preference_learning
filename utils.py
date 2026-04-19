@@ -524,12 +524,13 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--logprob_micro_batch_size",
         type=int,
-        default=8,
+        default=0,
         help=(
-            "Online only: number of preference pairs per step for logp computation. "
-            "Each step runs chosen then rejected LM forward on the same prompts; "
-            "uses scaled backward() per chunk to cap peak VRAM (avoids huge logits). "
-            "Use 0 to process all pairs in one go (may OOM on long completions)."
+            "Online only: max sequences per HF forward when computing logp for preference/MLE. "
+            "0 = no chunking (one forward pass per branch over the whole in-step batch; matches "
+            "on-policy training step best). "
+            "Set >0 only to reduce peak VRAM on long completions; multiple backward() chunks "
+            "accumulate grads equivalent to one full-batch loss (same total gradient if stable)."
         ),
     )
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -542,6 +543,26 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
         help=(
             "Online only: if >0, clamp preference gap (chosen_logp - rejected_logp) to "
             "[-online_gap_clip_abs, +online_gap_clip_abs] before preference loss."
+        ),
+    )
+    parser.add_argument(
+        "--online_pref_min_avg_logprob_chosen",
+        type=float,
+        default=None,
+        help=(
+            "Online: require chosen (correct or GT-positive) trajectory avg_logprob >= this value. "
+            "More negative = stricter (e.g. -5 drops very low-confidence chosen). "
+            "Omit to disable. Note: -1 is usually too aggressive for real text."
+        ),
+    )
+    parser.add_argument(
+        "--online_pref_min_avg_logprob_rejected",
+        type=float,
+        default=None,
+        help=(
+            "Online: require rejected (wrong) trajectory avg_logprob >= this value. "
+            "Drops pairs where the model is extremely surprised by the completion (often "
+            "correlates with grad NaN in bf16). Typical try: -4 to -6. Omit to disable."
         ),
     )
     parser.add_argument("--online_skip_nonfinite_loss", type=str2bool, default=True, help="Online only: skip update when loss chunk or grad norm is non-finite.")
@@ -588,12 +609,6 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
         type=str2bool,
         default=False,
         help="If true, online_pairs.jsonl stores token_ids and hidden_vec per rollout (very large).",
-    )
-    parser.add_argument(
-        "--online_log_loss_chunks",
-        type=str2bool,
-        default=True,
-        help="Online: print each pref/gt_pref/mle micro-batch loss_chunk and brief logp stats.",
     )
     parser.add_argument("--online_rollout_backend", type=str, default="vllm", choices=["vllm", "hf"], help="Online: rollout engine - vLLM (default) or Hugging Face generate.")
     parser.add_argument("--online_vllm_use_tqdm", type=str2bool, default=True, help="Online + vLLM: show tqdm progress in llm.generate.")

@@ -332,6 +332,38 @@ def build_hidden_nn_pairs(
     return [(int(c_idx), int(w_idx)) for w_idx, c_idx in enumerate(nn_correct_idx)]
 
 
+def _pref_pair_passes_avg_logprob_floor(
+    chosen_avg_logprob: float,
+    rejected_avg_logprob: float,
+    min_chosen: Optional[float],
+    min_rejected: Optional[float],
+) -> bool:
+    """Drop preference pairs whose rollout-time avg sequence logprob is too negative."""
+    if min_chosen is not None and chosen_avg_logprob < min_chosen:
+        return False
+    if min_rejected is not None and rejected_avg_logprob < min_rejected:
+        return False
+    return True
+
+
+def filter_mixed_pref_pairs_by_avg_logprob(
+    mixed_pairs: Sequence[Tuple[int, int]],
+    correct_trajs: Sequence[RolloutTrajectory],
+    wrong_trajs: Sequence[RolloutTrajectory],
+    min_chosen: Optional[float],
+    min_rejected: Optional[float],
+) -> List[Tuple[int, int]]:
+    if min_chosen is None and min_rejected is None:
+        return [(int(a), int(b)) for a, b in mixed_pairs]
+    out: List[Tuple[int, int]] = []
+    for c_idx, w_idx in mixed_pairs:
+        c_lp = correct_trajs[c_idx].avg_logprob
+        w_lp = wrong_trajs[w_idx].avg_logprob
+        if _pref_pair_passes_avg_logprob_floor(c_lp, w_lp, min_chosen, min_rejected):
+            out.append((int(c_idx), int(w_idx)))
+    return out
+
+
 def rollout_trajectory_to_json(traj: RolloutTrajectory, *, include_dense: bool) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "response_text": traj.response_text,
@@ -807,22 +839,6 @@ class SftTruncationStats:
     dropped_completion_too_long: int
 
 
-def _online_log_loss_chunk(
-    enabled: bool,
-    tag: str,
-    start: int,
-    end: int,
-    loss_chunk_val: float,
-    detail: str = "",
-) -> None:
-    if not enabled:
-        return
-    msg = f"[online-loss] {tag} rows=[{start}:{end}] loss_chunk={loss_chunk_val:.8f}"
-    if detail:
-        msg += " " + detail
-    print(msg, flush=True)
-
-
 def filter_weighted_pairs_without_truncation(
     tokenizer: object,
     train_prompts: Sequence[str],
@@ -983,17 +999,6 @@ def _online_run_preference_optimizer_step(
             pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
-            if args.online_log_loss_chunks:
-                with torch.no_grad():
-                    cg = chosen_logps.detach()
-                    rg = rejected_logps.detach()
-                    pg = preference_gap.detach()
-                    detail = (
-                        f"mean_logp_chosen={float(cg.mean()):.5f} mean_logp_rejected={float(rg.mean()):.5f} "
-                        f"mean_gap={float(pg.mean()):.5f} logp_finite="
-                        f"{bool(torch.isfinite(cg).all() and torch.isfinite(rg).all())}"
-                    )
-                _online_log_loss_chunk(args.online_log_loss_chunks, "pref", start, end, loss_chunk_val, detail)
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
@@ -1037,17 +1042,6 @@ def _online_run_preference_optimizer_step(
             gt_pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (gt_pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
-            if args.online_log_loss_chunks:
-                with torch.no_grad():
-                    cg = chosen_logps.detach()
-                    rg = rejected_logps.detach()
-                    pg = preference_gap.detach()
-                    detail = (
-                        f"mean_logp_chosen={float(cg.mean()):.5f} mean_logp_rejected={float(rg.mean()):.5f} "
-                        f"mean_gap={float(pg.mean()):.5f} logp_finite="
-                        f"{bool(torch.isfinite(cg).all() and torch.isfinite(rg).all())}"
-                    )
-                _online_log_loss_chunk(args.online_log_loss_chunks, "gt_pref", start, end, loss_chunk_val, detail)
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
@@ -1079,13 +1073,6 @@ def _online_run_preference_optimizer_step(
             mle_loss_vec = -logps
             loss_chunk = (mle_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
-            if args.online_log_loss_chunks:
-                with torch.no_grad():
-                    lg = logps.detach()
-                    detail = (
-                        f"mean_logp_completion={float(lg.mean()):.5f} logp_finite={bool(torch.isfinite(lg).all())}"
-                    )
-                _online_log_loss_chunk(args.online_log_loss_chunks, "mle", start, end, loss_chunk_val, detail)
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
@@ -1096,16 +1083,6 @@ def _online_run_preference_optimizer_step(
             if failed is not None:
                 return failed
             mle_loss_weighted_sum += (mle_loss_vec * w).sum().item()
-
-    if args.online_log_loss_chunks:
-        combined = pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum
-        print(
-            f"[online-loss] all_chunks_backward_done pref_wsum={pref_loss_weighted_sum:.6f} "
-            f"gt_pref_wsum={gt_pref_loss_weighted_sum:.6f} mle_wsum={mle_loss_weighted_sum:.6f} "
-            f"combined_wsum={combined:.6f} total_weight={total_weight:.6f} "
-            f"implied_mean_loss={combined / total_weight:.6f}",
-            flush=True,
-        )
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
@@ -1118,15 +1095,6 @@ def _online_run_preference_optimizer_step(
             total_norm = torch.tensor(0.0, device=device)
     grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
     if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
-        if args.online_log_loss_chunks:
-            combined = pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum
-            print(
-                f"[online-loss] accum_weighted_sums pref={pref_loss_weighted_sum:.6f} "
-                f"gt_pref={gt_pref_loss_weighted_sum:.6f} mle={mle_loss_weighted_sum:.6f} "
-                f"sum={combined:.6f} total_weight={total_weight:.6f} "
-                f"implied_mean_loss={combined / total_weight:.6f} grad_norm={grad_norm}",
-                flush=True,
-            )
         optimizer.zero_grad(set_to_none=True)
         return _build_zero_stats("nonfinite_grad_norm", grad_norm_value=grad_norm)
     if args.online_hard_grad_norm_cap > 0 and grad_norm > args.online_hard_grad_norm_cap:
@@ -1289,7 +1257,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"prompt_weight_clip=[{args.prompt_weight_min},{args.prompt_weight_max}], "
         f"pos_weight_mode={args.positive_weight_mode}, "
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
-        f"gap_clip_abs={args.online_gap_clip_abs}"
+        f"gap_clip_abs={args.online_gap_clip_abs}, "
+        f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
+        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}"
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
@@ -1400,6 +1370,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                             tau=args.positive_weight_tau,
                         )
                         mixed_pairs = build_hidden_nn_pairs(correct_trajs, wrong_trajs)
+                        mixed_pairs = filter_mixed_pref_pairs_by_avg_logprob(
+                            mixed_pairs,
+                            correct_trajs,
+                            wrong_trajs,
+                            args.online_pref_min_avg_logprob_chosen,
+                            args.online_pref_min_avg_logprob_rejected,
+                        )
                         if mixed_pairs:
                             objective = OnlinePendingObjective(
                                 sample_id=sample_obj.sample_id,
@@ -1585,8 +1562,20 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         elif objective.objective_type == "all_wrong":
                             if objective.gt_positive is None or not objective.wrong:
                                 continue
-                            pair_weight = float(args.lambda_gt) / float(len(objective.wrong))
-                            for wrong_traj in objective.wrong:
+                            gt_wrong_kept = [
+                                w
+                                for w in objective.wrong
+                                if _pref_pair_passes_avg_logprob_floor(
+                                    objective.gt_positive.avg_logprob,
+                                    w.avg_logprob,
+                                    args.online_pref_min_avg_logprob_chosen,
+                                    args.online_pref_min_avg_logprob_rejected,
+                                )
+                            ]
+                            if not gt_wrong_kept:
+                                continue
+                            pair_weight = float(args.lambda_gt) / float(len(gt_wrong_kept))
+                            for wrong_traj in gt_wrong_kept:
                                 gt_pref_train_prompts_raw.append(objective.train_prompt)
                                 gt_pref_chosen_raw.append(objective.gt_positive.response_text)
                                 gt_pref_rejected_raw.append(wrong_traj.response_text)
@@ -1679,19 +1668,14 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     kept_mle_samples += loss_stats.mle_samples_used
                     print(
                         f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                        f"optimizer_step={updates} pref_pairs={loss_stats.pref_pairs_used} "
-                        f"gt_pref_pairs={loss_stats.gt_pref_pairs_used} "
-                        f"mle_samples={loss_stats.mle_samples_used} "
-                        f"loss={loss_stats.total_loss:.4f} "
-                        f"mle_loss={loss_stats.mle_loss:.4f} "
-                        f"pref_loss={loss_stats.pref_loss:.4f} "
-                        f"gt_pref_loss={loss_stats.gt_pref_loss:.4f} "
-                        f"gap={loss_stats.mean_gap:.4f} "
-                        f"grad_norm={loss_stats.grad_norm:.4f} "
-                        f"lora_mean_abs={loss_stats.lora_mean_abs:.6e} "
-                        f"lora_max_abs={loss_stats.lora_max_abs:.6e} "
-                        f"lora_nan_ratio={loss_stats.lora_nan_ratio:.6f} "
-                        f"lora_inf_ratio={loss_stats.lora_inf_ratio:.6f}"
+                        f"optimizer_step={updates} "
+                        f"pref_loss={loss_stats.pref_loss:.6f} "
+                        f"mean_gap={loss_stats.mean_gap:.6f} "
+                        f"gt_pref_loss={loss_stats.gt_pref_loss:.6f} "
+                        f"mle_loss={loss_stats.mle_loss:.6f} "
+                        f"total_loss={loss_stats.total_loss:.6f} "
+                        f"grad_norm={loss_stats.grad_norm:.6f}",
+                        flush=True,
                     )
 
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
@@ -1709,7 +1693,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 )
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    f"no optimizer update applied ({hint}; see per-chunk skip lines or empty batch)"
+                    f"no optimizer update applied ({hint}; see skip lines above or empty batch)"
                 )
             elif rollout_objectives:
                 print(
