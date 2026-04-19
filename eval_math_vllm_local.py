@@ -31,6 +31,8 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
+from utils import extract_user_prompt
+
 try:
     from math_verify import parse, verify
 
@@ -198,8 +200,6 @@ def load_problem_answer_parquet_examples(path: Path, limit: Optional[int]) -> Li
 
 
 def load_dapo_parquet_examples(path: Path, limit: Optional[int]) -> List[Dict[str, Any]]:
-    from train_dapo_preference import extract_user_prompt
-
     rows: List[Dict[str, Any]] = []
     pf = pq.ParquetFile(path)
     cols = ["prompt", "reward_model", "extra_info"]

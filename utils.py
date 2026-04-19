@@ -4,7 +4,7 @@ import argparse
 import random
 import re
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import pyarrow.parquet as pq
 import torch
@@ -33,6 +33,21 @@ class DapoSample:
     ground_truth: str
     gold_rationale: str
     sample_id: str
+
+
+DEFAULT_GOLD_RATIONALE_KEY_PATHS: Tuple[str, ...] = (
+    "reward_model.gold_rationale",
+    "reward_model.rationale",
+    "reward_model.solution",
+    "reward_model.reference_solution",
+    "extra_info.gold_rationale",
+)
+
+DEFAULT_MATH_HF_USER_CONTENT_SUFFIX = (
+    "\n\nPlease solve the problem with step-by-step reasoning. "
+    "End your full response with exactly one final line of the form:\n"
+    "Answer: <your final answer>."
+)
 
 
 def extract_user_prompt(messages: object) -> str:
@@ -148,6 +163,91 @@ def iter_dapo_samples(
                 return
 
 
+def detect_parquet_dataset_layout(parquet_path: str) -> str:
+    """Return ``dapo`` or ``math_hf`` based on column names."""
+    schema = pq.ParquetFile(parquet_path).schema_arrow
+    names = set(schema.names)
+    if "prompt" in names and "reward_model" in names:
+        return "dapo"
+    if "problem" in names and "solution" in names:
+        return "math_hf"
+    raise ValueError(
+        f"Unsupported parquet layout in {parquet_path!r}; columns={sorted(names)}. "
+        "Expected DAPO (prompt+reward_model) or MATH HF (problem+solution)."
+    )
+
+
+def extract_boxed_answer_last(text: str) -> str:
+    """Return inner text of the last ``\\boxed{...}`` region, or empty string."""
+    idx = text.rfind("\\boxed")
+    if idx < 0:
+        return ""
+    i = idx
+    num_left_braces = 0
+    right_brace_idx: Optional[int] = None
+    while i < len(text):
+        if text[i] == "{":
+            num_left_braces += 1
+        if text[i] == "}":
+            num_left_braces -= 1
+            if num_left_braces == 0:
+                right_brace_idx = i
+                break
+        i += 1
+    if right_brace_idx is None:
+        return ""
+    boxed_str = text[idx : right_brace_idx + 1]
+    if boxed_str.startswith("\\boxed{") and boxed_str.endswith("}"):
+        return boxed_str[7:-1].strip()
+    return ""
+
+
+def ground_truth_from_math_solution(solution: str) -> str:
+    if not solution:
+        return ""
+    boxed = extract_boxed_answer_last(solution)
+    if boxed:
+        return boxed
+    return extract_final_answer_from_any_line(solution).strip()
+
+
+def iter_math_hf_samples(
+    parquet_path: str,
+    scan_batch_size: int,
+    max_source_samples: Optional[int],
+    gold_rationale_key_paths: Sequence[str],
+    require_gold_rationale: bool,
+) -> Iterator[DapoSample]:
+    """HF MATH-style parquet: columns ``problem`` (string) and ``solution`` (string)."""
+    del gold_rationale_key_paths  # API symmetry with ``iter_dapo_samples``; unused here.
+    parquet_file = pq.ParquetFile(parquet_path)
+    yielded = 0
+    cols = ["problem", "solution"]
+    for record_batch in parquet_file.iter_batches(batch_size=scan_batch_size, columns=cols):
+        problems = record_batch.column("problem").to_pylist()
+        solutions = record_batch.column("solution").to_pylist()
+        for problem_obj, solution_obj in zip(problems, solutions):
+            prompt_text = str(problem_obj or "").strip()
+            solution_text = str(solution_obj or "").strip()
+            if not prompt_text or not solution_text:
+                continue
+            if require_gold_rationale and not solution_text:
+                continue
+            ground_truth = ground_truth_from_math_solution(solution_text)
+            if not ground_truth:
+                continue
+            sample_id = f"math-{yielded}"
+            yield DapoSample(
+                prompt=prompt_text,
+                ground_truth=ground_truth,
+                gold_rationale=solution_text,
+                sample_id=sample_id,
+            )
+            yielded += 1
+            if max_source_samples is not None and yielded >= max_source_samples:
+                return
+
+
 _ANSWER_LINE_CANONICAL = re.compile(r"^\s*(?:final\s+)?answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
 _ANSWER_LINE_PARQUET = re.compile(r"^\s*answer\s*[:\uFF1A]\s*(.+?)\s*$", flags=re.IGNORECASE)
 _BOXED = re.compile(r"\\boxed\{([^{}]+)\}")
@@ -221,6 +321,17 @@ def extract_final_answer_if_last_line(text: str) -> tuple[bool, str]:
     return True, answer
 
 
+def extract_rollout_scored_answer(text: str) -> tuple[bool, str]:
+    """Parse a model rollout for grading: last-line ``Answer:`` first, else last ``\\boxed{}``."""
+    has_last, ans = extract_final_answer_if_last_line(text)
+    if has_last and ans.strip():
+        return True, ans.strip()
+    boxed = extract_boxed_answer_last(text)
+    if boxed.strip():
+        return True, boxed.strip()
+    return False, ""
+
+
 def extract_final_answer_robust(text: str) -> str:
     has_last, answer_last = extract_final_answer_if_last_line(text)
     if not has_last:
@@ -240,6 +351,15 @@ def extract_final_answer_from_any_line(text: str) -> str:
         if parsed:
             return parsed
     return ""
+
+
+def extract_reference_answer_for_verifier(text: str) -> str:
+    """Ground-truth text from a reference solution (e.g. MATH): ``Answer:`` lines or ``\\boxed{}``."""
+    s = extract_final_answer_from_any_line(text)
+    if s.strip():
+        return s.strip()
+    boxed = extract_boxed_answer_last(text)
+    return boxed.strip()
 
 
 def normalize_answer(answer: str) -> str:
@@ -306,6 +426,29 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--stage", type=str, default="online", choices=["online"], help="Only online mode is supported.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_path", type=str, default="/path/to/dapo-math-17k.parquet")
+    parser.add_argument(
+        "--dataset_layout",
+        type=str,
+        default="auto",
+        choices=["auto", "dapo", "math_hf"],
+        help=(
+            "Parquet layout: ``dapo`` (prompt+reward_model+extra_info), "
+            "``math_hf`` (problem+solution, e.g. HF MATH train parquet). "
+            "``auto`` picks by column names."
+        ),
+    )
+    parser.add_argument(
+        "--user_content_suffix",
+        type=str,
+        default="",
+        help="Appended to each raw user prompt before chat templating (e.g. output format for HF MATH).",
+    )
+    parser.add_argument(
+        "--auto_math_hf_user_suffix",
+        type=str2bool,
+        default=True,
+        help="If true and layout is math_hf and --user_content_suffix is empty, append DEFAULT_MATH_HF suffix.",
+    )
     parser.add_argument(
         "--gold_rationale_key",
         action="append",
@@ -447,6 +590,18 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--online_save_every_updates", type=int, default=0, help="Save checkpoint every N online updates. Use 0 to disable periodic checkpoints.")
+    parser.add_argument(
+        "--online_pairs_include_dense_rollouts",
+        type=str2bool,
+        default=False,
+        help="If true, online_pairs.jsonl stores token_ids and hidden_vec per rollout (very large).",
+    )
+    parser.add_argument(
+        "--online_log_loss_chunks",
+        type=str2bool,
+        default=True,
+        help="Online: print each pref/gt_pref/mle micro-batch loss_chunk and brief logp stats.",
+    )
     parser.add_argument("--online_rollout_backend", type=str, default="vllm", choices=["vllm", "hf"], help="Online: rollout engine - vLLM (default) or Hugging Face generate.")
     parser.add_argument("--online_vllm_use_tqdm", type=str2bool, default=True, help="Online + vLLM: show tqdm progress in llm.generate.")
     parser.add_argument(

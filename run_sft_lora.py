@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-LoRA SFT training on the same DAPO-style parquet dataset.
+LoRA SFT training on parquet math data.
 
-Dataset schema (same as train_dapo_preference.py):
-  - prompt: list[{"role": "...", "content": "..."}]
-  - reward_model: {"ground_truth": "..."}
-  - extra_info: {"index": "..."} (optional)
+Supported layouts (``--dataset_layout auto|dapo|math_hf``):
+
+- **dapo**: ``prompt`` (chat messages), ``reward_model.ground_truth``, optional ``extra_info.index``.
+  Target = ``answer_prefix + ground_truth``.
+- **math_hf** (e.g. HF ``MATH`` train parquet): ``problem`` (string), ``solution`` (string with reasoning + ``\\boxed{}``).
+  Target = full ``solution`` (supervises reasoning); ``ground_truth`` is parsed for bookkeeping only.
+  By default an Answer-line instruction is appended to ``problem`` (``--user_content_suffix`` / ``--auto_math_hf_user_suffix``).
 """
 
 from __future__ import annotations
@@ -13,11 +16,18 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence
 
-import pyarrow.parquet as pq
+from utils import (
+    DEFAULT_GOLD_RATIONALE_KEY_PATHS,
+    DEFAULT_MATH_HF_USER_CONTENT_SUFFIX,
+    DapoSample,
+    detect_parquet_dataset_layout,
+    iter_dapo_samples,
+    iter_math_hf_samples,
+)
+
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import (
@@ -28,11 +38,11 @@ from transformers import (
 )
 
 
-@dataclass
-class DapoSample:
-    prompt: str
-    ground_truth: str
-    sample_id: str
+def resolve_user_content_suffix_for_layout(args: argparse.Namespace, layout: str) -> str:
+    user_suffix = str(args.user_content_suffix or "")
+    if args.auto_math_hf_user_suffix and layout == "math_hf" and not user_suffix.strip():
+        return DEFAULT_MATH_HF_USER_CONTENT_SUFFIX
+    return user_suffix
 
 
 def str2bool(v: str) -> bool:
@@ -44,55 +54,28 @@ def str2bool(v: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid bool value: {v}")
 
 
-def extract_user_prompt(messages: object) -> str:
-    if not isinstance(messages, list) or not messages:
-        return ""
-    user_contents: List[str] = []
-    for message in messages:
-        if isinstance(message, dict) and message.get("role") == "user":
-            content = str(message.get("content", "")).strip()
-            if content:
-                user_contents.append(content)
-    if user_contents:
-        return user_contents[-1]
-    for message in reversed(messages):
-        if isinstance(message, dict):
-            content = str(message.get("content", "")).strip()
-            if content:
-                return content
-    return ""
-
-
-def iter_dapo_samples(
-    parquet_path: str,
-    scan_batch_size: int,
-    max_source_samples: Optional[int],
-) -> Iterator[DapoSample]:
-    parquet_file = pq.ParquetFile(parquet_path)
-    yielded = 0
-    columns = ["prompt", "reward_model", "extra_info"]
-    for record_batch in parquet_file.iter_batches(batch_size=scan_batch_size, columns=columns):
-        prompt_col = record_batch.column("prompt").to_pylist()
-        reward_col = record_batch.column("reward_model").to_pylist()
-        extra_col = record_batch.column("extra_info").to_pylist()
-        for prompt_obj, reward_obj, extra_obj in zip(prompt_col, reward_col, extra_col):
-            prompt_text = extract_user_prompt(prompt_obj)
-            if not prompt_text:
-                continue
-            ground_truth = ""
-            if isinstance(reward_obj, dict):
-                ground_truth = str(reward_obj.get("ground_truth", "")).strip()
-            if not ground_truth:
-                continue
-            sample_id = ""
-            if isinstance(extra_obj, dict):
-                sample_id = str(extra_obj.get("index", "")).strip()
-            if not sample_id:
-                sample_id = f"row-{yielded}"
-            yield DapoSample(prompt=prompt_text, ground_truth=ground_truth, sample_id=sample_id)
-            yielded += 1
-            if max_source_samples is not None and yielded >= max_source_samples:
-                return
+def iter_sft_source_samples(args: argparse.Namespace) -> Iterator[DapoSample]:
+    layout = args.dataset_layout
+    if layout == "auto":
+        layout = detect_parquet_dataset_layout(args.dataset_path)
+    if layout == "dapo":
+        yield from iter_dapo_samples(
+            parquet_path=args.dataset_path,
+            scan_batch_size=args.scan_batch_size,
+            max_source_samples=args.max_source_samples,
+            gold_rationale_key_paths=list(DEFAULT_GOLD_RATIONALE_KEY_PATHS),
+            require_gold_rationale=False,
+        )
+    elif layout == "math_hf":
+        yield from iter_math_hf_samples(
+            parquet_path=args.dataset_path,
+            scan_batch_size=args.scan_batch_size,
+            max_source_samples=args.max_source_samples,
+            gold_rationale_key_paths=(),
+            require_gold_rationale=False,
+        )
+    else:
+        raise ValueError(f"Unsupported --dataset_layout: {layout}")
 
 
 def apply_qwen_chat_template(
@@ -122,19 +105,23 @@ def build_target_text(ground_truth: str, answer_prefix: str) -> str:
 
 
 def build_records(args: argparse.Namespace, tokenizer: object) -> List[Dict[str, str]]:
+    layout = args.dataset_layout
+    if layout == "auto":
+        layout = detect_parquet_dataset_layout(args.dataset_path)
+    user_suffix = resolve_user_content_suffix_for_layout(args, layout)
+
     records: List[Dict[str, str]] = []
-    for sample in iter_dapo_samples(
-        parquet_path=args.dataset_path,
-        scan_batch_size=args.scan_batch_size,
-        max_source_samples=args.max_source_samples,
-    ):
+    for sample in iter_sft_source_samples(args):
         prompt_text = apply_qwen_chat_template(
             tokenizer=tokenizer,
-            prompt=sample.prompt,
+            prompt=sample.prompt + user_suffix,
             enable_thinking=args.enable_thinking,
             system_prompt=args.system_prompt,
         )
-        completion_text = build_target_text(sample.ground_truth, args.answer_prefix)
+        if sample.gold_rationale.strip():
+            completion_text = sample.gold_rationale.strip()
+        else:
+            completion_text = build_target_text(sample.ground_truth, args.answer_prefix)
         records.append(
             {
                 "sample_id": sample.sample_id,
@@ -240,6 +227,13 @@ class DataCollatorForPromptMaskedSFT:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("LoRA SFT on DAPO parquet dataset")
     parser.add_argument("--dataset_path", type=str, required=True)
+    parser.add_argument(
+        "--dataset_layout",
+        type=str,
+        default="auto",
+        choices=["auto", "dapo", "math_hf"],
+        help="Parquet layout: dapo, math_hf (problem+solution), or auto by columns.",
+    )
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -251,6 +245,18 @@ def parse_args() -> argparse.Namespace:
         help="Cap parquet rows loaded (0: if max_steps>0, use max_steps*per_device_batch*grad_accum; else load all).",
     )
     parser.add_argument("--system_prompt", type=str, default="")
+    parser.add_argument(
+        "--user_content_suffix",
+        type=str,
+        default="",
+        help="Appended to each user prompt before chat templating.",
+    )
+    parser.add_argument(
+        "--auto_math_hf_user_suffix",
+        type=str2bool,
+        default=True,
+        help="If true and layout is math_hf and user_content_suffix is empty, append DEFAULT_MATH_HF suffix.",
+    )
     parser.add_argument("--enable_thinking", type=str2bool, default=True)
     parser.add_argument("--answer_prefix", type=str, default="Answer: ")
 
@@ -312,6 +318,10 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    layout = args.dataset_layout
+    if layout == "auto":
+        layout = detect_parquet_dataset_layout(args.dataset_path)
+
     records = build_records(args, tokenizer)
     if not records:
         raise RuntimeError("No valid samples loaded from dataset.")
@@ -323,8 +333,10 @@ def main() -> None:
     eval_records = records[:eval_size]
     train_records = records[eval_size:]
 
+    u_suffix = resolve_user_content_suffix_for_layout(args, layout)
     print(
-        f"[sft] loaded={len(records)} train={len(train_records)} eval={len(eval_records)} "
+        f"[sft] dataset_layout={layout} user_content_suffix_chars={len(u_suffix)} "
+        f"loaded={len(records)} train={len(train_records)} eval={len(eval_records)} "
         f"answer_prefix={json.dumps(args.answer_prefix)}"
     )
 

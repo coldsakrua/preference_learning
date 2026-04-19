@@ -27,7 +27,7 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/dapo-math-17k.parquet}
+dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 seed=${SEED:-42}
@@ -76,7 +76,6 @@ python train_dapo_preference.py \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
   --output_dir "${train_out}" \
-  --require_gold_rationale_for_all_wrong true \
   --online_rollout_backend vllm \
   --tensor_parallel_size "${tensor_parallel_size}" \
   --vllm_dtype "${vllm_dtype}" \
@@ -102,7 +101,8 @@ python train_dapo_preference.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --enable_thinking false
+  --enable_thinking false \
+  --use_all_wrong_gt_preference false
 
 echo "[DAPO-PREF] done"
 echo "train_output=${train_out}"

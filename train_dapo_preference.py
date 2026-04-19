@@ -28,14 +28,17 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 from utils import (
+    DEFAULT_MATH_HF_USER_CONTENT_SUFFIX,
     DapoSample,
     answer_text_matches,
     build_parser as build_cli_parser,
     compute_prompt_rarity_weight,
     compute_smoothed_correct_rate,
-    extract_final_answer_from_any_line,
-    extract_final_answer_if_last_line,
+    detect_parquet_dataset_layout,
+    extract_reference_answer_for_verifier,
+    extract_rollout_scored_answer,
     iter_dapo_samples,
+    iter_math_hf_samples,
     set_seed,
     str2bool,
     strip_prompt_prefix_from_text,
@@ -266,7 +269,7 @@ def split_rollout_candidates_for_training(
     correct_kept: List[str] = []
     wrong_kept: List[str] = []
     for idx, candidate in enumerate(candidates):
-        has_final_answer_line, parsed_last_answer = extract_final_answer_if_last_line(candidate)
+        has_final_answer_line, parsed_last_answer = extract_rollout_scored_answer(candidate)
         parsed_answer = parsed_last_answer if has_final_answer_line else ""
         is_correct = answer_text_matches(parsed_answer, ground_truth)
         responses_has_final_answer_line.append(has_final_answer_line)
@@ -331,24 +334,27 @@ def build_hidden_nn_pairs(
     return [(int(c_idx), int(w_idx)) for w_idx, c_idx in enumerate(nn_correct_idx)]
 
 
-def rollout_trajectory_to_json(traj: RolloutTrajectory) -> Dict[str, Any]:
-    return {
+def rollout_trajectory_to_json(traj: RolloutTrajectory, *, include_dense: bool) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
         "response_text": traj.response_text,
-        "token_ids": [int(t) for t in traj.token_ids],
         "is_correct": bool(traj.is_correct),
         "fail_type": traj.fail_type,
         "has_final_answer_line": bool(traj.has_final_answer_line),
         "final_answer": traj.final_answer,
         "avg_logprob": float(traj.avg_logprob),
         "avg_nll": float(traj.avg_nll),
-        "hidden_vec": [float(v) for v in traj.hidden_vec],
     }
+    if include_dense:
+        out["token_ids"] = [int(t) for t in traj.token_ids]
+        out["hidden_vec"] = [float(v) for v in traj.hidden_vec]
+    return out
 
 
 def build_online_bootstrap_jsonl_record(
     *,
     sample_id: str,
     prompt: str,
+    prompt_user_effective: str,
     system_prompt: str,
     ground_truth: str,
     candidates: Sequence[str],
@@ -357,6 +363,7 @@ def build_online_bootstrap_jsonl_record(
     prompt_weight: float,
     rho_hat: float,
     all_trajectories: Sequence[RolloutTrajectory],
+    include_dense_rollouts: bool,
 ) -> Dict[str, Any]:
     n_correct_total = int(sum(1 for x in split.responses_correct if x))
     n_total = len(candidates)
@@ -365,6 +372,7 @@ def build_online_bootstrap_jsonl_record(
     record: Dict[str, Any] = {
         "sample_id": sample_id,
         "prompt": prompt,
+        "prompt_user_effective": prompt_user_effective,
         "system_prompt": system_prompt,
         "ground_truth": ground_truth,
         "responses": [str(c) for c in candidates],
@@ -382,7 +390,7 @@ def build_online_bootstrap_jsonl_record(
         "rho_hat": float(rho_hat),
         "prompt_weight": float(prompt_weight),
         "objective_type": objective_type,
-        "rollouts": [rollout_trajectory_to_json(t) for t in all_trajectories],
+        "rollouts": [rollout_trajectory_to_json(t, include_dense=include_dense_rollouts) for t in all_trajectories],
     }
     if objective is not None:
         record["correct_traj_weights"] = [float(v) for v in objective.correct_traj_weights]
@@ -391,7 +399,9 @@ def build_online_bootstrap_jsonl_record(
             for c_idx, w_idx in objective.mixed_pref_pairs
         ]
         if objective.gt_positive is not None:
-            record["gt_positive"] = rollout_trajectory_to_json(objective.gt_positive)
+            record["gt_positive"] = rollout_trajectory_to_json(
+                objective.gt_positive, include_dense=include_dense_rollouts
+            )
     return record
 
 
@@ -799,6 +809,22 @@ class SftTruncationStats:
     dropped_completion_too_long: int
 
 
+def _online_log_loss_chunk(
+    enabled: bool,
+    tag: str,
+    start: int,
+    end: int,
+    loss_chunk_val: float,
+    detail: str = "",
+) -> None:
+    if not enabled:
+        return
+    msg = f"[online-loss] {tag} rows=[{start}:{end}] loss_chunk={loss_chunk_val:.8f}"
+    if detail:
+        msg += " " + detail
+    print(msg, flush=True)
+
+
 def filter_weighted_pairs_without_truncation(
     tokenizer: object,
     train_prompts: Sequence[str],
@@ -957,6 +983,17 @@ def _online_run_preference_optimizer_step(
             pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
+            if args.online_log_loss_chunks:
+                with torch.no_grad():
+                    cg = chosen_logps.detach()
+                    rg = rejected_logps.detach()
+                    pg = preference_gap.detach()
+                    detail = (
+                        f"mean_logp_chosen={float(cg.mean()):.5f} mean_logp_rejected={float(rg.mean()):.5f} "
+                        f"mean_gap={float(pg.mean()):.5f} logp_finite="
+                        f"{bool(torch.isfinite(cg).all() and torch.isfinite(rg).all())}"
+                    )
+                _online_log_loss_chunk(args.online_log_loss_chunks, "pref", start, end, loss_chunk_val, detail)
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
@@ -998,6 +1035,17 @@ def _online_run_preference_optimizer_step(
             gt_pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
             loss_chunk = (gt_pref_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
+            if args.online_log_loss_chunks:
+                with torch.no_grad():
+                    cg = chosen_logps.detach()
+                    rg = rejected_logps.detach()
+                    pg = preference_gap.detach()
+                    detail = (
+                        f"mean_logp_chosen={float(cg.mean()):.5f} mean_logp_rejected={float(rg.mean()):.5f} "
+                        f"mean_gap={float(pg.mean()):.5f} logp_finite="
+                        f"{bool(torch.isfinite(cg).all() and torch.isfinite(rg).all())}"
+                    )
+                _online_log_loss_chunk(args.online_log_loss_chunks, "gt_pref", start, end, loss_chunk_val, detail)
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
@@ -1029,6 +1077,13 @@ def _online_run_preference_optimizer_step(
             mle_loss_vec = -logps
             loss_chunk = (mle_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
+            if args.online_log_loss_chunks:
+                with torch.no_grad():
+                    lg = logps.detach()
+                    detail = (
+                        f"mean_logp_completion={float(lg.mean()):.5f} logp_finite={bool(torch.isfinite(lg).all())}"
+                    )
+                _online_log_loss_chunk(args.online_log_loss_chunks, "mle", start, end, loss_chunk_val, detail)
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
@@ -1039,6 +1094,16 @@ def _online_run_preference_optimizer_step(
             if failed is not None:
                 return failed
             mle_loss_weighted_sum += (mle_loss_vec * w).sum().item()
+
+    if args.online_log_loss_chunks:
+        combined = pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum
+        print(
+            f"[online-loss] all_chunks_backward_done pref_wsum={pref_loss_weighted_sum:.6f} "
+            f"gt_pref_wsum={gt_pref_loss_weighted_sum:.6f} mle_wsum={mle_loss_weighted_sum:.6f} "
+            f"combined_wsum={combined:.6f} total_weight={total_weight:.6f} "
+            f"implied_mean_loss={combined / total_weight:.6f}",
+            flush=True,
+        )
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
@@ -1051,6 +1116,15 @@ def _online_run_preference_optimizer_step(
             total_norm = torch.tensor(0.0, device=device)
     grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
     if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
+        if args.online_log_loss_chunks:
+            combined = pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum
+            print(
+                f"[online-loss] accum_weighted_sums pref={pref_loss_weighted_sum:.6f} "
+                f"gt_pref={gt_pref_loss_weighted_sum:.6f} mle={mle_loss_weighted_sum:.6f} "
+                f"sum={combined:.6f} total_weight={total_weight:.6f} "
+                f"implied_mean_loss={combined / total_weight:.6f} grad_norm={grad_norm}",
+                flush=True,
+            )
         optimizer.zero_grad(set_to_none=True)
         return _build_zero_stats("nonfinite_grad_norm", grad_norm_value=grad_norm)
     if args.online_hard_grad_norm_cap > 0 and grad_norm > args.online_hard_grad_norm_cap:
@@ -1154,13 +1228,35 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     prompt_pool = build_prompt_pool(args)
     prompt_rng = random.Random(args.seed + 20260412)
 
-    source_iter = iter_dapo_samples(
-        parquet_path=args.dataset_path,
-        scan_batch_size=args.scan_batch_size,
-        max_source_samples=args.max_source_samples,
-        gold_rationale_key_paths=args.gold_rationale_key,
-        require_gold_rationale=args.require_gold_rationale_for_all_wrong,
-    )
+    layout = args.dataset_layout
+    if layout == "auto":
+        layout = detect_parquet_dataset_layout(args.dataset_path)
+    if layout == "dapo":
+        source_iter = iter_dapo_samples(
+            parquet_path=args.dataset_path,
+            scan_batch_size=args.scan_batch_size,
+            max_source_samples=args.max_source_samples,
+            gold_rationale_key_paths=args.gold_rationale_key,
+            require_gold_rationale=args.require_gold_rationale_for_all_wrong,
+        )
+    elif layout == "math_hf":
+        source_iter = iter_math_hf_samples(
+            parquet_path=args.dataset_path,
+            scan_batch_size=args.scan_batch_size,
+            max_source_samples=args.max_source_samples,
+            gold_rationale_key_paths=(),
+            require_gold_rationale=args.require_gold_rationale_for_all_wrong,
+        )
+    else:
+        raise ValueError(f"Unsupported --dataset_layout: {layout}")
+
+    rollout_user_suffix = str(args.user_content_suffix or "")
+    if (
+        args.auto_math_hf_user_suffix
+        and layout == "math_hf"
+        and not rollout_user_suffix.strip()
+    ):
+        rollout_user_suffix = DEFAULT_MATH_HF_USER_CONTENT_SUFFIX
 
     updates = 0
     rollout_steps = 0
@@ -1178,7 +1274,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
     total_steps_str = str(args.online_steps) if args.online_steps is not None else "inf"
     print(
-        f"[online] rollout_backend={args.online_rollout_backend}, "
+        f"[online] dataset_layout={layout}, "
+        f"user_content_suffix_chars={len(rollout_user_suffix)}, "
+        f"rollout_backend={args.online_rollout_backend}, "
         f"rollout_batch_size={args.rollout_batch_size} "
         f"({args.rollout_n} samples per prompt via n={args.rollout_n}), "
         f"online_pairs_per_step={k} (chunk size within one rollout step), "
@@ -1214,7 +1312,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             prompt_texts = [
                 apply_qwen_chat_template(
                     tokenizer,
-                    s.prompt,
+                    s.prompt + rollout_user_suffix,
                     enable_thinking=args.enable_thinking,
                     system_prompt=sp,
                 )
@@ -1355,8 +1453,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                             sample_obj.prompt,
                             sample_obj.gold_rationale,
                         )
+
+                        if not gt_text and sample_obj.ground_truth:
+                            gt_text = f"Answer: {sample_obj.ground_truth}"
                         if gt_text:
-                            gt_final_answer = extract_final_answer_from_any_line(gt_text)
+                            gt_final_answer = extract_reference_answer_for_verifier(gt_text)
                             gt_has_final = bool(gt_final_answer)
                             gt_is_correct = answer_text_matches(
                                 gt_final_answer if gt_has_final else "",
@@ -1408,6 +1509,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 record = build_online_bootstrap_jsonl_record(
                     sample_id=sample_obj.sample_id,
                     prompt=sample_obj.prompt,
+                    prompt_user_effective=sample_obj.prompt + rollout_user_suffix,
                     system_prompt=system_prompts[idx],
                     ground_truth=sample_obj.ground_truth,
                     candidates=candidates,
@@ -1416,6 +1518,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     prompt_weight=prompt_weight,
                     rho_hat=rho_hat,
                     all_trajectories=trajectories,
+                    include_dense_rollouts=args.online_pairs_include_dense_rollouts,
                 )
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -1438,6 +1541,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             dropped_pref_pairs_by_truncation_in_rollout = 0
             dropped_gt_pref_pairs_by_truncation_in_rollout = 0
             dropped_mle_by_truncation_in_rollout = 0
+            last_optimizer_skip_reason: Optional[str] = None
             if rollout_objectives:
                 for chunk_start in range(0, len(rollout_objectives), k):
                     chunk = rollout_objectives[chunk_start : chunk_start + k]
@@ -1555,6 +1659,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         mle_weights=mle_weights,
                     )
                     if not loss_stats.update_applied:
+                        last_optimizer_skip_reason = loss_stats.skip_reason
                         print(
                             f"[online] rollout_step={rollout_steps}/{total_steps_str} "
                             f"skip optimizer update reason={loss_stats.skip_reason} "
@@ -1594,9 +1699,14 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         print(f"[online] saved checkpoint to {ckpt_dir}")
 
             if rollout_objectives and updates_in_rollout == 0:
+                hint = (
+                    f"last_skip_reason={last_optimizer_skip_reason!r}"
+                    if last_optimizer_skip_reason
+                    else "no_chunk_reached_optimizer"
+                )
                 print(
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
-                    "no optimizer update (all samples filtered by truncation/weight)"
+                    f"no optimizer update applied ({hint}; see per-chunk skip lines or empty batch)"
                 )
             elif rollout_objectives:
                 print(
