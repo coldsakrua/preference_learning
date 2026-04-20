@@ -10,6 +10,10 @@ For each rollout step:
   - Mixed: rarity-weighted correct MLE + hidden-NN preference.
   - All-correct: rarity-weighted correct MLE only.
   - All-wrong: GT-positive preference only.
+
+Optional mode ``--online_mle_on_correct_only true``:
+  - Keep only correct trajectories from every prompt and run MLE.
+  - Do not compute mixed/all-wrong preference losses.
 """
 
 from __future__ import annotations
@@ -65,7 +69,7 @@ class OnlinePendingObjective:
     sample_id: str
     ground_truth: str
     train_prompt: str
-    objective_type: str  # "mixed" | "all_correct" | "all_wrong"
+    objective_type: str  # "mixed" | "all_correct" | "all_wrong" | "correct_only_mle"
     rho_hat: float
     prompt_weight: float
     correct: List["RolloutTrajectory"]
@@ -1256,6 +1260,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"prompt_gamma={args.prompt_weight_gamma}, "
         f"prompt_weight_clip=[{args.prompt_weight_min},{args.prompt_weight_max}], "
         f"pos_weight_mode={args.positive_weight_mode}, "
+        f"online_mle_on_correct_only={args.online_mle_on_correct_only}, "
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
@@ -1362,7 +1367,38 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 wrong_trajs = [trajectories[i] for i in split.wrong_kept_indices]
                 objective: Optional[OnlinePendingObjective] = None
 
-                if n_correct_total > 0 and n_correct_total < n_total:
+                if args.online_mle_on_correct_only:
+                    if correct_trajs:
+                        correct_weights = compute_correct_trajectory_weights(
+                            correct_trajs=correct_trajs,
+                            mode=args.positive_weight_mode,
+                            tau=args.positive_weight_tau,
+                        )
+                        objective_type = "all_correct" if n_correct_total == n_total else "correct_only_mle"
+                        objective = OnlinePendingObjective(
+                            sample_id=sample_obj.sample_id,
+                            ground_truth=sample_obj.ground_truth,
+                            train_prompt=prompt_texts[idx],
+                            objective_type=objective_type,
+                            rho_hat=rho_hat,
+                            prompt_weight=prompt_weight,
+                            correct=correct_trajs,
+                            wrong=[],
+                            correct_traj_weights=correct_weights,
+                            mixed_pref_pairs=[],
+                            gt_positive=None,
+                        )
+                        rollout_objectives.append(objective)
+                        if n_correct_total == n_total:
+                            all_correct_objectives_in_rollout += 1
+                            logged_all_correct_objectives += 1
+                        else:
+                            mixed_objectives_in_rollout += 1
+                            logged_mixed_objectives += 1
+                    else:
+                        skipped_after_filter += 1
+                        skipped_after_filter_in_rollout += 1
+                elif n_correct_total > 0 and n_correct_total < n_total:
                     if correct_trajs and wrong_trajs:
                         correct_weights = compute_correct_trajectory_weights(
                             correct_trajs=correct_trajs,
@@ -1552,7 +1588,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                                     pref_chosen_raw.append(objective.correct[c_idx].response_text)
                                     pref_rejected_raw.append(objective.wrong[w_idx].response_text)
                                     pref_weights_raw.append(pair_weight)
-                        elif objective.objective_type == "all_correct":
+                        elif objective.objective_type in {"all_correct", "correct_only_mle"}:
                             for traj, traj_weight in zip(objective.correct, objective.correct_traj_weights):
                                 mle_train_prompts_raw.append(objective.train_prompt)
                                 mle_completions_raw.append(traj.response_text)
@@ -1734,6 +1770,12 @@ def main() -> None:
     parser = build_cli_parser(DEFAULT_SYSTEM_PROMPT)
     args = parser.parse_args()
     set_seed(args.seed)
+
+    if args.online_mle_on_correct_only and (args.lambda_pref != 0 or args.lambda_gt != 0):
+        print(
+            "[online] online_mle_on_correct_only=true: preference branches are disabled; "
+            "lambda_pref/lambda_gt will not be used."
+        )
 
     if args.max_source_samples == 0:
         args.max_source_samples = None

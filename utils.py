@@ -504,6 +504,15 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--lambda_mle", type=float, default=1.0, help="Weight for L_mle.")
     parser.add_argument("--lambda_pref", type=float, default=0.25, help="Weight for mixed-prompt L_pref.")
     parser.add_argument("--lambda_gt", type=float, default=0.5, help="Weight for all-wrong GT preference loss.")
+    parser.add_argument(
+        "--online_mle_on_correct_only",
+        type=str2bool,
+        default=False,
+        help=(
+            "Online only: use only correct rollout trajectories for MLE updates. "
+            "Disable mixed/all-wrong preference losses."
+        ),
+    )
     parser.add_argument("--prompt_smoothing_alpha", type=float, default=1.0, help="Alpha in rho_hat=(r+alpha)/(n+alpha+beta).")
     parser.add_argument("--prompt_smoothing_beta", type=float, default=1.0, help="Beta in rho_hat=(r+alpha)/(n+alpha+beta).")
     parser.add_argument("--prompt_weight_gamma", type=float, default=1.0, help="Gamma in prompt rarity weighting clip((1-rho_hat)^gamma, w_min, w_max).")
