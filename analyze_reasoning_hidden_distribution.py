@@ -416,10 +416,21 @@ def generate_reasoning_with_vllm(
         llm_kwargs["enforce_eager"] = True
 
     llm = LLM(**llm_kwargs)
+    n = max(int(rollout_n), 1)
+    # vLLM forbids greedy decoding with n > 1. Auto-enable sampling in that case.
+    effective_do_sample = bool(do_sample or n > 1)
+    if n > 1 and not do_sample:
+        print(
+            f"[warn] rollout_n={n} with do_sample=False is incompatible with greedy decoding in vLLM; "
+            "auto-switching to sampling mode."
+        )
+    effective_temperature = float(temperature) if effective_do_sample else 0.0
+    if effective_do_sample and effective_temperature <= 0.0:
+        effective_temperature = 1.0
     sp_kwargs = dict(
-        n=max(int(rollout_n), 1),
-        temperature=temperature if do_sample else 0.0,
-        top_p=top_p if do_sample else 1.0,
+        n=n,
+        temperature=effective_temperature,
+        top_p=top_p if effective_do_sample else 1.0,
         max_tokens=max_new_tokens,
     )
 

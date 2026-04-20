@@ -27,7 +27,7 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/logs/train.parquet}
+dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 inference_backend=${INFERENCE_BACKEND:-vllm}
 
@@ -46,7 +46,7 @@ dtype=${DTYPE:-auto}
 system_prompt=${SYSTEM_PROMPT:-}
 
 inspect_only=${INSPECT_ONLY:-false}
-do_sample=${DO_SAMPLE:-false}
+do_sample=${DO_SAMPLE:-true}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 skip_plot=${SKIP_PLOT:-false}
