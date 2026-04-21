@@ -27,26 +27,27 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/dapo-math-17k.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-instruct}
+dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-512}
-online_steps=${ONLINE_STEPS:-30}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-5}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
+online_steps=${ONLINE_STEPS:-20}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-2e-6}
-max_length=${MAX_LENGTH:-8192}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-0}
+beta=${BETA:-0.3}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-16}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
-rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-8192}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
+max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 
 # PEFT LoRA (anchor env includes peft). Set USE_LORA=false for full fine-tuning.
@@ -93,7 +94,7 @@ python train_dapo_preference.py \
   --top_p "${top_p}" \
   --max_new_tokens "${max_new_tokens}" \
   --learning_rate "${learning_rate}" \
-  --beta 0.1 \
+  --beta "${beta}" \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
   --online_gap_clip_abs 0 \
