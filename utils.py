@@ -513,6 +513,15 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
             "Disable mixed/all-wrong preference losses."
         ),
     )
+    parser.add_argument(
+        "--online_pref_loss_only",
+        type=str2bool,
+        default=False,
+        help=(
+            "Online only: use only mixed-prompt preference loss (L_pref). "
+            "Disable MLE and all-wrong GT preference losses."
+        ),
+    )
     parser.add_argument("--prompt_smoothing_alpha", type=float, default=1.0, help="Alpha in rho_hat=(r+alpha)/(n+alpha+beta).")
     parser.add_argument("--prompt_smoothing_beta", type=float, default=1.0, help="Beta in rho_hat=(r+alpha)/(n+alpha+beta).")
     parser.add_argument("--prompt_weight_gamma", type=float, default=1.0, help="Gamma in prompt rarity weighting clip((1-rho_hat)^gamma, w_min, w_max).")

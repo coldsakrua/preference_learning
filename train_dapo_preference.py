@@ -14,6 +14,10 @@ For each rollout step:
 Optional mode ``--online_mle_on_correct_only true``:
   - Keep only correct trajectories from every prompt and run MLE.
   - Do not compute mixed/all-wrong preference losses.
+
+Optional mode ``--online_pref_loss_only true``:
+  - Keep only mixed prompts with both correct and wrong trajectories.
+  - Run only L_pref (no MLE, no all-wrong GT preference).
 """
 
 from __future__ import annotations
@@ -69,7 +73,7 @@ class OnlinePendingObjective:
     sample_id: str
     ground_truth: str
     train_prompt: str
-    objective_type: str  # "mixed" | "all_correct" | "all_wrong" | "correct_only_mle"
+    objective_type: str  # "mixed" | "all_correct" | "all_wrong" | "correct_only_mle" | "mixed_pref_only"
     rho_hat: float
     prompt_weight: float
     correct: List["RolloutTrajectory"]
@@ -1261,6 +1265,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"prompt_weight_clip=[{args.prompt_weight_min},{args.prompt_weight_max}], "
         f"pos_weight_mode={args.positive_weight_mode}, "
         f"online_mle_on_correct_only={args.online_mle_on_correct_only}, "
+        f"online_pref_loss_only={args.online_pref_loss_only}, "
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
@@ -1367,7 +1372,40 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 wrong_trajs = [trajectories[i] for i in split.wrong_kept_indices]
                 objective: Optional[OnlinePendingObjective] = None
 
-                if args.online_mle_on_correct_only:
+                if args.online_pref_loss_only:
+                    if n_correct_total > 0 and n_correct_total < n_total and correct_trajs and wrong_trajs:
+                        mixed_pairs = build_hidden_nn_pairs(correct_trajs, wrong_trajs)
+                        mixed_pairs = filter_mixed_pref_pairs_by_avg_logprob(
+                            mixed_pairs,
+                            correct_trajs,
+                            wrong_trajs,
+                            args.online_pref_min_avg_logprob_chosen,
+                            args.online_pref_min_avg_logprob_rejected,
+                        )
+                        if mixed_pairs:
+                            objective = OnlinePendingObjective(
+                                sample_id=sample_obj.sample_id,
+                                ground_truth=sample_obj.ground_truth,
+                                train_prompt=prompt_texts[idx],
+                                objective_type="mixed_pref_only",
+                                rho_hat=rho_hat,
+                                prompt_weight=prompt_weight,
+                                correct=correct_trajs,
+                                wrong=wrong_trajs,
+                                correct_traj_weights=[],
+                                mixed_pref_pairs=mixed_pairs,
+                                gt_positive=None,
+                            )
+                            rollout_objectives.append(objective)
+                            mixed_objectives_in_rollout += 1
+                            logged_mixed_objectives += 1
+                        else:
+                            skipped_after_filter += 1
+                            skipped_after_filter_in_rollout += 1
+                    else:
+                        skipped_after_filter += 1
+                        skipped_after_filter_in_rollout += 1
+                elif args.online_mle_on_correct_only:
                     if correct_trajs:
                         correct_weights = compute_correct_trajectory_weights(
                             correct_trajs=correct_trajs,
@@ -1595,6 +1633,14 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                                 mle_weights_raw.append(
                                     float(args.lambda_mle) * float(objective.prompt_weight) * float(traj_weight)
                                 )
+                        elif objective.objective_type == "mixed_pref_only":
+                            if objective.mixed_pref_pairs:
+                                pair_weight = float(args.lambda_pref) / float(len(objective.mixed_pref_pairs))
+                                for c_idx, w_idx in objective.mixed_pref_pairs:
+                                    pref_train_prompts_raw.append(objective.train_prompt)
+                                    pref_chosen_raw.append(objective.correct[c_idx].response_text)
+                                    pref_rejected_raw.append(objective.wrong[w_idx].response_text)
+                                    pref_weights_raw.append(pair_weight)
                         elif objective.objective_type == "all_wrong":
                             if objective.gt_positive is None or not objective.wrong:
                                 continue
@@ -1771,10 +1817,19 @@ def main() -> None:
     args = parser.parse_args()
     set_seed(args.seed)
 
+    if args.online_mle_on_correct_only and args.online_pref_loss_only:
+        raise SystemExit(
+            "error: --online_mle_on_correct_only and --online_pref_loss_only cannot both be true"
+        )
     if args.online_mle_on_correct_only and (args.lambda_pref != 0 or args.lambda_gt != 0):
         print(
             "[online] online_mle_on_correct_only=true: preference branches are disabled; "
             "lambda_pref/lambda_gt will not be used."
+        )
+    if args.online_pref_loss_only and (args.lambda_mle != 0 or args.lambda_gt != 0):
+        print(
+            "[online] online_pref_loss_only=true: MLE/all-wrong GT branches are disabled; "
+            "lambda_mle/lambda_gt will not be used."
         )
 
     if args.max_source_samples == 0:
