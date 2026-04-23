@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Local math eval with vLLM + Qwen3 chat template + \\boxed{} extraction + math_verify grading.
+Local math eval with vLLM + tokenizer chat template + \\boxed{} extraction + math_verify grading.
 
 Data under ``preference_learning/data/`` can be selected by **name** (``--dataset``), no full path needed.
 Use ``--list-datasets`` to print known names. Custom files still use ``--data-path``.
@@ -288,7 +288,7 @@ def resolve_user_lora_dir(raw: Optional[str]) -> Optional[Path]:
     Turn CLI LoRA path into the directory that actually holds adapter_config + weights.
 
     If ``raw`` is a training output parent (e.g. .../train) without weights at the root,
-    use ``final/`` or ``lora_adapter/`` when present (matches train_dapo_preference.py layout).
+    use ``final/`` or ``lora_adapter/`` when present (matches train_preference.py layout).
     """
     if raw is None or not str(raw).strip():
         return None

@@ -497,7 +497,15 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--prompt_candidates_file", type=str, default="", help="TXT/JSON file containing candidate English system prompts.")
     parser.add_argument("--use_default_prompt_candidates", type=str2bool, default=False, help="Append built-in English prompt candidates to the prompt pool.")
     parser.add_argument("--prompt_fixed_index", type=int, default=0, help="Prompt index used when prompt_mode=fixed.")
-    parser.add_argument("--enable_thinking", type=str2bool, default=True, help="Whether to enable Qwen thinking mode when building chat template.")
+    parser.add_argument(
+        "--enable_thinking",
+        type=str2bool,
+        default=True,
+        help=(
+            "Pass enable_thinking to tokenizer chat template when supported. "
+            "Ignored automatically for tokenizers that do not accept this argument."
+        ),
+    )
     parser.add_argument("--learning_rate", type=float, default=2e-6)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--beta", type=float, default=0.2)

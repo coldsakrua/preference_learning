@@ -65,6 +65,18 @@ DEFAULT_PROMPT_CANDIDATES = [
 ]
 
 
+_EMPTY_LORA_HEALTH = {
+    "lora_mean_abs": 0.0,
+    "lora_max_abs": 0.0,
+    "lora_nan_ratio": 0.0,
+    "lora_inf_ratio": 0.0,
+}
+
+
+def _empty_lora_health() -> Dict[str, float]:
+    return dict(_EMPTY_LORA_HEALTH)
+
+
 
 @dataclass
 class OnlinePendingObjective:
@@ -119,12 +131,7 @@ def _compute_lora_param_health(model: object) -> Dict[str, float]:
     """Compute lightweight LoRA parameter health metrics after each update."""
     named_params = getattr(model, "named_parameters", None)
     if not callable(named_params):
-        return {
-            "lora_mean_abs": 0.0,
-            "lora_max_abs": 0.0,
-            "lora_nan_ratio": 0.0,
-            "lora_inf_ratio": 0.0,
-        }
+        return _empty_lora_health()
 
     total_numel = 0
     nan_numel = 0
@@ -148,12 +155,7 @@ def _compute_lora_param_health(model: object) -> Dict[str, float]:
             abs_max = max(abs_max, float(abs_tensor.max().item()))
 
     if total_numel == 0:
-        return {
-            "lora_mean_abs": 0.0,
-            "lora_max_abs": 0.0,
-            "lora_nan_ratio": 0.0,
-            "lora_inf_ratio": 0.0,
-        }
+        return _empty_lora_health()
     return {
         "lora_mean_abs": abs_sum / total_numel,
         "lora_max_abs": abs_max,
@@ -1837,26 +1839,36 @@ def main() -> None:
     if args.online_steps == 0:
         args.online_steps = None
 
-    if args.online_pairs_per_step < 1:
-        raise SystemExit("error: --online-pairs-per-step must be >= 1")
-    if args.rollout_n < 2:
-        raise SystemExit("error: --rollout_n must be >= 2")
-    if args.beta <= 0:
-        raise SystemExit("error: --beta must be > 0")
-    if args.lambda_mle < 0 or args.lambda_pref < 0 or args.lambda_gt < 0:
-        raise SystemExit("error: --lambda_mle/--lambda_pref/--lambda_gt must be >= 0")
-    if args.prompt_smoothing_alpha < 0 or args.prompt_smoothing_beta < 0:
-        raise SystemExit("error: --prompt_smoothing_alpha/--prompt_smoothing_beta must be >= 0")
-    if args.prompt_weight_gamma < 0:
-        raise SystemExit("error: --prompt_weight_gamma must be >= 0")
-    if args.prompt_weight_min < 0 or args.prompt_weight_max <= 0:
-        raise SystemExit("error: --prompt_weight_min must be >=0 and --prompt_weight_max must be >0")
-    if args.prompt_weight_min > args.prompt_weight_max:
-        raise SystemExit("error: --prompt_weight_min must be <= --prompt_weight_max")
-    if args.hidden_layer_offset < 1:
-        raise SystemExit("error: --hidden_layer_offset must be >= 1")
-    if args.rollout_feature_micro_batch_size < 0:
-        raise SystemExit("error: --rollout_feature_micro_batch_size must be >= 0")
+    validations = [
+        (args.online_pairs_per_step < 1, "error: --online-pairs-per-step must be >= 1"),
+        (args.rollout_n < 2, "error: --rollout_n must be >= 2"),
+        (args.beta <= 0, "error: --beta must be > 0"),
+        (
+            args.lambda_mle < 0 or args.lambda_pref < 0 or args.lambda_gt < 0,
+            "error: --lambda_mle/--lambda_pref/--lambda_gt must be >= 0",
+        ),
+        (
+            args.prompt_smoothing_alpha < 0 or args.prompt_smoothing_beta < 0,
+            "error: --prompt_smoothing_alpha/--prompt_smoothing_beta must be >= 0",
+        ),
+        (args.prompt_weight_gamma < 0, "error: --prompt_weight_gamma must be >= 0"),
+        (
+            args.prompt_weight_min < 0 or args.prompt_weight_max <= 0,
+            "error: --prompt_weight_min must be >=0 and --prompt_weight_max must be >0",
+        ),
+        (
+            args.prompt_weight_min > args.prompt_weight_max,
+            "error: --prompt_weight_min must be <= --prompt_weight_max",
+        ),
+        (args.hidden_layer_offset < 1, "error: --hidden_layer_offset must be >= 1"),
+        (
+            args.rollout_feature_micro_batch_size < 0,
+            "error: --rollout_feature_micro_batch_size must be >= 0",
+        ),
+    ]
+    for failed, message in validations:
+        if failed:
+            raise SystemExit(message)
     run_online_preference_training(args)
 
 

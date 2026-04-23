@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/dapo_pref_4b_pref_only_1gpu.%j.out
+#SBATCH -o logs/pref_4b_pref_only_1gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -65,15 +65,15 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/dapo_pref_4b_pref_only_1gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/pref_4b_pref_only_1gpu/${run_name}}
 train_out="${run_root}/train"
 
 mkdir -p "${run_root}" "${train_out}"
 
-echo "[DAPO-PREF-ONLY] run_root=${run_root}"
-echo "[DAPO-PREF-ONLY] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[DAPO-PREF-ONLY] online mode: only mixed preference loss (L_pref)"
-python train_dapo_preference.py \
+echo "[PREF-ONLY] run_root=${run_root}"
+echo "[PREF-ONLY] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
+echo "[PREF-ONLY] online mode: only mixed preference loss (L_pref)"
+python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -112,5 +112,5 @@ python train_dapo_preference.py \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --enable_thinking false
 
-echo "[DAPO-PREF-ONLY] done"
+echo "[PREF-ONLY] done"
 echo "train_output=${train_out}"

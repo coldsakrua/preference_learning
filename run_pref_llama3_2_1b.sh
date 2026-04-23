@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/dapo_pref_4b_1gpu.%j.out
+#SBATCH -o logs/pref_llama3_2_1b_1gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -27,32 +27,30 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/dapo-math-17k.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-instruct}
+dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/llama3.2-1b}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-512}
-online_steps=${ONLINE_STEPS:-30}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-5}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
+online_steps=${ONLINE_STEPS:-20}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-2e-6}
-beta=${BETA:-0.1}
-max_length=${MAX_LENGTH:-8192}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-0}
+beta=${BETA:-0.3}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-16}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
-# vLLM 单轮：需 >= 题干 token + max_new_tokens；默认 8192 省 KV（超长题可 export ROLLOUT_MAX_MODEL_LEN）
-rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-8192}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
+max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 
-# PEFT LoRA (anchor env includes peft). Set USE_LORA=false for full fine-tuning.
 use_lora=${USE_LORA:-true}
 lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
@@ -66,20 +64,20 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/dapo_pref_4b_1gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/pref_llama3_2_1b_1gpu/${run_name}}
 train_out="${run_root}/train"
 
 mkdir -p "${run_root}" "${train_out}"
 
-echo "[DAPO-PREF] run_root=${run_root}"
-echo "[DAPO-PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[DAPO-PREF] online mode: vLLM rollout + HF preference update"
-python train_dapo_preference.py \
+echo "[PREF-LLAMA] run_root=${run_root}"
+echo "[PREF-LLAMA] model_path=${model_path}"
+echo "[PREF-LLAMA] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
+echo "[PREF-LLAMA] online mode: vLLM rollout + HF preference update"
+python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
   --output_dir "${train_out}" \
-  --require_gold_rationale_for_all_wrong true \
   --online_rollout_backend vllm \
   --tensor_parallel_size "${tensor_parallel_size}" \
   --vllm_dtype "${vllm_dtype}" \
@@ -106,7 +104,10 @@ python train_dapo_preference.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --enable_thinking false
+  --enable_thinking false \
+  --use_all_wrong_gt_preference false \
+  --online_pref_min_avg_logprob_chosen -3 \
+  --online_pref_min_avg_logprob_rejected -3
 
-echo "[DAPO-PREF] done"
+echo "[PREF-LLAMA] done"
 echo "train_output=${train_out}"
