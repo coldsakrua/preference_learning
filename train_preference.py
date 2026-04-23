@@ -1,25 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
-"""
-Online (on-policy) self-bootstrapping training for DAPO math data.
-
-For each rollout step:
-  - Sample N responses per prompt with current policy.
-  - Split prompt into mixed / all-correct / all-wrong by verifier.
-  - Mixed: rarity-weighted correct MLE + hidden-NN preference.
-  - All-correct: rarity-weighted correct MLE only.
-  - All-wrong: GT-positive preference only.
-
-Optional mode ``--online_mle_on_correct_only true``:
-  - Keep only correct trajectories from every prompt and run MLE.
-  - Do not compute mixed/all-wrong preference losses.
-
-Optional mode ``--online_pref_loss_only true``:
-  - Keep only mixed prompts with both correct and wrong trajectories.
-  - Run only L_pref (no MLE, no all-wrong GT preference).
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -71,6 +51,8 @@ _EMPTY_LORA_HEALTH = {
     "lora_nan_ratio": 0.0,
     "lora_inf_ratio": 0.0,
 }
+
+_WARNED_MISSING_CHAT_TEMPLATE = False
 
 
 def _empty_lora_health() -> Dict[str, float]:
@@ -248,6 +230,7 @@ def apply_qwen_chat_template(
     enable_thinking: bool,
     system_prompt: str = "",
 ) -> str:
+    global _WARNED_MISSING_CHAT_TEMPLATE
     messages = []
     if system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt.strip()})
@@ -262,6 +245,16 @@ def apply_qwen_chat_template(
     except TypeError:
         kwargs.pop("enable_thinking", None)
         return tokenizer.apply_chat_template(messages, **kwargs)
+    except ValueError as e:
+        if "tokenizer.chat_template is not set" not in str(e):
+            raise
+        if not _WARNED_MISSING_CHAT_TEMPLATE:
+            print(
+                "[warn] tokenizer.chat_template is missing; fallback to plain text prompts "
+                "for online rollout/training."
+            )
+            _WARNED_MISSING_CHAT_TEMPLATE = True
+        return "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
 
 
 def split_rollout_candidates_for_training(

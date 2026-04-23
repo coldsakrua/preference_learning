@@ -25,7 +25,7 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/llama3.2-1b}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/llama-3.2-1b}
 
 NO_THINKING=${NO_THINKING:-1}
 datasets_csv=${DATASETS:-math500,aime24,aime25,aime26}
@@ -43,7 +43,7 @@ seed=${SEED:-42}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 max_model_len=${MAX_MODEL_LEN:-0}
-generate_batch_size=${GENERATE_BATCH_SIZE:-16}
+generate_batch_size=${GENERATE_BATCH_SIZE:-4}
 force_base_tokenizer=${FORCE_BASE_TOKENIZER:-1}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
@@ -70,7 +70,7 @@ echo "[EVAL-LLAMA] FORCE_BASE_TOKENIZER=${force_base_tokenizer} (1=base tokenize
 echo "[EVAL-LLAMA] output_json=${output_json}"
 
 cmd=(
-  python eval_math_vllm_local.py
+  python eval_math_vllm_local_llama.py
   --model-path "${model_path}"
   --data-format "${data_format}"
   --output-json "${output_json}"
