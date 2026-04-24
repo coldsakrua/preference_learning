@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -309,6 +310,18 @@ def main() -> None:
     _ensure_trl_version()
     set_seed(args.seed)
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and args.use_lora and args.gradient_checkpointing:
+        print(
+            "[grpo] detected DDP(world_size>1) + LoRA + gradient_checkpointing. "
+            "To avoid DDP 'mark ready twice' checkpoint conflicts, forcing gradient_checkpointing=false."
+        )
+        args.gradient_checkpointing = False
+    print(
+        f"[grpo] runtime flags: world_size={world_size}, use_lora={bool(args.use_lora)}, "
+        f"gradient_checkpointing={bool(args.gradient_checkpointing)}"
+    )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_jsonl_path = output_dir / "training_metrics.jsonl"
@@ -340,6 +353,7 @@ def main() -> None:
         report_to=report_to,
         run_name=args.run_name,
         seed=args.seed,
+        ddp_find_unused_parameters=False,
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 

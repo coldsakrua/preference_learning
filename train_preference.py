@@ -87,6 +87,7 @@ class RolloutTrajectory:
     final_answer: str
     avg_logprob: float
     avg_nll: float
+    avg_entropy: float
     hidden_vec: List[float]
 
 
@@ -367,6 +368,12 @@ def filter_mixed_pref_pairs_by_avg_logprob(
     return out
 
 
+def _mean_or_nan(values: Sequence[float]) -> float:
+    if not values:
+        return float("nan")
+    return float(sum(float(v) for v in values) / len(values))
+
+
 def rollout_trajectory_to_json(traj: RolloutTrajectory, *, include_dense: bool) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "response_text": traj.response_text,
@@ -376,6 +383,7 @@ def rollout_trajectory_to_json(traj: RolloutTrajectory, *, include_dense: bool) 
         "final_answer": traj.final_answer,
         "avg_logprob": float(traj.avg_logprob),
         "avg_nll": float(traj.avg_nll),
+        "avg_entropy": float(traj.avg_entropy),
     }
     if include_dense:
         out["token_ids"] = [int(t) for t in traj.token_ids]
@@ -498,6 +506,21 @@ def _seq_logps_from_logits_labels(
     return seq_logps
 
 
+def _seq_entropy_from_logits_labels(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    shifted_logits = logits[:, :-1, :]
+    shifted_labels = labels[:, 1:]
+    valid_mask = shifted_labels.ne(-100).to(shifted_logits.dtype)
+    token_log_probs = F.log_softmax(shifted_logits, dim=-1)
+    token_probs = token_log_probs.exp()
+    token_entropy = -(token_probs * token_log_probs).sum(dim=-1)
+    seq_entropy = (token_entropy * valid_mask).sum(dim=-1)
+    seq_entropy = seq_entropy / valid_mask.sum(dim=-1).clamp_min(1.0)
+    return seq_entropy
+
+
 def _compute_sequence_logps_batch(
     model: object,
     tokenizer: object,
@@ -521,7 +544,7 @@ def _compute_sequence_logps_and_hidden_batch(
     max_length: int,
     device: torch.device,
     hidden_layer_offset: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_ids, attention_mask, labels = _labeled_batch_tensors(
         tokenizer, prompt_texts, completion_texts, max_length, device
     )
@@ -532,6 +555,7 @@ def _compute_sequence_logps_and_hidden_batch(
         use_cache=False,
     )
     seq_logps = _seq_logps_from_logits_labels(outputs.logits, labels)
+    seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
     hidden_states = outputs.hidden_states
     if hidden_states is None or len(hidden_states) == 0:
         raise RuntimeError("Model did not return hidden_states; cannot run hidden-state pair mining.")
@@ -542,7 +566,7 @@ def _compute_sequence_logps_and_hidden_batch(
     denom = completion_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     pooled = (layer_hidden * completion_mask.unsqueeze(-1)).sum(dim=1) / denom
     hidden_vec = F.normalize(pooled, p=2, dim=-1, eps=1e-12)
-    return seq_logps, hidden_vec
+    return seq_logps, seq_entropy, hidden_vec
 
 
 def build_rollout_trajectories_for_prompt(
@@ -565,6 +589,7 @@ def build_rollout_trajectories_for_prompt(
     )["input_ids"]
     prompt_texts = [train_prompt for _ in candidates]
     avg_logprobs: List[float] = []
+    avg_entropies: List[float] = []
     hidden_vecs: List[List[float]] = []
     mb = args.rollout_feature_micro_batch_size if args.rollout_feature_micro_batch_size > 0 else len(candidates)
 
@@ -575,7 +600,7 @@ def build_rollout_trajectories_for_prompt(
             end = min(start + mb, len(candidates))
             batch_prompts = prompt_texts[start:end]
             batch_completions = list(candidates[start:end])
-            seq_logps, batch_hidden = _compute_sequence_logps_and_hidden_batch(
+            seq_logps, seq_entropy, batch_hidden = _compute_sequence_logps_and_hidden_batch(
                 model=model,
                 tokenizer=tokenizer,
                 prompt_texts=batch_prompts,
@@ -585,6 +610,7 @@ def build_rollout_trajectories_for_prompt(
                 hidden_layer_offset=args.hidden_layer_offset,
             )
             avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
+            avg_entropies.extend([float(v) for v in seq_entropy.detach().cpu().tolist()])
             hidden_vecs.extend([[float(x) for x in row] for row in batch_hidden.detach().cpu().tolist()])
     if was_training:
         model.train()
@@ -602,6 +628,7 @@ def build_rollout_trajectories_for_prompt(
                 final_answer=str(split.responses_final_answers[idx]),
                 avg_logprob=avg_logprob,
                 avg_nll=-avg_logprob,
+                avg_entropy=float(avg_entropies[idx]),
                 hidden_vec=list(hidden_vecs[idx]),
             )
         )
@@ -1350,6 +1377,10 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             skipped_after_filter_in_rollout = 0
             sampled_correct_total_in_rollout = 0
             sampled_candidates_total_in_rollout = 0
+            rollout_all_entropy_values: List[float] = []
+            rollout_correct_entropy_values: List[float] = []
+            rollout_wrong_entropy_values: List[float] = []
+            rollout_gt_entropy_values: List[float] = []
             for idx, sample_obj in enumerate(buffer):
                 start = idx * args.rollout_n
                 end = start + args.rollout_n
@@ -1390,8 +1421,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     split=split,
                     args=args,
                 )
+                rollout_all_entropy_values.extend([float(t.avg_entropy) for t in trajectories])
                 correct_trajs = [trajectories[i] for i in split.correct_kept_indices]
                 wrong_trajs = [trajectories[i] for i in split.wrong_kept_indices]
+                rollout_correct_entropy_values.extend([float(t.avg_entropy) for t in correct_trajs])
+                rollout_wrong_entropy_values.extend([float(t.avg_entropy) for t in wrong_trajs])
                 objective: Optional[OnlinePendingObjective] = None
 
                 if args.online_pref_loss_only:
@@ -1562,6 +1596,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                                 gt_positive = gt_trajectories[0]
 
                     if gt_positive is not None and wrong_trajs:
+                        rollout_all_entropy_values.append(float(gt_positive.avg_entropy))
+                        rollout_gt_entropy_values.append(float(gt_positive.avg_entropy))
                         objective = OnlinePendingObjective(
                             sample_id=sample_obj.sample_id,
                             ground_truth=sample_obj.ground_truth,
@@ -1609,6 +1645,24 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 f"skipped_after_filter_in_rollout={skipped_after_filter_in_rollout} "
                 f"objectives_ready_for_update={len(rollout_objectives)}"
             )
+            ent_overall = _mean_or_nan(rollout_all_entropy_values)
+            ent_correct = _mean_or_nan(rollout_correct_entropy_values)
+            ent_wrong = _mean_or_nan(rollout_wrong_entropy_values)
+            ent_gt = _mean_or_nan(rollout_gt_entropy_values)
+            ent_gap_wrong_minus_correct = (
+                float(ent_wrong - ent_correct)
+                if not math.isnan(ent_wrong) and not math.isnan(ent_correct)
+                else float("nan")
+            )
+            print(
+                f"[online] rollout_step={rollout_steps}/{total_steps_str} "
+                f"entropy_overall_mean={ent_overall:.4f} "
+                f"entropy_overall_count={len(rollout_all_entropy_values)} "
+                f"entropy_correct_mean={ent_correct:.4f} "
+                f"entropy_wrong_mean={ent_wrong:.4f} "
+                f"entropy_gt_ref_mean={ent_gt:.4f} "
+                f"entropy_gap_wrong_minus_correct={ent_gap_wrong_minus_correct:.4f}"
+            )
             sampled_correct_rate = (
                 float(sampled_correct_total_in_rollout) / float(sampled_candidates_total_in_rollout)
                 if sampled_candidates_total_in_rollout > 0
@@ -1628,6 +1682,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     "sampled_correct_total": int(sampled_correct_total_in_rollout),
                     "sampled_candidates_total": int(sampled_candidates_total_in_rollout),
                     "sampled_correct_rate": float(sampled_correct_rate),
+                    "entropy_overall_mean": float(ent_overall),
+                    "entropy_overall_count": int(len(rollout_all_entropy_values)),
+                    "entropy_correct_mean": float(ent_correct),
+                    "entropy_wrong_mean": float(ent_wrong),
+                    "entropy_gt_ref_mean": float(ent_gt),
+                    "entropy_gap_wrong_minus_correct": float(ent_gap_wrong_minus_correct),
                 },
             )
 
