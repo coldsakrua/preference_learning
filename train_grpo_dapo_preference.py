@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from datasets import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
+from transformers import TrainerCallback
 from utils import (
     DEFAULT_GOLD_RATIONALE_KEY_PATHS,
     DEFAULT_MATH_HF_USER_CONTENT_SUFFIX,
@@ -28,6 +30,48 @@ DEFAULT_SYSTEM_PROMPT = (
     "Solve the problem step by step, then end with exactly one final line in the format: "
     "Answer: $<final_answer>."
 )
+
+
+class JsonlMetricsCallback(TrainerCallback):
+    """Persist every trainer log event to a standalone JSONL file."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep a compact, consistent subset of key RL metrics for easy plotting.
+        self._tracked_keywords = (
+            "reward",
+            "entropy",
+            "kl",
+            "loss",
+            "adv",
+            "return",
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+        if not logs:
+            return
+        record: Dict[str, Any] = {
+            "event": "trainer_log",
+            "step": int(state.global_step),
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+        }
+        for k, v in logs.items():
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                record[k] = v
+            else:
+                record[k] = str(v)
+        tracked_metrics: Dict[str, float] = {}
+        for k, v in logs.items():
+            if not isinstance(v, (int, float)):
+                continue
+            key_lower = str(k).lower()
+            if any(token in key_lower for token in self._tracked_keywords):
+                tracked_metrics[str(k)] = float(v)
+        if tracked_metrics:
+            record["tracked_metrics"] = tracked_metrics
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +120,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--lora_target_modules",
         type=str,
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    )
+    parser.add_argument(
+        "--lora_path",
+        "--lora-path",
+        dest="lora_path",
+        type=str,
+        default="",
+        help="Existing LoRA adapter path to continue GRPO fine-tuning from.",
     )
     parser.add_argument("--resume_from_checkpoint", type=str, default="")
     return parser
@@ -204,6 +256,53 @@ def _build_peft_config(args: argparse.Namespace) -> Optional[Any]:
     )
 
 
+def _ensure_input_require_grads_for_checkpointing(model: Any) -> None:
+    """Make sure checkpointed LoRA training has grad-carrying inputs."""
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+        return
+    if not hasattr(model, "get_input_embeddings"):
+        return
+    embeddings = model.get_input_embeddings()
+    if embeddings is None:
+        return
+    if getattr(model, "_grpo_input_require_grads_hook", None) is not None:
+        return
+
+    def _make_inputs_require_grad(_module: Any, _inputs: Any, output: Any) -> Any:
+        if isinstance(output, tuple):
+            if output and hasattr(output[0], "requires_grad_"):
+                output[0].requires_grad_(True)
+            return output
+        if hasattr(output, "requires_grad_"):
+            output.requires_grad_(True)
+        return output
+
+    hook = embeddings.register_forward_hook(_make_inputs_require_grad)
+    setattr(model, "_grpo_input_require_grads_hook", hook)
+
+
+def _adapter_dir_has_weights(d: Path) -> bool:
+    return (d / "adapter_model.safetensors").is_file() or (d / "adapter_model.bin").is_file()
+
+
+def _resolve_lora_adapter_dir(user_path: str) -> Optional[Path]:
+    raw = user_path.strip()
+    if not raw:
+        return None
+    root = Path(raw).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"LoRA path not found: {root}")
+    if _adapter_dir_has_weights(root):
+        return root
+    for cand in (root / "final", root / "lora_adapter"):
+        if _adapter_dir_has_weights(cand):
+            return cand
+    raise FileNotFoundError(
+        f"No adapter weights found under {root} (or its final/ / lora_adapter/ subdirs)."
+    )
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -212,6 +311,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_jsonl_path = output_dir / "training_metrics.jsonl"
     train_dataset = build_grpo_dataset(args)
     reward_funcs = build_reward_funcs()
 
@@ -240,28 +340,80 @@ def main() -> None:
         report_to=report_to,
         run_name=args.run_name,
         seed=args.seed,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
+    lora_dir = _resolve_lora_adapter_dir(args.lora_path) if args.use_lora else None
+    if not args.use_lora and args.lora_path.strip():
+        print("[grpo] use_lora=false: ignore --lora_path and train base model directly.")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    model_for_trainer: Any = args.model_path
+    peft_config = _build_peft_config(args)
+    if args.use_lora and lora_dir is not None:
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise RuntimeError("--lora_path requires peft to be installed.") from exc
+        base_model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True)
+        model_for_trainer = PeftModel.from_pretrained(base_model, str(lora_dir), is_trainable=True)
+        peft_config = None
+        print(f"[grpo] loaded existing LoRA adapter: {lora_dir}")
+    if args.use_lora and args.gradient_checkpointing:
+        _ensure_input_require_grads_for_checkpointing(model_for_trainer)
+
     trainer = GRPOTrainer(
-        model=args.model_path,
+        model=model_for_trainer,
         reward_funcs=reward_funcs,
         args=grpo_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        peft_config=_build_peft_config(args),
+        peft_config=peft_config,
     )
+    trainer.add_callback(JsonlMetricsCallback(metrics_jsonl_path))
+    with metrics_jsonl_path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "event": "run_start",
+                    "model_path": args.model_path,
+                    "dataset_path": args.dataset_path,
+                    "output_dir": str(output_dir),
+                    "metrics_jsonl": str(metrics_jsonl_path),
+                    "use_lora": bool(args.use_lora),
+                    "lora_path": str(args.lora_path),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
     resume_ckpt = args.resume_from_checkpoint.strip() or None
     trainer.train(resume_from_checkpoint=resume_ckpt)
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(final_dir))
+    if args.use_lora:
+        model_to_save = trainer.accelerator.unwrap_model(trainer.model)
+        model_to_save.save_pretrained(str(final_dir))
+    else:
+        trainer.save_model(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
+    with metrics_jsonl_path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "event": "run_end",
+                    "final_model": str(final_dir),
+                    "metrics_jsonl": str(metrics_jsonl_path),
+                    "global_step": int(getattr(trainer.state, "global_step", 0)),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
     print(f"[grpo] finished. final_model={final_dir}")
 
 

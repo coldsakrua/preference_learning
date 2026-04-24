@@ -70,7 +70,7 @@ echo "[EVAL-LLAMA] FORCE_BASE_TOKENIZER=${force_base_tokenizer} (1=base tokenize
 echo "[EVAL-LLAMA] output_json=${output_json}"
 
 cmd=(
-  python eval_math_vllm_local_llama.py
+  python eval_math_vllm_local_llama3_2_1b.py
   --model-path "${model_path}"
   --data-format "${data_format}"
   --output-json "${output_json}"

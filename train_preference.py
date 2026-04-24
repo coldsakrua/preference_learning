@@ -1148,6 +1148,12 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     online_pairs_path = output_root / "online_pairs.jsonl"
+    metrics_jsonl_path = output_root / "training_metrics.jsonl"
+
+    def _write_metric(event: str, payload: Dict[str, Any]) -> None:
+        rec = {"event": event, **payload}
+        with metrics_jsonl_path.open("a", encoding="utf-8") as mf:
+            mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     model_path = args.model_path.strip()
     if not model_path:
@@ -1266,6 +1272,23 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
         f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}"
     )
+    _write_metric(
+        "run_start",
+        {
+            "output_dir": str(output_root),
+            "model_path": str(args.model_path),
+            "dataset_path": str(args.dataset_path),
+            "online_steps": args.online_steps,
+            "online_pairs_per_step": args.online_pairs_per_step,
+            "rollout_n": args.rollout_n,
+            "learning_rate": args.learning_rate,
+            "beta": args.beta,
+            "lambda_mle": args.lambda_mle,
+            "lambda_pref": args.lambda_pref,
+            "lambda_gt": args.lambda_gt,
+            "metrics_jsonl": str(metrics_jsonl_path),
+        },
+    )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
 
@@ -1325,6 +1348,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             all_wrong_objectives_in_rollout = 0
             skipped_all_wrong_in_rollout = 0
             skipped_after_filter_in_rollout = 0
+            sampled_correct_total_in_rollout = 0
+            sampled_candidates_total_in_rollout = 0
             for idx, sample_obj in enumerate(buffer):
                 start = idx * args.rollout_n
                 end = start + args.rollout_n
@@ -1341,6 +1366,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 )
                 n_total = len(candidates)
                 n_correct_total = sum(1 for x in split.responses_correct if x)
+                sampled_correct_total_in_rollout += int(n_correct_total)
+                sampled_candidates_total_in_rollout += int(n_total)
                 rho_hat = compute_smoothed_correct_rate(
                     r_cnt=n_correct_total,
                     total=n_total,
@@ -1582,6 +1609,27 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                 f"skipped_after_filter_in_rollout={skipped_after_filter_in_rollout} "
                 f"objectives_ready_for_update={len(rollout_objectives)}"
             )
+            sampled_correct_rate = (
+                float(sampled_correct_total_in_rollout) / float(sampled_candidates_total_in_rollout)
+                if sampled_candidates_total_in_rollout > 0
+                else 0.0
+            )
+            _write_metric(
+                "rollout_summary",
+                {
+                    "rollout_step": int(rollout_steps),
+                    "scanned": int(scanned),
+                    "mixed_in_rollout": int(mixed_objectives_in_rollout),
+                    "all_correct_in_rollout": int(all_correct_objectives_in_rollout),
+                    "all_wrong_in_rollout": int(all_wrong_objectives_in_rollout),
+                    "skipped_all_wrong_in_rollout": int(skipped_all_wrong_in_rollout),
+                    "skipped_after_filter_in_rollout": int(skipped_after_filter_in_rollout),
+                    "objectives_ready_for_update": int(len(rollout_objectives)),
+                    "sampled_correct_total": int(sampled_correct_total_in_rollout),
+                    "sampled_candidates_total": int(sampled_candidates_total_in_rollout),
+                    "sampled_correct_rate": float(sampled_correct_rate),
+                },
+            )
 
             updates_in_rollout = 0
             consumed_pref_pairs_in_rollout = 0
@@ -1734,6 +1782,15 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                             f"skip optimizer update reason={loss_stats.skip_reason} "
                             f"grad_norm={loss_stats.grad_norm:.4f}"
                         )
+                        _write_metric(
+                            "optimizer_step_skipped",
+                            {
+                                "rollout_step": int(rollout_steps),
+                                "optimizer_step": int(updates),
+                                "skip_reason": str(loss_stats.skip_reason),
+                                "grad_norm": float(loss_stats.grad_norm),
+                            },
+                        )
                         continue
                     updates += 1
                     updates_in_rollout += 1
@@ -1753,6 +1810,26 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         f"total_loss={loss_stats.total_loss:.6f} "
                         f"grad_norm={loss_stats.grad_norm:.6f}",
                         flush=True,
+                    )
+                    _write_metric(
+                        "optimizer_step",
+                        {
+                            "rollout_step": int(rollout_steps),
+                            "optimizer_step": int(updates),
+                            "pref_loss": float(loss_stats.pref_loss),
+                            "mean_gap": float(loss_stats.mean_gap),
+                            "gt_pref_loss": float(loss_stats.gt_pref_loss),
+                            "mle_loss": float(loss_stats.mle_loss),
+                            "total_loss": float(loss_stats.total_loss),
+                            "grad_norm": float(loss_stats.grad_norm),
+                            "pref_pairs_used": int(loss_stats.pref_pairs_used),
+                            "gt_pref_pairs_used": int(loss_stats.gt_pref_pairs_used),
+                            "mle_samples_used": int(loss_stats.mle_samples_used),
+                            "lora_mean_abs": float(loss_stats.lora_mean_abs),
+                            "lora_max_abs": float(loss_stats.lora_max_abs),
+                            "lora_nan_ratio": float(loss_stats.lora_nan_ratio),
+                            "lora_inf_ratio": float(loss_stats.lora_inf_ratio),
+                        },
                     )
 
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
@@ -1804,6 +1881,25 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"logged_all_wrong_objectives={logged_all_wrong_objectives}, "
         f"skipped_all_wrong={skipped_all_wrong}, skipped_after_filter={skipped_after_filter}, "
         f"objectives_log={online_pairs_path}, final_model={final_dir}"
+    )
+    _write_metric(
+        "run_end",
+        {
+            "rollout_steps": int(rollout_steps),
+            "optimizer_steps": int(updates),
+            "scanned": int(scanned),
+            "kept_pref_pairs": int(kept_pref_pairs),
+            "kept_gt_pref_pairs": int(kept_gt_pref_pairs),
+            "kept_mle_samples": int(kept_mle_samples),
+            "logged_mixed_objectives": int(logged_mixed_objectives),
+            "logged_all_correct_objectives": int(logged_all_correct_objectives),
+            "logged_all_wrong_objectives": int(logged_all_wrong_objectives),
+            "skipped_all_wrong": int(skipped_all_wrong),
+            "skipped_after_filter": int(skipped_after_filter),
+            "objectives_log": str(online_pairs_path),
+            "final_model": str(final_dir),
+            "metrics_jsonl": str(metrics_jsonl_path),
+        },
     )
 
 

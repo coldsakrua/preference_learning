@@ -308,6 +308,24 @@ def run_hf_fallback_eval(argv: List[str]) -> None:
     out_path.write_text(json.dumps(summary, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     print(f"[eval-hf] wrote final json -> {out_path}", flush=True)
 
+    print("\n" + "=" * 60, flush=True)
+    print("[ALL] combined", flush=True)
+    for k in pass_at_k_list:
+        s = pass_at_k_summary[str(k)]
+        print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{n})", flush=True)
+    for tag, m in metrics_by_dataset.items():
+        print(f"[{tag}] n={m['num_problems']}", flush=True)
+        for k in pass_at_k_list:
+            s = m["pass_at_k"][str(k)]
+            print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})", flush=True)
+        print(f"  Avg pass@1 over n={gen_n}: {m['average_pass1_over_gen_n_pct']:.2f}%", flush=True)
+    print(f"Avg pass@1 over n={gen_n}: {summary['average_pass1_over_gen_n_pct']:.2f}%", flush=True)
+    print(f"Avg correct / sample: {summary['average_correct_pct']:.2f}%", flush=True)
+    print(f"Majority vote: {summary['majority_vote_pct']:.2f}%", flush=True)
+    print(f"Boxed format rate: {summary['format_rate_pct']:.2f}%", flush=True)
+    print(f"Wrote {out_path}", flush=True)
+    print("=" * 60, flush=True)
+
 
 if __name__ == "__main__":
     main()
