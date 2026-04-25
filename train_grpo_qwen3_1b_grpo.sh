@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=72:00:00
-#SBATCH --exclude=gpua800n13
+#SBATCH --exclude=gpua800n01,gpua800n11
 
 set -eo pipefail
 nvidia-smi
@@ -28,10 +28,10 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 
 seed=${SEED:-42}
 learning_rate=${LEARNING_RATE:-1e-6}
-train_steps=${TRAIN_STEPS:-400}
-global_prompts_per_step=${GLOBAL_PROMPTS_PER_STEP:-8}
-rollouts_per_prompt=${ROLLOUTS_PER_PROMPT:-8}
-per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
+train_steps=${TRAIN_STEPS:-200}
+global_prompts_per_step=${GLOBAL_PROMPTS_PER_STEP:-4}
+rollouts_per_prompt=${ROLLOUTS_PER_PROMPT:-4}
+per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 max_completion_length=${MAX_COMPLETION_LENGTH:-4096}
 temperature=${TEMPERATURE:-0.6}
@@ -53,7 +53,7 @@ lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 lora_target_modules=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
-lora_path=${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/dapo_pref_4b_1gpu/20260419_123231_job1382590/train/final}
+lora_path=${LORA_PATH-}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -83,6 +83,14 @@ if (( global_prompts_per_step % denom != 0 )); then
   echo "[GRPO] GLOBAL_PROMPTS_PER_STEP(${global_prompts_per_step}) must be divisible by PER_DEVICE_TRAIN_BATCH_SIZE(${per_device_train_batch_size}) * WORLD_SIZE(${world_size})"
   exit 1
 fi
+if (( rollouts_per_prompt <= 0 )); then
+  echo "[GRPO] ROLLOUTS_PER_PROMPT must be > 0, got ${rollouts_per_prompt}"
+  exit 1
+fi
+if (( global_prompts_per_step % rollouts_per_prompt != 0 )); then
+  echo "[GRPO] GLOBAL_PROMPTS_PER_STEP(${global_prompts_per_step}) must be divisible by ROLLOUTS_PER_PROMPT(${rollouts_per_prompt})"
+  exit 1
+fi
 gradient_accumulation_steps=$(( global_prompts_per_step / denom ))
 if (( gradient_accumulation_steps <= 0 )); then
   echo "[GRPO] computed GRADIENT_ACCUMULATION_STEPS=${gradient_accumulation_steps} is invalid"
@@ -94,10 +102,16 @@ echo "[GRPO] model_path=${model_path}"
 echo "[GRPO] dataset_path=${dataset_path}"
 echo "[GRPO] train_steps=${train_steps}, global_prompts_per_step=${global_prompts_per_step}, rollouts_per_prompt=${rollouts_per_prompt}"
 echo "[GRPO] world_size=${world_size}, per_device_train_batch_size=${per_device_train_batch_size}, gradient_accumulation_steps=${gradient_accumulation_steps}"
+echo "[GRPO] generation_batch_size=${global_prompts_per_step} (must be divisible by rollouts_per_prompt)"
 echo "[GRPO] use_lora=${use_lora} (bool=${use_lora_bool})"
+if [[ -n "${lora_path}" ]]; then
+  echo "[GRPO] lora_path=${lora_path} (will load adapter if use_lora=1)"
+else
+  echo "[GRPO] lora_path is empty: will not load a pretrained LoRA (use_lora=1 -> train LoRA from scratch on base; use_lora=0 -> full model)"
+fi
 echo "[GRPO] note: current TRL GRPO setup uses integrated generation+KL in each rank; cannot pin one GPU only for rollout and the other only for KL."
 
-torchrun --nproc_per_node="${world_size}" train_grpo_dapo_preference.py \
+torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" train_grpo_dapo_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --dataset_layout auto \
@@ -115,7 +129,7 @@ torchrun --nproc_per_node="${world_size}" train_grpo_dapo_preference.py \
   --beta "${beta}" \
   --logging_steps "${logging_steps}" \
   --save_steps "${save_steps}" \
-  --save_total_limit 3 \
+  --save_total_limit 100 \
   --gradient_checkpointing true \
   --bf16 true \
   --fp16 false \

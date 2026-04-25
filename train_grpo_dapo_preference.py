@@ -105,6 +105,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--beta", type=float, default=0.04)
+    parser.add_argument("--redundancy_penalty_enabled", type=str2bool, default=True)
+    parser.add_argument("--redundancy_target_len", type=int, default=768)
+    parser.add_argument(
+        "--redundancy_len_penalty",
+        type=float,
+        default=0.0001,
+        help="Linear penalty factor for tokens beyond redundancy_target_len.",
+    )
+    parser.add_argument("--redundancy_ngram", type=int, default=3)
+    parser.add_argument(
+        "--redundancy_rep_penalty",
+        type=float,
+        default=0.2,
+        help="Penalty multiplier for repeated n-gram ratio.",
+    )
+    parser.add_argument(
+        "--redundancy_penalty_cap",
+        type=float,
+        default=0.25,
+        help="Upper bound of total redundancy penalty per completion.",
+    )
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--save_steps", type=int, default=50)
     parser.add_argument("--save_total_limit", type=int, default=3)
@@ -216,7 +237,7 @@ def _completion_to_text(completion: Any) -> str:
     return str(completion)
 
 
-def build_reward_funcs() -> List[Any]:
+def build_reward_funcs(args: argparse.Namespace, tokenizer: Any) -> List[Any]:
     def answer_accuracy_reward(completions: List[Any], ground_truth: List[str], **_: Any) -> List[float]:
         rewards: List[float] = []
         for completion, target in zip(completions, ground_truth):
@@ -233,7 +254,42 @@ def build_reward_funcs() -> List[Any]:
             rewards.append(0.1 if has_final else -0.1)
         return rewards
 
-    return [answer_accuracy_reward, answer_format_reward]
+    def _repeated_ngram_ratio(tokens: List[int], n: int) -> float:
+        if n <= 0 or len(tokens) < n:
+            return 0.0
+        total = len(tokens) - n + 1
+        seen = set()
+        repeated = 0
+        for i in range(total):
+            gram = tuple(tokens[i : i + n])
+            if gram in seen:
+                repeated += 1
+            else:
+                seen.add(gram)
+        return float(repeated) / float(total) if total > 0 else 0.0
+
+    def redundancy_penalty_reward(completions: List[Any], **_: Any) -> List[float]:
+        rewards: List[float] = []
+        target_len = max(1, int(args.redundancy_target_len))
+        ngram_n = max(1, int(args.redundancy_ngram))
+        len_coef = max(0.0, float(args.redundancy_len_penalty))
+        rep_coef = max(0.0, float(args.redundancy_rep_penalty))
+        cap = max(0.0, float(args.redundancy_penalty_cap))
+        for completion in completions:
+            text = _completion_to_text(completion)
+            token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            length_over = max(0, len(token_ids) - target_len)
+            len_penalty = len_coef * float(length_over)
+            rep_ratio = _repeated_ngram_ratio(token_ids, ngram_n)
+            rep_penalty = rep_coef * rep_ratio
+            penalty = min(cap, len_penalty + rep_penalty)
+            rewards.append(-penalty)
+        return rewards
+
+    reward_funcs: List[Any] = [answer_accuracy_reward, answer_format_reward]
+    if args.redundancy_penalty_enabled:
+        reward_funcs.append(redundancy_penalty_reward)
+    return reward_funcs
 
 
 def _build_peft_config(args: argparse.Namespace) -> Optional[Any]:
@@ -326,7 +382,6 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_jsonl_path = output_dir / "training_metrics.jsonl"
     train_dataset = build_grpo_dataset(args)
-    reward_funcs = build_reward_funcs()
 
     report_to = [] if args.report_to.lower() == "none" else [args.report_to]
     grpo_args = GRPOConfig(
@@ -363,6 +418,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    reward_funcs = build_reward_funcs(args, tokenizer)
 
     model_for_trainer: Any = args.model_path
     peft_config = _build_peft_config(args)
