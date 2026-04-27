@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Local math eval with vLLM + tokenizer chat template + \\boxed{} extraction + math_verify grading.
-
-Data under ``preference_learning/data/`` can be selected by **name** (``--dataset``), no full path needed.
-Use ``--list-datasets`` to print known names. Custom files still use ``--data-path``.
-
-File formats (auto by suffix if ``--data-format auto``):
-  - *.jsonl: {"problem", "answer", "id"(optional)}
-  - *.parquet: detected from schema —
-    DAPO: prompt (chat messages), reward_model.ground_truth, extra_info;
-    AMO-Bench-like: prompt (plain string), answer, question_id (optional);
-    CMIMC/HMMT/BRUMO-like: problem, answer, problem_idx (optional)
-
-Summary JSON includes ``pass_at_k`` (e.g. pass@1/4/8/16): each k counts problems where
-at least one of the first k samples is graded correct.
-
-"""
 
 from __future__ import annotations
 
@@ -434,11 +417,13 @@ def summarize_result_subset(
     total_sol = n_d * gen_n
     fmt = sum(sum(1 for g in r.get("generations", []) if g.get("formatted")) for r in rows)
     tot_correct = sum(r.get("num_correct", 0) for r in rows)
+    avg1_pct = pass_at_k.get("1", {}).get("pct", 0.0)
+    avg16_pct = 100.0 * tot_correct / total_sol if total_sol else 0.0
     return {
         "num_problems": n_d,
         "pass_at_k": pass_at_k,
-        # Treat n generations as n independent pass@1 trials and average them.
-        "average_pass1_over_gen_n_pct": 100.0 * tot_correct / total_sol if total_sol else 0.0,
+        "avg1_pct": avg1_pct,
+        "avg16_pct": avg16_pct,
         "majority_vote_pct": 100.0 * maj / n_d if n_d else 0.0,
         "average_correct_pct": 100.0 * tot_correct / total_sol if total_sol else 0.0,
         "format_rate_pct": 100.0 * fmt / total_sol if total_sol else 0.0,
@@ -874,6 +859,8 @@ def main() -> None:
                 "total": processed,
                 "pct": 100.0 * c / processed if processed else 0.0,
             }
+        avg1_pct = pass_at_k_summary.get("1", {}).get("pct", 0.0)
+        avg16_pct = 100.0 * total_correct / total_solutions if total_solutions else 0.0
 
         by_tag: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for r in results:
@@ -908,12 +895,12 @@ def main() -> None:
             "gen_n": gen_n,
             "pass_at_k_list": pass_at_k_list,
             "pass_at_k": pass_at_k_summary,
+            "avg1_pct": avg1_pct,
+            "avg16_pct": avg16_pct,
             "metrics_by_dataset": metrics_by_dataset,
             "num_problems": processed,
             "num_problems_total": n_prompts,
             "total_solutions": total_solutions,
-            # Treat pass@gen_n as gen_n independent pass@1 evaluations and average.
-            "average_pass1_over_gen_n_pct": 100.0 * total_correct / total_solutions if total_solutions else 0.0,
             "average_correct_pct": 100.0 * total_correct / total_solutions if total_solutions else 0.0,
             "majority_vote_pct": 100.0 * majority_correct / processed if processed else 0.0,
             "format_rate_pct": 100.0 * formatted_total / total_solutions if total_solutions else 0.0,
@@ -950,13 +937,15 @@ def main() -> None:
     for k in pass_at_k_list:
         s = pass_at_k_summary[str(k)]
         print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{n})", flush=True)
+    print(f"  Avg1(one-shot hit rate): {summary['avg1_pct']:.2f}%", flush=True)
+    print(f"  Avg16(overall correctness): {summary['avg16_pct']:.2f}%", flush=True)
     for tag, m in metrics_by_dataset.items():
         print(f"[{tag}] n={m['num_problems']}", flush=True)
         for k in pass_at_k_list:
             s = m["pass_at_k"][str(k)]
             print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})", flush=True)
-        print(f"  Avg pass@1 over n={gen_n}: {m['average_pass1_over_gen_n_pct']:.2f}%", flush=True)
-    print(f"Avg pass@1 over n={gen_n}: {summary['average_pass1_over_gen_n_pct']:.2f}%", flush=True)
+        print(f"  Avg1(one-shot hit rate): {m['avg1_pct']:.2f}%", flush=True)
+        print(f"  Avg16(overall correctness): {m['avg16_pct']:.2f}%", flush=True)
     print(f"Avg correct / sample: {summary['average_correct_pct']:.2f}%", flush=True)
     print(f"Majority vote: {summary['majority_vote_pct']:.2f}%", flush=True)
     print(f"Boxed format rate: {summary['format_rate_pct']:.2f}%", flush=True)

@@ -9,7 +9,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import pyarrow.parquet as pq
 import torch
@@ -33,6 +33,7 @@ class MathSample:
     level: str
     problem_type: str
     subject: str
+    dataset_name: str
 
 
 @dataclass
@@ -131,6 +132,7 @@ def load_math_hf_samples(
     parquet_path: Path,
     max_samples: Optional[int],
     scan_batch_size: int,
+    dataset_name: str,
 ) -> List[MathSample]:
     parquet_file = pq.ParquetFile(parquet_path)
     required = {"problem", "solution"}
@@ -166,11 +168,176 @@ def load_math_hf_samples(
                 level=str(lv or "").strip(),
                 problem_type=str(tp or "").strip(),
                 subject=str(sub or "").strip(),
+                dataset_name=dataset_name,
             )
             samples.append(sample)
             if max_samples is not None and len(samples) >= max_samples:
                 return samples
     return samples
+
+
+def _extract_opsd_prompt(record: Dict[str, object]) -> str:
+    problem = str(record.get("problem", "") or "").strip()
+    if problem:
+        return problem
+    question = str(record.get("Question", "") or "").strip()
+    if question:
+        return question
+    conversations = record.get("conversations")
+    if isinstance(conversations, list):
+        for item in conversations:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("from", "")).strip().lower() == "user":
+                text = str(item.get("value", "")).strip()
+                if text:
+                    return text
+    return ""
+
+
+def _extract_opsd_answer(record: Dict[str, object]) -> str:
+    answer = str(record.get("Answer", "") or "").strip()
+    if answer:
+        return extract_answer_candidate(answer)
+    solution = str(record.get("solution", "") or "").strip()
+    return extract_answer_candidate(solution)
+
+
+def _extract_opsd_solution(record: Dict[str, object]) -> str:
+    solution = str(record.get("solution", "") or "").strip()
+    if solution:
+        return solution
+    thought = str(record.get("COT_Reason", "") or "").strip()
+    answer = str(record.get("Answer", "") or "").strip()
+    if thought and answer:
+        return f"<think>\n{thought}\n</think>\n\nAnswer: {answer}".strip()
+    if answer:
+        return f"Answer: {answer}".strip()
+    return thought
+
+
+def _iter_records_from_jsonlike(path: Path) -> Iterator[Dict[str, object]]:
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8")
+    if suffix == ".jsonl":
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                yield obj
+        return
+    loaded = json.loads(text)
+    if isinstance(loaded, list):
+        for item in loaded:
+            if isinstance(item, dict):
+                yield item
+    elif isinstance(loaded, dict):
+        candidates = loaded.get("data")
+        if isinstance(candidates, list):
+            for item in candidates:
+                if isinstance(item, dict):
+                    yield item
+
+
+def load_opsd_samples_from_records(
+    records: Iterator[Dict[str, object]],
+    max_samples: Optional[int],
+    dataset_name: str,
+) -> List[MathSample]:
+    samples: List[MathSample] = []
+    for record in records:
+        problem = _extract_opsd_prompt(record)
+        solution = _extract_opsd_solution(record)
+        gt = _extract_opsd_answer(record)
+        if not problem or not gt:
+            continue
+        if not solution:
+            solution = f"Answer: {gt}"
+        sample = MathSample(
+            sample_id=f"{dataset_name}-{len(samples)}",
+            problem=problem,
+            solution=solution,
+            ground_truth=gt,
+            level="",
+            problem_type="opsd",
+            subject="",
+            dataset_name=dataset_name,
+        )
+        samples.append(sample)
+        if max_samples is not None and len(samples) >= max_samples:
+            break
+    return samples
+
+
+def _load_samples_for_single_file(
+    dataset_file: Path,
+    max_samples: Optional[int],
+    scan_batch_size: int,
+    dataset_name: str,
+) -> List[MathSample]:
+    suffix = dataset_file.suffix.lower()
+    if suffix == ".parquet":
+        parquet_file = pq.ParquetFile(dataset_file)
+        names = set(parquet_file.schema_arrow.names)
+        if {"problem", "solution"}.issubset(names):
+            return load_math_hf_samples(
+                parquet_path=dataset_file,
+                max_samples=max_samples,
+                scan_batch_size=scan_batch_size,
+                dataset_name=dataset_name,
+            )
+        rows: List[Dict[str, object]] = []
+        use_cols = [c for c in ["problem", "Question", "Answer", "solution", "COT_Reason", "conversations"] if c in names]
+        for batch in parquet_file.iter_batches(batch_size=scan_batch_size, columns=use_cols):
+            for rec in batch.to_pylist():
+                if isinstance(rec, dict):
+                    rows.append(rec)
+                if max_samples is not None and len(rows) >= max_samples:
+                    break
+            if max_samples is not None and len(rows) >= max_samples:
+                break
+        return load_opsd_samples_from_records(iter(rows), max_samples=max_samples, dataset_name=dataset_name)
+    if suffix in {".jsonl", ".json"}:
+        return load_opsd_samples_from_records(
+            _iter_records_from_jsonlike(dataset_file),
+            max_samples=max_samples,
+            dataset_name=dataset_name,
+        )
+    return []
+
+
+def load_samples_for_dataset_path(
+    dataset_path: Path,
+    max_samples: Optional[int],
+    scan_batch_size: int,
+) -> List[MathSample]:
+    if dataset_path.is_dir():
+        dataset_name = dataset_path.name
+        files = sorted(
+            [p for p in dataset_path.rglob("*") if p.is_file() and p.suffix.lower() in {".parquet", ".jsonl", ".json"}]
+        )
+        merged: List[MathSample] = []
+        for fp in files:
+            part = _load_samples_for_single_file(
+                fp,
+                max_samples=None,
+                scan_batch_size=scan_batch_size,
+                dataset_name=dataset_name,
+            )
+            if part:
+                merged.extend(part)
+            if max_samples is not None and len(merged) >= max_samples:
+                return merged[:max_samples]
+        return merged
+    dataset_name = dataset_path.stem
+    return _load_samples_for_single_file(
+        dataset_path,
+        max_samples=max_samples,
+        scan_batch_size=scan_batch_size,
+        dataset_name=dataset_name,
+    )
 
 
 def resolve_device(device: str) -> str:
@@ -261,7 +428,10 @@ def trajectory_embedding_from_ids(
     hidden = get_last_hidden_suffix(model, full, prefix_len=int(prompt_ids.shape[1]))
     if hidden.shape[0] == 0:
         return None
-    return hidden.mean(dim=0)
+    mu = hidden.mean(dim=0)
+    end = hidden[-1]
+    mx = hidden.max(dim=0).values
+    return torch.cat([mu, end, mx], dim=0)
 
 
 def cosine_distance(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -561,6 +731,33 @@ def std_without_nan(values: Iterable[float]) -> float:
     return float(math.sqrt(max(var, 0.0)))
 
 
+def ratio_or_nan(numerator: float, denominator: float) -> float:
+    if math.isnan(numerator) or math.isnan(denominator) or denominator <= 0.0:
+        return float("nan")
+    return float(numerator / denominator)
+
+
+def bootstrap_split_distance(
+    bank: torch.Tensor,
+    generator: torch.Generator,
+    distance_fn: Any,
+    repeats: int = 100,
+) -> float:
+    if bank.ndim != 2 or bank.shape[0] < 4:
+        return float("nan")
+    n = int(bank.shape[0])
+    vals: List[float] = []
+    for _ in range(max(int(repeats), 1)):
+        perm = torch.randperm(n, generator=generator)
+        half = n // 2
+        if half <= 0 or (n - half) <= 0:
+            continue
+        a = bank[perm[:half]]
+        b = bank[perm[half:]]
+        vals.append(float(distance_fn(a, b)))
+    return mean_without_nan(vals)
+
+
 def weighted_mean_from_pairs(rows: List[Dict[str, object]], mean_key: str, count_key: str) -> float:
     num = 0.0
     den = 0
@@ -621,6 +818,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--dataset_path", type=str, default="logs/train.parquet")
+    parser.add_argument(
+        "--dataset_paths",
+        type=str,
+        default="",
+        help="Optional comma-separated dataset paths for joint multi-dataset analysis.",
+    )
     parser.add_argument("--model_path", type=str, default="")
     parser.add_argument("--output_dir", type=str, default="outputs/hidden_state_distribution")
     parser.add_argument("--inference_backend", type=str, default="transformers", choices=["transformers", "vllm"])
@@ -644,6 +847,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspect_only", action="store_true")
     parser.add_argument("--max_global_tokens", type=int, default=4096)
     parser.add_argument("--max_tokens_per_sample_for_global", type=int, default=128)
+    parser.add_argument("--bootstrap_repeats", type=int, default=100)
+    parser.add_argument("--bootstrap_max_tokens", type=int, default=1024)
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=4096)
@@ -661,39 +866,59 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    dataset_path = Path(args.dataset_path).expanduser().resolve()
+    dataset_paths_raw = [x.strip() for x in str(args.dataset_paths).split(",") if x.strip()]
+    if dataset_paths_raw:
+        dataset_paths = [Path(p).expanduser().resolve() for p in dataset_paths_raw]
+    else:
+        dataset_paths = [Path(args.dataset_path).expanduser().resolve()]
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    samples_all = load_math_hf_samples(
-        parquet_path=dataset_path,
-        max_samples=None,
-        scan_batch_size=args.scan_batch_size,
-    )
-    if not samples_all:
-        raise RuntimeError(f"No valid samples were loaded from {dataset_path}.")
+    for dp in dataset_paths:
+        if not dp.exists():
+            raise FileNotFoundError(f"Dataset path does not exist: {dp}")
 
+    per_dataset_loaded: Dict[str, int] = {}
+    per_dataset_selected: Dict[str, int] = {}
+    samples: List[MathSample] = []
+    samples_all_count = 0
     requested_total = max(int(args.problems_per_batch), 1) * max(int(args.rollout_rounds), 1)
     if args.max_samples > 0:
         requested_total = min(requested_total, int(args.max_samples))
-    requested_total = min(requested_total, len(samples_all))
-    samples = samples_all[:requested_total]
+    per_dataset_cap = max(1, int(math.ceil(requested_total / max(len(dataset_paths), 1))))
+    for dataset_path in dataset_paths:
+        loaded = load_samples_for_dataset_path(
+            dataset_path=dataset_path,
+            max_samples=None,
+            scan_batch_size=args.scan_batch_size,
+        )
+        if not loaded:
+            continue
+        per_dataset_loaded[dataset_path.stem] = len(loaded)
+        selected = loaded[: min(len(loaded), per_dataset_cap)]
+        per_dataset_selected[dataset_path.stem] = len(selected)
+        samples.extend(selected)
+        samples_all_count += len(loaded)
     if not samples:
-        raise RuntimeError("No samples were selected after applying round/batch/sample limits.")
+        raise RuntimeError("No samples were selected after parsing all dataset paths.")
+    if len(samples) > requested_total:
+        samples = samples[:requested_total]
     effective_rounds = int(math.ceil(len(samples) / max(int(args.problems_per_batch), 1))) if samples else 0
 
     preview = {
-        "dataset_path": str(dataset_path),
-        "num_loaded_samples": len(samples_all),
+        "dataset_paths": [str(p) for p in dataset_paths],
+        "num_loaded_samples_total": samples_all_count,
+        "num_loaded_samples_by_dataset": per_dataset_loaded,
+        "num_selected_samples_by_dataset": per_dataset_selected,
         "num_selected_samples": len(samples),
         "requested_total_samples": requested_total,
         "problems_per_batch": int(args.problems_per_batch),
         "rollout_rounds": int(args.rollout_rounds),
         "effective_rounds": effective_rounds,
         "rollout_n": int(args.rollout_n),
-        "columns": list(pq.ParquetFile(dataset_path).schema_arrow.names),
         "first_sample": {
             "sample_id": samples[0].sample_id,
+            "dataset_name": samples[0].dataset_name,
             "problem_preview": samples[0].problem[:240],
             "solution_preview": samples[0].solution[:240],
             "ground_truth": samples[0].ground_truth,
@@ -784,7 +1009,14 @@ def main() -> None:
 
     model_device = next(model.parameters()).device
 
-    per_problem_rows: List[Dict[str, object]] = []
+    teacher_bank: List[torch.Tensor] = []
+    rollout_bank: List[torch.Tensor] = []
+    correct_bank: List[torch.Tensor] = []
+    wrong_bank: List[torch.Tensor] = []
+    teacher_bank_by_dataset: Dict[str, List[torch.Tensor]] = {}
+    rollout_bank_by_dataset: Dict[str, List[torch.Tensor]] = {}
+    correct_counts: List[int] = []
+    wrong_counts: List[int] = []
     for sample, prompt_text, one_problem_rollouts in tqdm(
         zip(samples, prompt_texts, generation_results),
         desc="Analyze",
@@ -800,12 +1032,12 @@ def main() -> None:
         if ref_ids.numel() == 0:
             continue
         standard_emb = trajectory_embedding_from_ids(model, prompt_ids, ref_ids.to(model_device))
+        if standard_emb is not None:
+            teacher_bank.append(standard_emb)
+            teacher_bank_by_dataset.setdefault(sample.dataset_name, []).append(standard_emb)
 
-        correct_vectors: List[torch.Tensor] = []
-        wrong_vectors: List[torch.Tensor] = []
-        first_correct_preview = ""
-        first_wrong_preview = ""
-        valid_rollouts = 0
+        one_correct = 0
+        one_wrong = 0
         for gen_res in one_problem_rollouts[: max(int(args.rollout_n), 1)]:
             gen_ids: torch.Tensor
             if gen_res.token_ids is not None:
@@ -823,81 +1055,101 @@ def main() -> None:
             emb = trajectory_embedding_from_ids(model, prompt_ids, gen_ids)
             if emb is None:
                 continue
-            valid_rollouts += 1
+            rollout_bank.append(emb)
+            rollout_bank_by_dataset.setdefault(sample.dataset_name, []).append(emb)
             pred_answer = extract_answer_candidate(gen_res.text)
             if is_correct_answer(pred_answer, sample.ground_truth):
-                correct_vectors.append(emb)
-                if not first_correct_preview:
-                    first_correct_preview = gen_res.text[:180].replace("\n", " ")
+                correct_bank.append(emb)
+                one_correct += 1
             else:
-                wrong_vectors.append(emb)
-                if not first_wrong_preview:
-                    first_wrong_preview = gen_res.text[:180].replace("\n", " ")
+                wrong_bank.append(emb)
+                one_wrong += 1
+        correct_counts.append(one_correct)
+        wrong_counts.append(one_wrong)
 
-        cc_mean, cc_count = mean_pairwise_distance(correct_vectors)
-        cw_mean, cw_count = mean_cross_distance(correct_vectors, wrong_vectors)
-        cs_mean, cs_count = mean_to_standard_distance(correct_vectors, standard_emb)
-        ws_mean, ws_count = mean_to_standard_distance(wrong_vectors, standard_emb)
+    if not teacher_bank or not rollout_bank:
+        raise RuntimeError("No usable embeddings were collected for teacher/rollout banks.")
 
-        row = {
-            "sample_id": sample.sample_id,
-            "level": sample.level,
-            "type": sample.problem_type,
-            "subject": sample.subject,
-            "rollout_n": int(args.rollout_n),
-            "valid_rollouts": int(valid_rollouts),
-            "num_correct": len(correct_vectors),
-            "num_wrong": len(wrong_vectors),
-            "ground_truth": sample.ground_truth,
-            "correct_correct_pairs": int(cc_count),
-            "correct_wrong_pairs": int(cw_count),
-            "correct_standard_pairs": int(cs_count),
-            "wrong_standard_pairs": int(ws_count),
-            "cos_dist_correct_correct_mean": cc_mean,
-            "cos_dist_correct_wrong_mean": cw_mean,
-            "cos_dist_correct_standard_mean": cs_mean,
-            "cos_dist_wrong_standard_mean": ws_mean,
-            "problem_preview": sample.problem[:120].replace("\n", " "),
-            "first_correct_preview": first_correct_preview,
-            "first_wrong_preview": first_wrong_preview,
-            "solution_preview": sample.solution[:160].replace("\n", " "),
+    teacher_tensor = torch.stack(teacher_bank, dim=0).float()
+    rollout_tensor = torch.stack(rollout_bank, dim=0).float()
+    correct_tensor = torch.stack(correct_bank, dim=0).float() if correct_bank else None
+    wrong_tensor = torch.stack(wrong_bank, dim=0).float() if wrong_bank else None
+
+    metric_generator = torch.Generator().manual_seed(args.seed + 17)
+    bootstrap_generator = torch.Generator().manual_seed(args.seed + 29)
+
+    def mmd_with_limit(a: torch.Tensor, b: torch.Tensor) -> float:
+        return mmd_rbf(
+            a,
+            b,
+            generator=metric_generator,
+            max_tokens=max(int(args.bootstrap_max_tokens), 32),
+        )
+
+    teacher_rollout_mmd = mmd_with_limit(teacher_tensor, rollout_tensor)
+    rollout_internal_mmd = bootstrap_split_distance(
+        rollout_tensor,
+        generator=bootstrap_generator,
+        distance_fn=mmd_with_limit,
+        repeats=int(args.bootstrap_repeats),
+    )
+    teacher_rollout_ratio = ratio_or_nan(teacher_rollout_mmd, rollout_internal_mmd)
+
+    teacher_rollout_cos_mean = cosine_of_means(teacher_tensor, rollout_tensor)
+    teacher_rollout_l2_mean = l2_of_means(teacher_tensor, rollout_tensor)
+
+    correct_wrong_mmd = float("nan")
+    correct_wrong_ratio = float("nan")
+    if correct_tensor is not None and wrong_tensor is not None:
+        correct_wrong_mmd = mmd_with_limit(correct_tensor, wrong_tensor)
+        correct_wrong_ratio = ratio_or_nan(correct_wrong_mmd, rollout_internal_mmd)
+
+    per_dataset_margin: Dict[str, Dict[str, float]] = {}
+    for ds_name, t_list in teacher_bank_by_dataset.items():
+        r_list = rollout_bank_by_dataset.get(ds_name, [])
+        if not t_list or not r_list:
+            continue
+        t_tensor = torch.stack(t_list, dim=0).float()
+        r_tensor = torch.stack(r_list, dim=0).float()
+        ds_tr = mmd_with_limit(t_tensor, r_tensor)
+        ds_rr = bootstrap_split_distance(
+            r_tensor,
+            generator=bootstrap_generator,
+            distance_fn=mmd_with_limit,
+            repeats=int(args.bootstrap_repeats),
+        )
+        per_dataset_margin[ds_name] = {
+            "teacher_rollout_mmd": ds_tr,
+            "rollout_internal_mmd_bootstrap": ds_rr,
+            "teacher_rollout_over_internal_ratio": ratio_or_nan(ds_tr, ds_rr),
+            "teacher_count": float(t_tensor.shape[0]),
+            "rollout_count": float(r_tensor.shape[0]),
         }
-        per_problem_rows.append(row)
 
-    if not per_problem_rows:
-        raise RuntimeError("No usable per-problem rows were produced. Check model outputs and token limits.")
-
-    save_csv(output_dir / "per_problem_cosine_metrics.csv", per_problem_rows)
-
-    metric_defs = [
-        ("cos_dist_correct_correct_mean", "correct_correct_pairs"),
-        ("cos_dist_correct_wrong_mean", "correct_wrong_pairs"),
-        ("cos_dist_correct_standard_mean", "correct_standard_pairs"),
-        ("cos_dist_wrong_standard_mean", "wrong_standard_pairs"),
-    ]
-    per_metric: Dict[str, Dict[str, float]] = {}
-    for mean_key, count_key in metric_defs:
-        vals = [float(r[mean_key]) for r in per_problem_rows]
-        valid_vals = [v for v in vals if not math.isnan(v)]
-        per_metric[mean_key] = {
-            "mean_over_problems": mean_without_nan(vals),
-            "std_over_problems": std_without_nan(vals),
-            "min_over_problems": min(valid_vals) if valid_vals else float("nan"),
-            "max_over_problems": max(valid_vals) if valid_vals else float("nan"),
-            "weighted_mean_over_pairs": weighted_mean_from_pairs(per_problem_rows, mean_key, count_key),
-            "total_pair_count": float(sum(int(r[count_key]) for r in per_problem_rows)),
-            "valid_problem_count": float(sum(0 if math.isnan(float(r[mean_key])) else 1 for r in per_problem_rows)),
-        }
-
-    correct_counts = [int(r["num_correct"]) for r in per_problem_rows]
-    wrong_counts = [int(r["num_wrong"]) for r in per_problem_rows]
+    dataset_pairwise_teacher_mmd: List[Dict[str, object]] = []
+    ds_names = sorted([k for k, v in teacher_bank_by_dataset.items() if len(v) > 0])
+    for i in range(len(ds_names)):
+        for j in range(i + 1, len(ds_names)):
+            a_name = ds_names[i]
+            b_name = ds_names[j]
+            a_tensor = torch.stack(teacher_bank_by_dataset[a_name], dim=0).float()
+            b_tensor = torch.stack(teacher_bank_by_dataset[b_name], dim=0).float()
+            dataset_pairwise_teacher_mmd.append(
+                {
+                    "dataset_a": a_name,
+                    "dataset_b": b_name,
+                    "teacher_teacher_mmd": mmd_with_limit(a_tensor, b_tensor),
+                    "teacher_teacher_cosine_of_means": cosine_of_means(a_tensor, b_tensor),
+                    "teacher_teacher_l2_of_means_normed": l2_of_means(a_tensor, b_tensor),
+                }
+            )
 
     summary = {
-        "dataset_path": str(dataset_path),
+        "dataset_paths": [str(p) for p in dataset_paths],
         "model_path": args.model_path,
-        "samples_total_available": len(samples_all),
+        "samples_total_available": samples_all_count,
         "samples_selected": len(samples),
-        "samples_used": len(per_problem_rows),
+        "samples_used": len(teacher_bank),
         "settings": {
             "inference_backend": args.inference_backend,
             "rollout_n": args.rollout_n,
@@ -918,6 +1170,15 @@ def main() -> None:
             "vllm_max_model_len": args.vllm_max_model_len,
             "vllm_dtype": args.vllm_dtype,
             "vllm_enforce_eager": args.vllm_enforce_eager,
+            "bootstrap_repeats": args.bootstrap_repeats,
+            "bootstrap_max_tokens": args.bootstrap_max_tokens,
+        },
+        "bank_sizes": {
+            "teacher_bank_size": int(teacher_tensor.shape[0]),
+            "rollout_bank_size": int(rollout_tensor.shape[0]),
+            "correct_bank_size": int(0 if correct_tensor is None else correct_tensor.shape[0]),
+            "wrong_bank_size": int(0 if wrong_tensor is None else wrong_tensor.shape[0]),
+            "embedding_dim": int(teacher_tensor.shape[1]),
         },
         "correctness_counts": {
             "mean_num_correct_per_problem": float(sum(correct_counts) / len(correct_counts)),
@@ -925,18 +1186,21 @@ def main() -> None:
             "total_correct_trajectories": int(sum(correct_counts)),
             "total_wrong_trajectories": int(sum(wrong_counts)),
         },
-        "cosine_distance_stats": per_metric,
+        "margin_hypothesis_metrics": {
+            "teacher_rollout_mmd": teacher_rollout_mmd,
+            "rollout_internal_mmd_bootstrap": rollout_internal_mmd,
+            "teacher_rollout_over_internal_ratio": teacher_rollout_ratio,
+            "teacher_rollout_cosine_of_means": teacher_rollout_cos_mean,
+            "teacher_rollout_l2_of_means_normed": teacher_rollout_l2_mean,
+            "correct_wrong_mmd": correct_wrong_mmd,
+            "correct_wrong_over_internal_ratio": correct_wrong_ratio,
+        },
+        "per_dataset_margin_metrics": per_dataset_margin,
+        "dataset_pairwise_teacher_metrics": dataset_pairwise_teacher_mmd,
         "files": {
             "dataset_preview": str(output_dir / "dataset_preview.json"),
-            "per_problem_cosine_metrics_csv": str(output_dir / "per_problem_cosine_metrics.csv"),
         },
     }
-
-    plot_path = None
-    if not args.skip_plot:
-        plot_path = maybe_make_plot(per_problem_rows, output_dir)
-        if plot_path is not None:
-            summary["files"]["plot"] = str(plot_path)
 
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
