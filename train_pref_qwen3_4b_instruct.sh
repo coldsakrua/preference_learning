@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/pref_4b.%j.out
+#SBATCH -o logs/pref_4b_instruct_1gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -28,13 +28,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-instruct}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
 online_steps=${ONLINE_STEPS:-20}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
@@ -43,15 +43,15 @@ top_k=${TOP_K:-20}
 min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-3072}
-learning_rate=${LEARNING_RATE:-1e-6}
+learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.3}
+max_length=${MAX_LENGTH:-4096}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
-max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 
 use_lora=${USE_LORA:-true}
@@ -67,7 +67,7 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/pref_4b_1gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/pref_4b_instruct_1gpu/${run_name}}
 train_out="${run_root}/train"
 
 mkdir -p "${run_root}" "${train_out}"
@@ -80,6 +80,7 @@ python train_preference.py \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
   --output_dir "${train_out}" \
+  --require_gold_rationale_for_all_wrong true \
   --online_rollout_backend vllm \
   --tensor_parallel_size "${tensor_parallel_size}" \
   --vllm_dtype "${vllm_dtype}" \
@@ -110,7 +111,6 @@ python train_preference.py \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --enable_thinking false \
-  --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \
   --online_pref_min_avg_logprob_rejected -3 \
 

@@ -38,9 +38,12 @@ online_steps=${ONLINE_STEPS:-20}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
-temperature=${TEMPERATURE:-0.6}
-top_p=${TOP_P:-0.95}
-max_new_tokens=${MAX_NEW_TOKENS:-2048}
+temperature=${TEMPERATURE:-0.7}
+top_p=${TOP_P:-0.8}
+top_k=${TOP_K:-20}
+min_p=${MIN_P:-0.0}
+presence_penalty=${PRESENCE_PENALTY:-0.0}
+max_new_tokens=${MAX_NEW_TOKENS:-3072}
 learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.3}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-16}
@@ -93,6 +96,9 @@ python train_preference.py \
   --rollout_batch_size "${rollout_batch_size}" \
   --temperature "${temperature}" \
   --top_p "${top_p}" \
+  --top_k "${top_k}" \
+  --min_p "${min_p}" \
+  --presence_penalty "${presence_penalty}" \
   --max_new_tokens "${max_new_tokens}" \
   --learning_rate "${learning_rate}" \
   --beta "${beta}" \

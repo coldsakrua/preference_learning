@@ -498,9 +498,11 @@ def _seq_logps_from_logits_labels(
     shifted_labels = labels[:, 1:]
     valid_mask = shifted_labels.ne(-100)
     safe_labels = shifted_labels.masked_fill(~valid_mask, 0)
-    token_logps = F.log_softmax(shifted_logits, dim=-1).gather(
+    # Use fp32 for log_softmax and sanitize tails before preference-gap math.
+    token_logps = F.log_softmax(shifted_logits.float(), dim=-1).gather(
         dim=-1, index=safe_labels.unsqueeze(-1)
     ).squeeze(-1)
+    token_logps = torch.nan_to_num(token_logps, nan=-20.0, neginf=-20.0, posinf=0.0).clamp_min(-20.0)
     seq_logps = (token_logps * valid_mask).sum(dim=-1)
     seq_logps = seq_logps / valid_mask.sum(dim=-1).clamp_min(1)
     return seq_logps
@@ -513,7 +515,8 @@ def _seq_entropy_from_logits_labels(
     shifted_logits = logits[:, :-1, :]
     shifted_labels = labels[:, 1:]
     valid_mask = shifted_labels.ne(-100).to(shifted_logits.dtype)
-    token_log_probs = F.log_softmax(shifted_logits, dim=-1)
+    token_log_probs = F.log_softmax(shifted_logits.float(), dim=-1)
+    token_log_probs = torch.nan_to_num(token_log_probs, nan=-20.0, neginf=-20.0, posinf=0.0).clamp_min(-20.0)
     token_probs = token_log_probs.exp()
     token_entropy = -(token_probs * token_log_probs).sum(dim=-1)
     seq_entropy = (token_entropy * valid_mask).sum(dim=-1)
@@ -782,6 +785,9 @@ def _online_rollout_completions_flat_vllm(
         n=args.rollout_n,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        presence_penalty=args.presence_penalty,
         max_tokens=args.max_new_tokens,
         seed=args.seed + rollout_steps * 100003,
     )
@@ -838,6 +844,9 @@ def _online_rollout_completions_flat_hf(
             do_sample=True,
             temperature=args.temperature,
             top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            presence_penalty=args.presence_penalty,
             max_new_tokens=args.max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,

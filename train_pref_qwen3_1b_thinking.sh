@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/pref_4b.%j.out
+#SBATCH -o logs/pref_1b_1gpu_thinking.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -17,7 +17,8 @@ cd /gpfs/share/home/2501210611/prefernce-learning/preference_learning
 source activate anchor
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 set -u
-mkdir -p logs
+log_dir=${LOG_DIR:-logs}
+mkdir -p "${log_dir}"
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -28,24 +29,24 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-128}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
 online_steps=${ONLINE_STEPS:-20}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-32}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-8}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
-rollout_n=${ROLLOUT_N:-8}
-temperature=${TEMPERATURE:-0.7}
-top_p=${TOP_P:-0.8}
+rollout_n=${ROLLOUT_N:-4}
+temperature=${TEMPERATURE:-0.6}
+top_p=${TOP_P:-0.95}
 top_k=${TOP_K:-20}
 min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-3072}
-learning_rate=${LEARNING_RATE:-1e-6}
+learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
@@ -67,7 +68,8 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/pref_4b_1gpu/${run_name}}
+exp_name=${EXP_NAME:-pref_1b_1gpu_thinking}
+run_root=${RUN_ROOT:-outputs/${exp_name}/${run_name}}
 train_out="${run_root}/train"
 
 mkdir -p "${run_root}" "${train_out}"
@@ -109,7 +111,7 @@ python train_preference.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --enable_thinking false \
+  --enable_thinking true \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \
   --online_pref_min_avg_logprob_rejected -3 \

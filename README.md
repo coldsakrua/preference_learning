@@ -82,10 +82,12 @@ python train_preference.py \
   --rollout_n 8 \
   --online-pairs-per-step 32 \
   --tensor_parallel_size 1 \
-  --temperature 0.6 \
-  --top_p 0.95 \
-  --max_new_tokens 8192 \
-  --max_length 8192 \
+  --temperature 0.7 \
+  --top_p 0.8 \
+  --top_k 20 \
+  --min_p 0 \
+  --max_new_tokens 3072 \
+  --max_length 4096 \
   --beta 0.1 \
   --prompt_smoothing_alpha 1.0 \
   --prompt_smoothing_beta 1.0 \
@@ -105,12 +107,13 @@ Use these ready-to-run examples:
 They run online rollout + preference updates and write outputs under
 `outputs/pref_*/<timestamp>_job<id>/`.
 
-The SLURM defaults are aligned with local eval decoding (`eval_math_vllm_local.sh`):
+The SLURM defaults (training scripts) are:
 
-- `temperature=0.6`
-- `top_p=0.95`
-- `max_new_tokens=8192`
-- `enable_thinking=false`
+- `temperature=0.7` (non-thinking) / `0.6` (thinking)
+- `top_p=0.8` (non-thinking) / `0.95` (thinking)
+- `top_k=20`, `min_p=0`, `presence_penalty=0`
+- `max_new_tokens=3072`
+- `max_length=4096` (`rollout_max_model_len=4096`)
 
 ## GRPO RL (trl==0.22.1)
 

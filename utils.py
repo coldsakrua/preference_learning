@@ -469,6 +469,14 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--min_p", type=float, default=0.0)
+    parser.add_argument(
+        "--presence_penalty",
+        type=float,
+        default=0.0,
+        help="Optional anti-repetition penalty (recommended range: 0~2).",
+    )
     parser.add_argument("--rollout_n", type=int, default=8, help="Number of sampled responses per prompt during rollout.")
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)

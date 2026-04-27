@@ -344,6 +344,7 @@ def build_llm(
     gpu_memory_utilization: float,
     max_model_len: int,
     enforce_eager: bool,
+    disable_custom_all_reduce: bool,
     max_lora_rank: int,
 ) -> Any:
     from vllm import LLM
@@ -356,6 +357,7 @@ def build_llm(
         "dtype": "bfloat16",
         "gpu_memory_utilization": gpu_memory_utilization,
         "max_model_len": max_model_len,
+        "disable_custom_all_reduce": disable_custom_all_reduce,
     }
     if enforce_eager:
         cfg["enforce_eager"] = True
@@ -513,11 +515,11 @@ def main() -> None:
     )
     parser.add_argument("--output-json", type=str, default="", help="Summary JSON path (not needed for --list-datasets).")
     parser.add_argument("--num-samples", type=int, default=0, help="0 = use all rows")
-    parser.add_argument("--max-new-tokens", type=int, default=8192)
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--top-k", type=int, default=-1)
-    parser.add_argument("--min-p", type=float, default=0.0)
+    parser.add_argument("--max-new-tokens", type=int, default=0, help="0 = auto by mode (thinking=38912, non-thinking=32768)")
+    parser.add_argument("--temperature", type=float, default=-1.0, help="<0 = auto by mode (thinking=0.6, non-thinking=0.7)")
+    parser.add_argument("--top-p", type=float, default=-1.0, help="<0 = auto by mode (thinking=0.95, non-thinking=0.8)")
+    parser.add_argument("--top-k", type=int, default=20, help="Set to 20 per Qwen3 official recommendation.")
+    parser.add_argument("--min-p", type=float, default=0.0, help="Set to 0 per Qwen3 official recommendation.")
     parser.add_argument("--presence-penalty", type=float, default=0.0)
     parser.add_argument(
         "--val-n",
@@ -543,6 +545,12 @@ def main() -> None:
         help="0 = auto (40960 if thinking else 32768)",
     )
     parser.add_argument("--enforce-eager", action="store_true", default=False)
+    parser.add_argument(
+        "--disable-custom-all-reduce",
+        action="store_true",
+        default=False,
+        help="Disable vLLM custom all-reduce and fall back to NCCL for tensor parallel inference.",
+    )
     parser.add_argument(
         "--force-base-tokenizer",
         action="store_true",
@@ -638,6 +646,12 @@ def main() -> None:
     max_model_len = args.max_model_len
     if max_model_len <= 0:
         max_model_len = 40960 if args.enable_thinking else 32768
+    max_new_tokens = args.max_new_tokens if args.max_new_tokens > 0 else (38912 if args.enable_thinking else 32768)
+    temperature = args.temperature if args.temperature >= 0 else (0.6 if args.enable_thinking else 0.7)
+    top_p = args.top_p if args.top_p >= 0 else (0.95 if args.enable_thinking else 0.8)
+    top_k = max(args.top_k, 0)
+    min_p = max(args.min_p, 0.0)
+    presence_penalty = args.presence_penalty
 
     print(f"[eval] total {len(examples)} problems from {len(resolved_paths)} file(s)")
     print(f"[eval] math_verify={'yes' if _HAS_MATH_VERIFY else 'no'}, thinking={args.enable_thinking}")
@@ -680,6 +694,7 @@ def main() -> None:
         args.gpu_memory_utilization,
         max_model_len,
         args.enforce_eager,
+        args.disable_custom_all_reduce,
         max_lora_rank,
     )
 
@@ -722,17 +737,17 @@ def main() -> None:
         all_prompts.append(text)
 
     sp_kw: Dict[str, Any] = {
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "min_p": args.min_p,
-        "max_tokens": args.max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "min_p": min_p,
+        "max_tokens": max_new_tokens,
         "n": gen_n,
         "seed": args.seed,
     }
-    if args.top_k > 0:
-        sp_kw["top_k"] = args.top_k
-    if args.presence_penalty != 0.0:
-        sp_kw["presence_penalty"] = args.presence_penalty
+    if top_k > 0:
+        sp_kw["top_k"] = top_k
+    if presence_penalty != 0.0:
+        sp_kw["presence_penalty"] = presence_penalty
 
     from vllm import SamplingParams
 
@@ -883,10 +898,12 @@ def main() -> None:
             "dataset_args": list(args.dataset) if args.dataset else [],
             "data_format": args.data_format,
             "enable_thinking": args.enable_thinking,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "max_new_tokens": args.max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "max_new_tokens": max_new_tokens,
             "val_n_requested": args.val_n,
             "gen_n": gen_n,
             "pass_at_k_list": pass_at_k_list,

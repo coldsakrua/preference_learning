@@ -38,9 +38,18 @@ use_lora=${USE_LORA:-1}
 num_samples=${NUM_SAMPLES:-0}
 val_n=${VAL_N:-16}
 pass_at_k=${PASS_AT_K:-1,4,8,16}
-max_new_tokens=${MAX_NEW_TOKENS:-4096}
-temperature=${TEMPERATURE:-0.6}
-top_p=${TOP_P:-0.95}
+if [[ "${NO_THINKING}" == "1" ]]; then
+  max_new_tokens=${MAX_NEW_TOKENS:-32768}
+  temperature=${TEMPERATURE:-0.7}
+  top_p=${TOP_P:-0.8}
+else
+  max_new_tokens=${MAX_NEW_TOKENS:-38912}
+  temperature=${TEMPERATURE:-0.6}
+  top_p=${TOP_P:-0.95}
+fi
+top_k=${TOP_K:-20}
+min_p=${MIN_P:-0.0}
+presence_penalty=${PRESENCE_PENALTY:-0.0}
 seed=${SEED:-42}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9}
@@ -84,6 +93,9 @@ cmd=(
   --max-new-tokens "${max_new_tokens}"
   --temperature "${temperature}"
   --top-p "${top_p}"
+  --top-k "${top_k}"
+  --min-p "${min_p}"
+  --presence-penalty "${presence_penalty}"
   --seed "${seed}"
   --tensor-parallel-size "${tensor_parallel_size}"
   --gpu-memory-utilization "${gpu_memory_utilization}"

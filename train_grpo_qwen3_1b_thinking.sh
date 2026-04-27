@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/grpo_qwen3_4b_2gpu.%j.out
+#SBATCH -o logs/grpo_qwen3_1b_2gpu_thinking.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -29,16 +29,25 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 seed=${SEED:-42}
 learning_rate=${LEARNING_RATE:-1e-6}
 train_steps=${TRAIN_STEPS:-200}
+
 global_prompts_per_step=${GLOBAL_PROMPTS_PER_STEP:-4}
 rollouts_per_prompt=${ROLLOUTS_PER_PROMPT:-4}
-per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
-max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_completion_length=${MAX_COMPLETION_LENGTH:-4096}
+per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
+
+# Larger token budget for thinking-style completions.
+max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
+max_completion_length=${MAX_COMPLETION_LENGTH:-8192}
+
 temperature=${TEMPERATURE:-0.6}
 top_p=${TOP_P:-0.95}
 beta=${BETA:-0.04}
 save_steps=${SAVE_STEPS:-20}
 logging_steps=${LOGGING_STEPS:-5}
+redundancy_target_len=${REDUNDANCY_TARGET_LEN:-4096}
+
+# Keep prompt mode fixed and inject a reasoning-oriented system prompt.
+prompt_mode=${PROMPT_MODE:-fixed}
+system_prompt=${SYSTEM_PROMPT:-You are a precise math reasoning assistant. Think step by step internally, and end with exactly one final line in the format: Answer: $<final_answer>.}
 
 use_lora=${USE_LORA:-1}
 if [[ "${use_lora}" == "1" ]]; then
@@ -53,7 +62,7 @@ lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 lora_target_modules=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
-lora_path=${LORA_PATH-}
+lora_path=${LORA_PATH-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/pref_1b_1gpu_thinking/20260425_134147_job1454329/train/final}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -62,7 +71,7 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/grpo_qwen3_4b_2gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/grpo_qwen3_1b_2gpu_thinking/${run_name}}
 train_out="${run_root}/train"
 mkdir -p "${run_root}" "${train_out}"
 
@@ -102,7 +111,10 @@ echo "[GRPO] model_path=${model_path}"
 echo "[GRPO] dataset_path=${dataset_path}"
 echo "[GRPO] train_steps=${train_steps}, global_prompts_per_step=${global_prompts_per_step}, rollouts_per_prompt=${rollouts_per_prompt}"
 echo "[GRPO] world_size=${world_size}, per_device_train_batch_size=${per_device_train_batch_size}, gradient_accumulation_steps=${gradient_accumulation_steps}"
-echo "[GRPO] generation_batch_size=${global_prompts_per_step} (must be divisible by rollouts_per_prompt)"
+echo "[GRPO] generation_batch_size=${global_prompts_per_step} (must be divisible by num_generations=${rollouts_per_prompt})"
+echo "[GRPO] max_prompt_length=${max_prompt_length}, max_completion_length=${max_completion_length}"
+echo "[GRPO] redundancy_target_len=${redundancy_target_len}"
+echo "[GRPO] prompt_mode=${prompt_mode}"
 echo "[GRPO] use_lora=${use_lora} (bool=${use_lora_bool})"
 if [[ -n "${lora_path}" ]]; then
   echo "[GRPO] lora_path=${lora_path} (will load adapter if use_lora=1)"
@@ -127,6 +139,7 @@ torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" 
   --temperature "${temperature}" \
   --top_p "${top_p}" \
   --beta "${beta}" \
+  --redundancy_target_len "${redundancy_target_len}" \
   --logging_steps "${logging_steps}" \
   --save_steps "${save_steps}" \
   --save_total_limit 100 \
@@ -134,7 +147,9 @@ torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" 
   --bf16 true \
   --fp16 false \
   --report_to none \
-  --run_name "grpo_qwen3_4b_${run_name}" \
+  --prompt_mode "${prompt_mode}" \
+  --system_prompt "${system_prompt}" \
+  --run_name "grpo_qwen3_1b_thinking_${run_name}" \
   --use_lora "${use_lora_bool}" \
   --lora_r "${lora_r}" \
   --lora_alpha "${lora_alpha}" \
