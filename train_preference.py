@@ -64,6 +64,110 @@ def _unwrap_model(model: object) -> object:
     return getattr(model, "module", model)
 
 
+def _is_deepspeed_engine(model: object) -> bool:
+    return all(hasattr(model, attr) for attr in ("backward", "step", "module"))
+
+
+def _deepspeed_zero_stage(model: object) -> int:
+    if not _is_deepspeed_engine(model):
+        return 0
+    getter = getattr(model, "zero_optimization_stage", None)
+    if callable(getter):
+        try:
+            return int(getter())
+        except Exception:
+            return 0
+    return 0
+
+
+def _build_default_deepspeed_config(args: argparse.Namespace) -> Dict[str, Any]:
+    zero_opt: Dict[str, Any] = {
+        "stage": int(args.deepspeed_zero_stage),
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "reduce_scatter": True,
+        "allgather_partitions": True,
+        "reduce_bucket_size": int(args.deepspeed_reduce_bucket_size),
+        "allgather_bucket_size": int(args.deepspeed_allgather_bucket_size),
+    }
+    if args.deepspeed_offload_optimizer:
+        zero_opt["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
+    if int(args.deepspeed_zero_stage) == 3:
+        zero_opt["stage3_prefetch_bucket_size"] = int(args.deepspeed_stage3_prefetch_bucket_size)
+        zero_opt["stage3_param_persistence_threshold"] = int(
+            args.deepspeed_stage3_param_persistence_threshold
+        )
+        if args.deepspeed_offload_param:
+            zero_opt["offload_param"] = {"device": "cpu", "pin_memory": True}
+
+    bf16_enabled = str(args.torch_dtype).lower() == "bfloat16"
+    fp16_enabled = str(args.torch_dtype).lower() == "float16"
+    return {
+        "train_micro_batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 1,
+        "gradient_clipping": float(args.max_grad_norm if args.max_grad_norm > 0 else 0.0),
+        "bf16": {"enabled": bool(bf16_enabled)},
+        "fp16": {"enabled": bool(fp16_enabled)},
+        "zero_optimization": zero_opt,
+    }
+
+
+def _load_deepspeed_config(args: argparse.Namespace) -> Dict[str, Any]:
+    config_path = str(getattr(args, "deepspeed_config_path", "") or "").strip()
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError(f"DeepSpeed config must be a JSON object: {config_path}")
+        return cfg
+    return _build_default_deepspeed_config(args)
+
+
+def _compute_grad_norm(
+    trainable_params: Sequence[torch.nn.Parameter],
+    device: torch.device,
+) -> float:
+    grad_norm_parts = [
+        torch.linalg.vector_norm(p.grad.detach(), ord=2)
+        for p in trainable_params
+        if p.grad is not None
+    ]
+    if not grad_norm_parts:
+        return 0.0
+    total_norm = torch.linalg.vector_norm(torch.stack(grad_norm_parts), ord=2)
+    if isinstance(total_norm, torch.Tensor):
+        return float(total_norm.detach().to(device=device).item())
+    return float(total_norm)
+
+
+def _save_model_and_tokenizer(
+    model: object,
+    tokenizer: object,
+    save_dir: Path,
+) -> None:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    base_model = _unwrap_model(model)
+    try:
+        base_model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        return
+    except Exception as e:
+        if not _is_deepspeed_engine(model):
+            raise
+        zero_stage = _deepspeed_zero_stage(model)
+        if zero_stage != 3:
+            raise
+        ds_ckpt_dir = save_dir / "deepspeed_zero3_ckpt"
+        ds_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        model.save_checkpoint(str(ds_ckpt_dir), tag="global_step")
+        tokenizer.save_pretrained(save_dir)
+        print(
+            "[online] warning: save_pretrained failed under DeepSpeed ZeRO-3; "
+            f"saved DeepSpeed checkpoint instead: {ds_ckpt_dir} (error: {e})",
+            flush=True,
+        )
+
+
 
 @dataclass
 class OnlinePendingObjective:
@@ -934,7 +1038,7 @@ def filter_weighted_sft_without_truncation(
 def _online_run_preference_optimizer_step(
     model: object,
     tokenizer: object,
-    optimizer: AdamW,
+    optimizer: object,
     device: torch.device,
     args: argparse.Namespace,
     pref_train_prompts: List[str],
@@ -982,7 +1086,27 @@ def _online_run_preference_optimizer_step(
     )
     mb_mle = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(mle_batch, 1)
 
-    optimizer.zero_grad(set_to_none=True)
+    use_deepspeed = _is_deepspeed_engine(model)
+
+    def _zero_grad() -> None:
+        if use_deepspeed:
+            model.zero_grad()
+        else:
+            optimizer.zero_grad(set_to_none=True)
+
+    def _backward(loss: torch.Tensor) -> None:
+        if use_deepspeed:
+            model.backward(loss)
+        else:
+            loss.backward()
+
+    def _step() -> None:
+        if use_deepspeed:
+            model.step()
+        else:
+            optimizer.step()
+
+    _zero_grad()
     pref_loss_weighted_sum = 0.0
     gt_pref_loss_weighted_sum = 0.0
     mle_loss_weighted_sum = 0.0
@@ -1004,15 +1128,15 @@ def _online_run_preference_optimizer_step(
                 "ensure input grads are enabled for checkpointing."
             )
         if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
-            optimizer.zero_grad(set_to_none=True)
+            _zero_grad()
             return _build_zero_stats(f"nonfinite_{skip_prefix}_loss_chunk(start={start},end={end})")
         if args.online_loss_value_cap > 0 and abs(loss_chunk_val) > args.online_loss_value_cap:
-            optimizer.zero_grad(set_to_none=True)
+            _zero_grad()
             return _build_zero_stats(
                 f"{skip_prefix}_loss_chunk_too_large(value={loss_chunk_val:.4f},"
                 f"cap={args.online_loss_value_cap:.4f})"
             )
-        loss_chunk.backward()
+        _backward(loss_chunk)
         return None
 
     if pref_batch > 0:
@@ -1130,20 +1254,16 @@ def _online_run_preference_optimizer_step(
             mle_loss_weighted_sum += (mle_loss_vec * w).sum().item()
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    if args.max_grad_norm > 0:
+    if args.max_grad_norm > 0 and not use_deepspeed:
         total_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+        grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
     else:
-        grad_norm_parts = [torch.linalg.vector_norm(p.grad.detach(), ord=2) for p in trainable if p.grad is not None]
-        if grad_norm_parts:
-            total_norm = torch.linalg.vector_norm(torch.stack(grad_norm_parts), ord=2)
-        else:
-            total_norm = torch.tensor(0.0, device=device)
-    grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
+        grad_norm = _compute_grad_norm(trainable, device)
     if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
-        optimizer.zero_grad(set_to_none=True)
+        _zero_grad()
         return _build_zero_stats("nonfinite_grad_norm", grad_norm_value=grad_norm)
     if args.online_hard_grad_norm_cap > 0 and grad_norm > args.online_hard_grad_norm_cap:
-        optimizer.zero_grad(set_to_none=True)
+        _zero_grad()
         return _build_zero_stats(
             (
                 f"grad_norm_too_large(value={grad_norm:.4f},"
@@ -1151,7 +1271,7 @@ def _online_run_preference_optimizer_step(
             ),
             grad_norm_value=grad_norm,
         )
-    optimizer.step()
+    _step()
 
     mean_gap = gap_weighted_sum / gap_weight_sum if gap_weight_sum > 0 else 0.0
     pref_loss = pref_loss_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
@@ -1232,8 +1352,22 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         model = wrap_model_with_lora(model, args)
         model.print_trainable_parameters()
 
+    use_deepspeed = bool(getattr(args, "use_deepspeed", False))
+    if use_deepspeed and args.hf_data_parallel:
+        raise ValueError("--use_deepspeed=true is incompatible with --hf_data_parallel=true.")
+    if (
+        use_deepspeed
+        and args.online_rollout_backend == "vllm"
+        and int(getattr(args, "deepspeed_zero_stage", 2)) == 3
+    ):
+        raise ValueError(
+            "DeepSpeed ZeRO-3 is not supported with --online_rollout_backend=vllm in this script. "
+            "Use --deepspeed_zero_stage 2, or switch to --online_rollout_backend hf."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    if not use_deepspeed:
+        model.to(device)
     model.train()
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -1241,7 +1375,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         if args.use_lora:
             ensure_input_require_grads_for_checkpointing(model)
 
-    if args.hf_data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
+    if (not use_deepspeed) and args.hf_data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         n_gpu = torch.cuda.device_count()
         model = torch.nn.DataParallel(model, device_ids=list(range(n_gpu)))
         print(f"[online] HF DataParallel enabled on {n_gpu} GPUs", flush=True)
@@ -1251,6 +1385,27 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    ds_config: Optional[Dict[str, Any]] = None
+    if use_deepspeed:
+        import deepspeed
+
+        ds_config = _load_deepspeed_config(args)
+        model, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            model_parameters=[p for p in model.parameters() if p.requires_grad],
+            config=ds_config,
+        )
+        model.train()
+        if hasattr(model, "device"):
+            device = torch.device(model.device)
+        print(
+            f"[online] DeepSpeed enabled: zero_stage={_deepspeed_zero_stage(model)} "
+            f"dtype={args.torch_dtype} offload_optimizer={args.deepspeed_offload_optimizer} "
+            f"offload_param={args.deepspeed_offload_param}",
+            flush=True,
+        )
+
     prompt_pool = build_prompt_pool(args)
     prompt_rng = random.Random(args.seed + 20260412)
 
@@ -1317,7 +1472,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
-        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}"
+        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}, "
+        f"use_deepspeed={use_deepspeed}, "
+        f"deepspeed_zero_stage={_deepspeed_zero_stage(model) if use_deepspeed else 0}"
     )
     _write_metric(
         "run_start",
@@ -1333,6 +1490,10 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "lambda_mle": args.lambda_mle,
             "lambda_pref": args.lambda_pref,
             "lambda_gt": args.lambda_gt,
+            "use_deepspeed": bool(use_deepspeed),
+            "deepspeed_zero_stage": int(_deepspeed_zero_stage(model)) if use_deepspeed else 0,
+            "deepspeed_config_path": str(args.deepspeed_config_path),
+            "deepspeed_config_auto": ds_config if (use_deepspeed and not str(args.deepspeed_config_path).strip()) else None,
             "metrics_jsonl": str(metrics_jsonl_path),
         },
     )
@@ -1914,9 +2075,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
                         ckpt_dir = output_root / f"checkpoint-update-{updates}"
-                        ckpt_dir.mkdir(parents=True, exist_ok=True)
-                        _unwrap_model(model).save_pretrained(ckpt_dir)
-                        tokenizer.save_pretrained(ckpt_dir)
+                        _save_model_and_tokenizer(model, tokenizer, ckpt_dir)
                         print(f"[online] saved checkpoint to {ckpt_dir}")
 
             if rollout_objectives and updates_in_rollout == 0:
@@ -1949,9 +2108,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             print("[online] remaining tail batch ignored to keep fixed rollout_batch_size behavior")
 
     final_dir = output_root / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    _unwrap_model(model).save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
+    _save_model_and_tokenizer(model, tokenizer, final_dir)
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
         f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, "

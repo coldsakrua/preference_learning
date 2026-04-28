@@ -60,6 +60,15 @@ lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
+use_deepspeed=${USE_DEEPSPEED:-true}
+deepspeed_config_path=${DEEPSPEED_CONFIG_PATH:-}
+deepspeed_zero_stage=${DEEPSPEED_ZERO_STAGE:-2}
+deepspeed_offload_optimizer=${DEEPSPEED_OFFLOAD_OPTIMIZER:-false}
+deepspeed_offload_param=${DEEPSPEED_OFFLOAD_PARAM:-false}
+deepspeed_reduce_bucket_size=${DEEPSPEED_REDUCE_BUCKET_SIZE:-50000000}
+deepspeed_allgather_bucket_size=${DEEPSPEED_ALLGATHER_BUCKET_SIZE:-50000000}
+deepspeed_stage3_param_persistence_threshold=${DEEPSPEED_STAGE3_PARAM_PERSISTENCE_THRESHOLD:-100000}
+deepspeed_stage3_prefetch_bucket_size=${DEEPSPEED_STAGE3_PREFETCH_BUCKET_SIZE:-50000000}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -76,6 +85,7 @@ mkdir -p "${run_root}" "${train_out}"
 
 echo "[PREF] run_root=${run_root}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
+echo "[PREF] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
 python train_preference.py \
   --seed "${seed}" \
@@ -110,6 +120,15 @@ python train_preference.py \
   --lora_alpha "${lora_alpha}" \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
+  --use_deepspeed "${use_deepspeed}" \
+  --deepspeed_config_path "${deepspeed_config_path}" \
+  --deepspeed_zero_stage "${deepspeed_zero_stage}" \
+  --deepspeed_offload_optimizer "${deepspeed_offload_optimizer}" \
+  --deepspeed_offload_param "${deepspeed_offload_param}" \
+  --deepspeed_reduce_bucket_size "${deepspeed_reduce_bucket_size}" \
+  --deepspeed_allgather_bucket_size "${deepspeed_allgather_bucket_size}" \
+  --deepspeed_stage3_param_persistence_threshold "${deepspeed_stage3_param_persistence_threshold}" \
+  --deepspeed_stage3_prefetch_bucket_size "${deepspeed_stage3_prefetch_bucket_size}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --enable_thinking true \
   --use_all_wrong_gt_preference false \
