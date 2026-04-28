@@ -740,6 +740,24 @@ def _online_rollout_completions_flat_vllm(
 ) -> List[str]:
     from vllm import LLM, SamplingParams
 
+    def _shutdown_vllm_engine(llm_obj: object) -> None:
+        """Best-effort explicit shutdown to avoid GPU memory lingering between rollout and HF backward."""
+        # vLLM versions differ in public cleanup APIs; try the safe options in order.
+        try:
+            sleep_fn = getattr(llm_obj, "sleep", None)
+            if callable(sleep_fn):
+                # level=1: offload/discard most GPU state before shutdown.
+                sleep_fn(level=1)
+        except Exception:
+            pass
+        try:
+            engine = getattr(llm_obj, "llm_engine", None)
+            shutdown_fn = getattr(engine, "shutdown", None) if engine is not None else None
+            if callable(shutdown_fn):
+                shutdown_fn()
+        except Exception:
+            pass
+
     base_model = _unwrap_model(model)
     use_lora = bool(getattr(args, "use_lora", False))
     lora_request = None
@@ -844,6 +862,7 @@ def _online_rollout_completions_flat_vllm(
         for cand in output.outputs:
             completion_flat.append(cand.text)
 
+    _shutdown_vllm_engine(llm)
     del llm
     gc.collect()
     if device.type == "cuda":
