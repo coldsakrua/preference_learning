@@ -3,7 +3,7 @@
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=72:00:00
 #SBATCH --exclude=gpua800n13
@@ -26,10 +26,7 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-world_size=${NPROC_PER_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0,1}" | awk -F, '{print NF}')}
-if [[ -z "${world_size}" || "${world_size}" -lt 1 ]]; then
-  world_size=1
-fi
+world_size=1
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-8b-base}
@@ -49,7 +46,7 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-3072}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
@@ -81,8 +78,8 @@ echo "[PREF] run_root=${run_root}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF] hf_data_parallel=${hf_data_parallel}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-echo "[PREF] torchrun world_size=${world_size}"
-torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" train_preference.py \
+echo "[PREF] python world_size=${world_size}"
+python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \

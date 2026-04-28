@@ -90,8 +90,8 @@ echo "[PREF-OPSD] dataset_path=${dataset_path}"
 echo "[PREF-OPSD] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF-OPSD] online mode: vLLM rollout + HF preference update (thinking enabled)"
 
-echo "[PREF-OPSD] torchrun world_size=${world_size}"
-torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" train_preference_opsd_thinking.py \
+echo "[PREF-OPSD] python world_size=${world_size}"
+python train_preference_opsd_thinking.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \

@@ -39,7 +39,7 @@ max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
 online_steps=${ONLINE_STEPS:-80}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-32}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
@@ -49,7 +49,7 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-4096}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
@@ -79,8 +79,8 @@ mkdir -p "${run_root}" "${train_out}"
 echo "[PREF] run_root=${run_root}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-echo "[PREF] torchrun world_size=${world_size}"
-torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" train_preference.py \
+echo "[PREF] python world_size=${world_size}"
+python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -115,7 +115,7 @@ torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" 
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --gradient_checkpointing true \
-  --rollout_compute_entropy false \
+  --rollout_compute_entropy true \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \

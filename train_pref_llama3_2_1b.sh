@@ -77,8 +77,8 @@ echo "[PREF-LLAMA] run_root=${run_root}"
 echo "[PREF-LLAMA] model_path=${model_path}"
 echo "[PREF-LLAMA] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF-LLAMA] online mode: vLLM rollout + HF preference update"
-echo "[PREF-LLAMA] torchrun world_size=${world_size}"
-torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" train_preference.py \
+echo "[PREF-LLAMA] python world_size=${world_size}"
+python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
