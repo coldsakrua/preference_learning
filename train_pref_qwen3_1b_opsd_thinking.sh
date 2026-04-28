@@ -98,11 +98,7 @@ echo "[PREF-OPSD] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}
 echo "[PREF-OPSD] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[PREF-OPSD] online mode: vLLM rollout + HF preference update (thinking enabled)"
 
-if [[ "${use_deepspeed}" == "true" ]]; then
-  launcher=(deepspeed --num_gpus=1)
-else
-  launcher=(python)
-fi
+launcher=(deepspeed --num_gpus=1)
 
 "${launcher[@]}" train_preference_opsd_thinking.py \
   --seed "${seed}" \

@@ -33,23 +33,23 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
-online_steps=${ONLINE_STEPS:-20}
+online_steps=${ONLINE_STEPS:-80}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
 top_k=${TOP_K:-20}
 min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
-max_new_tokens=${MAX_NEW_TOKENS:-3072}
+max_new_tokens=${MAX_NEW_TOKENS:-4096}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
@@ -85,7 +85,7 @@ echo "[PREF] run_root=${run_root}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-python train_preference.py \
+deepspeed --num_gpus=1 train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -128,6 +128,8 @@ python train_preference.py \
   --deepspeed_stage3_param_persistence_threshold "${deepspeed_stage3_param_persistence_threshold}" \
   --deepspeed_stage3_prefetch_bucket_size "${deepspeed_stage3_prefetch_bucket_size}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
+  --gradient_checkpointing false \
+  --rollout_compute_entropy false \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \

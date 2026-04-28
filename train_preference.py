@@ -657,6 +657,7 @@ def _compute_sequence_logps_and_hidden_batch(
     max_length: int,
     device: torch.device,
     hidden_layer_offset: int,
+    compute_entropy: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_ids, attention_mask, labels = _labeled_batch_tensors(
         tokenizer, prompt_texts, completion_texts, max_length, device
@@ -668,7 +669,10 @@ def _compute_sequence_logps_and_hidden_batch(
         use_cache=False,
     )
     seq_logps = _seq_logps_from_logits_labels(outputs.logits, labels)
-    seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
+    if compute_entropy:
+        seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
+    else:
+        seq_entropy = torch.zeros_like(seq_logps)
     hidden_states = outputs.hidden_states
     if hidden_states is None or len(hidden_states) == 0:
         raise RuntimeError("Model did not return hidden_states; cannot run hidden-state pair mining.")
@@ -721,6 +725,7 @@ def build_rollout_trajectories_for_prompt(
                 max_length=args.max_length,
                 device=device,
                 hidden_layer_offset=args.hidden_layer_offset,
+                compute_entropy=args.rollout_compute_entropy,
             )
             avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
             avg_entropies.extend([float(v) for v in seq_entropy.detach().cpu().tolist()])
@@ -1492,6 +1497,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"online_pref_loss_only={args.online_pref_loss_only}, "
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
+        f"rollout_compute_entropy={args.rollout_compute_entropy}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
         f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}, "
         f"use_deepspeed={use_deepspeed}, "

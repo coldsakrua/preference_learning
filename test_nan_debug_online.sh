@@ -29,15 +29,15 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-8b-base}
 
 # Keep NaN-debug parameters aligned with 1b preference training defaults.
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-1000000}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
-online_steps=${ONLINE_STEPS:-8}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-8}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-16}
+online_steps=${ONLINE_STEPS:-1}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-8}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-1}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
@@ -47,15 +47,17 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-3072}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 online_hard_grad_norm_cap=${ONLINE_HARD_GRAD_NORM_CAP:-1.5}
+gradient_checkpointing=${GRADIENT_CHECKPOINTING:-false}
+rollout_compute_entropy=${ROLLOUT_COMPUTE_ENTROPY:-false}
 
 use_lora=${USE_LORA:-true}
 lora_r=${LORA_R:-64}
@@ -92,11 +94,7 @@ run_case() {
   echo "[NAN-DEBUG] case=${case_name} -> ${log_file}"
   echo "[NAN-DEBUG] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 
-  if [[ "${use_deepspeed}" == "true" ]]; then
-    launcher=(deepspeed --num_gpus=1)
-  else
-    launcher=(python)
-  fi
+  launcher=(deepspeed --num_gpus=1)
 
   "${launcher[@]}" train_preference.py \
     --seed "${seed}" \
@@ -144,8 +142,9 @@ run_case() {
     --deepspeed_stage3_param_persistence_threshold "${deepspeed_stage3_param_persistence_threshold}" \
     --deepspeed_stage3_prefetch_bucket_size "${deepspeed_stage3_prefetch_bucket_size}" \
     --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
+    --gradient_checkpointing "${gradient_checkpointing}" \
+    --rollout_compute_entropy "${rollout_compute_entropy}" \
     --enable_thinking false \
-    --use_all_wrong_gt_preference true \
     --online_pref_min_avg_logprob_chosen -3 \
     --online_pref_min_avg_logprob_rejected -3 \
     --online_pref_loss_only "${online_pref_loss_only}" \
@@ -158,10 +157,10 @@ run_case() {
 }
 
 # 1) Full mixed objective
-# run_case "mixed" "false" "false" "1.0" "0.25" "0.5"
+run_case "mixed" "false" "false" "1.0" "0.25" "0.5"
 
 # 2) Preference-only branch (disable MLE/GT branch)
-run_case "pref_only" "true" "false" "0.0" "0.25" "0.0"
+# run_case "pref_only" "true" "false" "0.0" "0.25" "0.0"
 
 # 3) MLE-only-on-correct branch
 # run_case "mle_only" "false" "true" "1.0" "0.0" "0.0"

@@ -49,7 +49,7 @@ logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.5}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
@@ -91,7 +91,7 @@ echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[PREF] hf_data_parallel=${hf_data_parallel}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-python train_preference.py \
+deepspeed --num_gpus=2 train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -134,6 +134,8 @@ python train_preference.py \
   --deepspeed_stage3_param_persistence_threshold "${deepspeed_stage3_param_persistence_threshold}" \
   --deepspeed_stage3_prefetch_bucket_size "${deepspeed_stage3_prefetch_bucket_size}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
+  --gradient_checkpointing false \
+  --rollout_compute_entropy false \
   --hf_data_parallel "${hf_data_parallel}" \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \

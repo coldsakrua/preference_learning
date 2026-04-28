@@ -85,7 +85,7 @@ echo "[DAPO-PREF-MLE-ONLY] run_root=${run_root}"
 echo "[DAPO-PREF-MLE-ONLY] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[DAPO-PREF-MLE-ONLY] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[DAPO-PREF-MLE-ONLY] online mode: only correct trajectories contribute to MLE loss"
-python train_preference.py \
+deepspeed --num_gpus=1 train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \

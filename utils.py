@@ -414,6 +414,15 @@ def compute_prompt_rarity_weight(
 
 def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Online DAPO preference training with vLLM rollout.")
+    # Compatibility arg injected by DeepSpeed/Torch distributed launchers.
+    parser.add_argument(
+        "--local_rank",
+        "--local-rank",
+        dest="local_rank",
+        type=int,
+        default=-1,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_path", type=str, default="/path/to/dapo-math-17k.parquet")
     parser.add_argument(
@@ -553,6 +562,15 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--positive_weight_tau", type=float, default=1.0, help="Tau in softmax(tau * avg_nll) for correct trajectories.")
     parser.add_argument("--hidden_layer_offset", type=int, default=4, help="Use hidden_states[-hidden_layer_offset] for hidden-state pooling.")
     parser.add_argument("--rollout_feature_micro_batch_size", type=int, default=8, help="Micro-batch size for rollout feature extraction (avg_logprob + hidden_vec).")
+    parser.add_argument(
+        "--rollout_compute_entropy",
+        type=str2bool,
+        default=True,
+        help=(
+            "Whether to compute rollout sequence entropy from full-vocab logits. "
+            "Disable to reduce VRAM during rollout feature extraction."
+        ),
+    )
     parser.add_argument("--use_all_wrong_gt_preference", type=str2bool, default=True, help="Enable GT-positive preference branch for all-wrong prompts.")
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument(
