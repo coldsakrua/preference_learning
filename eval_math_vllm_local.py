@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -97,6 +98,53 @@ def load_jsonl_examples(path: Path, limit: Optional[int]) -> List[Dict[str, Any]
     return rows
 
 
+def _extract_gsm8k_final_answer(answer_text: str) -> str:
+    """
+    Extract the final GSM8K answer.
+    Typical format ends with: '#### 72'
+    """
+    text = str(answer_text or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"####\s*(.+?)\s*$", text, flags=re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Fallback: use last non-empty line if no #### marker exists.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def load_gsm8k_hf_examples(
+    path: Path,
+    limit: Optional[int],
+    gsm8k_config: str = "main",
+    gsm8k_split: str = "test",
+) -> List[Dict[str, Any]]:
+    """
+    Load GSM8K from a HuggingFace-datasets style directory.
+    Expected fields: question, answer
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise ImportError(
+            "Loading GSM8K directory requires `datasets`. Install with: pip install datasets"
+        ) from e
+
+    ds = load_dataset(str(path), gsm8k_config, split=gsm8k_split)
+    rows: List[Dict[str, Any]] = []
+    for i, o in enumerate(ds):
+        problem = str(o.get("question", "")).strip()
+        gt = _extract_gsm8k_final_answer(str(o.get("answer", "")))
+        if not problem or not gt:
+            continue
+        sid = str(o.get("id", i)).strip()
+        rows.append({"id": sid, "problem": problem, "ground_truth": gt})
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows
+
+
 def _parquet_loader_kind(path: Path) -> str:
     """Return 'dapo', 'amo_qa', or 'problem_answer' based on Parquet schema."""
     schema = pq.ParquetFile(path).schema_arrow
@@ -105,13 +153,16 @@ def _parquet_loader_kind(path: Path) -> str:
         return "dapo"
     if "problem" in names and "answer" in names:
         return "problem_answer"
+    if "question" in names and "answer" in names:
+        # Keep GSM8K parquet files compatible with the generic problem+answer loader.
+        return "problem_answer"
     if "prompt" in names and "answer" in names:
         pt = schema.field("prompt").type
         if pa.types.is_string(pt) or pa.types.is_large_string(pt):
             return "amo_qa"
     raise ValueError(
         f"Unsupported parquet schema in {path}; "
-        f"need DAPO (reward_model+…), or string prompt+answer, or problem+answer. "
+        f"need DAPO (reward_model+…), or string prompt+answer, or problem/question+answer. "
         f"Columns: {sorted(names)}"
     )
 
@@ -151,20 +202,23 @@ def load_problem_answer_parquet_examples(path: Path, limit: Optional[int]) -> Li
     rows: List[Dict[str, Any]] = []
     pf = pq.ParquetFile(path)
     names = pf.schema_arrow.names
+    text_col = "problem" if "problem" in names else "question" if "question" in names else None
+    if text_col is None:
+        raise ValueError(f"{path} has no 'problem' or 'question' column.")
     id_col: Optional[str] = None
     if "problem_idx" in names:
         id_col = "problem_idx"
     elif "id" in names:
         id_col = "id"
-    cols = ["problem", "answer"]
+    cols = [text_col, "answer"]
     if id_col:
-        cols = [id_col, "problem", "answer"]
+        cols = [id_col, text_col, "answer"]
     for batch in pf.iter_batches(batch_size=512, columns=cols):
         if id_col:
             ids = batch.column(id_col).to_pylist()
         else:
             ids = None
-        problems = batch.column("problem").to_pylist()
+        problems = batch.column(text_col).to_pylist()
         answers = batch.column("answer").to_pylist()
         for i, (pr, ans) in enumerate(zip(problems, answers)):
             problem = str(pr).strip() if pr is not None else ""
@@ -210,7 +264,24 @@ def load_dapo_parquet_examples(path: Path, limit: Optional[int]) -> List[Dict[st
     return rows
 
 
-def load_examples(path: Path, fmt: str, limit: Optional[int]) -> List[Dict[str, Any]]:
+def load_examples(
+    path: Path,
+    fmt: str,
+    limit: Optional[int],
+    gsm8k_config: str = "main",
+    gsm8k_split: str = "test",
+) -> List[Dict[str, Any]]:
+    if fmt == "auto" and path.is_dir():
+        has_gsm8k_meta = (
+            (path / "dataset_infos.json").is_file() and (path / "README.md").is_file()
+        )
+        if has_gsm8k_meta:
+            fmt = "gsm8k_hf"
+        else:
+            raise ValueError(
+                f"Cannot auto-detect format for directory {path}; set --data-format explicitly."
+            )
+
     if fmt == "auto":
         suf = path.suffix.lower()
         if suf == ".jsonl":
@@ -232,6 +303,8 @@ def load_examples(path: Path, fmt: str, limit: Optional[int]) -> List[Dict[str, 
         return load_amo_qa_parquet_examples(path, limit)
     if fmt == "problem_answer_parquet":
         return load_problem_answer_parquet_examples(path, limit)
+    if fmt == "gsm8k_hf":
+        return load_gsm8k_hf_examples(path, limit, gsm8k_config=gsm8k_config, gsm8k_split=gsm8k_split)
     raise ValueError(f"Unknown --data-format: {fmt}")
 
 
@@ -378,6 +451,7 @@ for _aliases, _rel in (
     (("math500", "math-500"), "MATH-500/test.parquet"),
     (("minerva",), "Minerva/test.parquet"),
     (("olympiad", "olympiad-bench", "olympiad_bench"), "Olympiad-Bench/test.parquet"),
+    (("gsm8k",), "gsm8k/socratic/test-00000-of-00001.parquet"),
 ):
     for _a in _aliases:
         _DATASET_REL_PATH[_a] = _rel
@@ -394,8 +468,8 @@ def resolve_dataset_path(name: str, data_root: Path) -> Path:
         known = ", ".join(sorted(set(_DATASET_REL_PATH.keys())))
         raise SystemExit(f"Unknown dataset {name!r}. Known aliases: {known}\n  (--data-root={data_root})")
     p = (data_root / rel).resolve()
-    if not p.is_file():
-        raise FileNotFoundError(f"Dataset {name!r} -> expected file missing: {p}")
+    if not p.exists():
+        raise FileNotFoundError(f"Dataset {name!r} -> expected path missing: {p}")
     return p
 
 
@@ -475,7 +549,20 @@ def main() -> None:
         "--data-format",
         type=str,
         default="auto",
-        choices=["auto", "jsonl", "dapo_parquet", "amo_qa_parquet", "problem_answer_parquet"],
+        choices=["auto", "jsonl", "dapo_parquet", "amo_qa_parquet", "problem_answer_parquet", "gsm8k_hf"],
+    )
+    parser.add_argument(
+        "--gsm8k-config",
+        type=str,
+        default="main",
+        choices=["main", "socratic"],
+        help="Used when --data-format=gsm8k_hf (or auto-detected gsm8k directory).",
+    )
+    parser.add_argument(
+        "--gsm8k-split",
+        type=str,
+        default="test",
+        help="Used when --data-format=gsm8k_hf (default: test).",
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -612,10 +699,23 @@ def main() -> None:
     tag_counts: Dict[str, int] = {}
     for raw, tag_override in load_queue:
         data_path = Path(raw).expanduser().resolve()
-        if not data_path.is_file():
-            raise FileNotFoundError(data_path)
+        if args.data_format == "gsm8k_hf":
+            if not data_path.exists():
+                raise FileNotFoundError(data_path)
+        else:
+            if not data_path.is_file():
+                raise FileNotFoundError(data_path)
         resolved_paths.append(data_path)
-        batch = load_examples(data_path, args.data_format, limit)
+        if args.data_format == "gsm8k_hf":
+            batch = load_gsm8k_hf_examples(data_path, limit, gsm8k_config=args.gsm8k_config, gsm8k_split=args.gsm8k_split)
+        else:
+            batch = load_examples(
+                data_path,
+                args.data_format,
+                limit,
+                gsm8k_config=args.gsm8k_config,
+                gsm8k_split=args.gsm8k_split,
+            )
         base_tag = tag_override if tag_override is not None else data_path.stem
         tag_counts[base_tag] = tag_counts.get(base_tag, 0) + 1
         tag = base_tag if tag_counts[base_tag] == 1 else f"{base_tag}_{tag_counts[base_tag]}"

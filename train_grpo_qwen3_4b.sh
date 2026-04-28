@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/grpo_qwen3_4b_2gpu.%j.out
+#SBATCH -o logs/grpo_qwen3_4b.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -24,15 +24,15 @@ export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
 
 seed=${SEED:-42}
 learning_rate=${LEARNING_RATE:-1e-6}
 train_steps=${TRAIN_STEPS:-200}
-global_prompts_per_step=${GLOBAL_PROMPTS_PER_STEP:-4}
-rollouts_per_prompt=${ROLLOUTS_PER_PROMPT:-4}
-per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
-max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
+global_prompts_per_step=${GLOBAL_PROMPTS_PER_STEP:-8}
+rollouts_per_prompt=${ROLLOUTS_PER_PROMPT:-8}
+per_device_train_batch_size=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
+max_prompt_length=${MAX_PROMPT_LENGTH:-512}
 max_completion_length=${MAX_COMPLETION_LENGTH:-4096}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.95}
@@ -53,7 +53,7 @@ lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 lora_target_modules=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
-lora_path=${LORA_PATH-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/pref_qwen3_1b_mixed_diff_1gpu/20260425_022124_job1453738/train/final}
+lora_path=${LORA_PATH-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/pref_4b_1gpu/20260427_101454_job1469254/train/final}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -62,7 +62,7 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/grpo_qwen3_4b_2gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/grpo_qwen3_4b/${run_name}}
 train_out="${run_root}/train"
 mkdir -p "${run_root}" "${train_out}"
 

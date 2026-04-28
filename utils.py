@@ -604,6 +604,15 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
+    parser.add_argument(
+        "--hf_data_parallel",
+        type=str2bool,
+        default=False,
+        help=(
+            "Online HF training forward/backward uses torch.nn.DataParallel on visible GPUs "
+            "when CUDA device count > 1. Keeps single-process control flow compatible with vLLM rollout."
+        ),
+    )
     parser.add_argument("--use_lora", type=str2bool, default=False, help="Train with PEFT LoRA (HF forward + preference loss); vLLM rollout loads base + adapter.")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling.")
