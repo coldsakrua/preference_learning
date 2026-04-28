@@ -6,7 +6,6 @@ import argparse
 import gc
 import json
 import math
-import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,39 +57,6 @@ _WARNED_MISSING_CHAT_TEMPLATE = False
 
 def _empty_lora_health() -> Dict[str, float]:
     return dict(_EMPTY_LORA_HEALTH)
-
-
-def _unwrap_model(model: object) -> object:
-    """Return underlying model for wrappers like DataParallel/DDP."""
-    return getattr(model, "module", model)
-
-
-def _compute_grad_norm(
-    trainable_params: Sequence[torch.nn.Parameter],
-    device: torch.device,
-) -> float:
-    grad_norm_parts = [
-        torch.linalg.vector_norm(p.grad.detach(), ord=2)
-        for p in trainable_params
-        if p.grad is not None
-    ]
-    if not grad_norm_parts:
-        return 0.0
-    total_norm = torch.linalg.vector_norm(torch.stack(grad_norm_parts), ord=2)
-    if isinstance(total_norm, torch.Tensor):
-        return float(total_norm.detach().to(device=device).item())
-    return float(total_norm)
-
-
-def _save_model_and_tokenizer(
-    model: object,
-    tokenizer: object,
-    save_dir: Path,
-) -> None:
-    save_dir.mkdir(parents=True, exist_ok=True)
-    base_model = _unwrap_model(model)
-    base_model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
 
 
 
@@ -581,7 +547,6 @@ def _compute_sequence_logps_and_hidden_batch(
     max_length: int,
     device: torch.device,
     hidden_layer_offset: int,
-    compute_entropy: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_ids, attention_mask, labels = _labeled_batch_tensors(
         tokenizer, prompt_texts, completion_texts, max_length, device
@@ -593,10 +558,7 @@ def _compute_sequence_logps_and_hidden_batch(
         use_cache=False,
     )
     seq_logps = _seq_logps_from_logits_labels(outputs.logits, labels)
-    if compute_entropy:
-        seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
-    else:
-        seq_entropy = torch.zeros_like(seq_logps)
+    seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
     hidden_states = outputs.hidden_states
     if hidden_states is None or len(hidden_states) == 0:
         raise RuntimeError("Model did not return hidden_states; cannot run hidden-state pair mining.")
@@ -649,7 +611,6 @@ def build_rollout_trajectories_for_prompt(
                 max_length=args.max_length,
                 device=device,
                 hidden_layer_offset=args.hidden_layer_offset,
-                compute_entropy=args.rollout_compute_entropy,
             )
             avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
             avg_entropies.extend([float(v) for v in seq_entropy.detach().cpu().tolist()])
@@ -740,32 +701,13 @@ def _online_rollout_completions_flat_vllm(
 ) -> List[str]:
     from vllm import LLM, SamplingParams
 
-    def _shutdown_vllm_engine(llm_obj: object) -> None:
-        """Best-effort explicit shutdown to avoid GPU memory lingering between rollout and HF backward."""
-        # vLLM versions differ in public cleanup APIs; try the safe options in order.
-        try:
-            sleep_fn = getattr(llm_obj, "sleep", None)
-            if callable(sleep_fn):
-                # level=1: offload/discard most GPU state before shutdown.
-                sleep_fn(level=1)
-        except Exception:
-            pass
-        try:
-            engine = getattr(llm_obj, "llm_engine", None)
-            shutdown_fn = getattr(engine, "shutdown", None) if engine is not None else None
-            if callable(shutdown_fn):
-                shutdown_fn()
-        except Exception:
-            pass
-
-    base_model = _unwrap_model(model)
     use_lora = bool(getattr(args, "use_lora", False))
     lora_request = None
     if use_lora:
         vllm_staging_dir.mkdir(parents=True, exist_ok=True)
         adapter_dir = vllm_staging_dir / "lora_adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
-        base_model.save_pretrained(adapter_dir)
+        model.save_pretrained(adapter_dir)
         tokenizer.save_pretrained(adapter_dir)
         ckpt = init_model_path
         try:
@@ -798,7 +740,7 @@ def _online_rollout_completions_flat_vllm(
         }
     elif hf_updates_so_far > 0:
         vllm_staging_dir.mkdir(parents=True, exist_ok=True)
-        base_model.save_pretrained(vllm_staging_dir)
+        model.save_pretrained(vllm_staging_dir)
         tokenizer.save_pretrained(vllm_staging_dir)
         ckpt = str(vllm_staging_dir)
         print(
@@ -862,7 +804,6 @@ def _online_rollout_completions_flat_vllm(
         for cand in output.outputs:
             completion_flat.append(cand.text)
 
-    _shutdown_vllm_engine(llm)
     del llm
     gc.collect()
     if device.type == "cuda":
@@ -987,7 +928,7 @@ def filter_weighted_sft_without_truncation(
 def _online_run_preference_optimizer_step(
     model: object,
     tokenizer: object,
-    optimizer: object,
+    optimizer: AdamW,
     device: torch.device,
     args: argparse.Namespace,
     pref_train_prompts: List[str],
@@ -1185,9 +1126,13 @@ def _online_run_preference_optimizer_step(
     trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
         total_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-        grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
     else:
-        grad_norm = _compute_grad_norm(trainable, device)
+        grad_norm_parts = [torch.linalg.vector_norm(p.grad.detach(), ord=2) for p in trainable if p.grad is not None]
+        if grad_norm_parts:
+            total_norm = torch.linalg.vector_norm(torch.stack(grad_norm_parts), ord=2)
+        else:
+            total_norm = torch.tensor(0.0, device=device)
+    grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
     if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
         optimizer.zero_grad(set_to_none=True)
         return _build_zero_stats("nonfinite_grad_norm", grad_norm_value=grad_norm)
@@ -1236,28 +1181,12 @@ def _online_run_preference_optimizer_step(
 def run_online_preference_training(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    has_local_rank = "LOCAL_RANK" in os.environ
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    use_ddp = has_local_rank and world_size > 1
-    is_main_process = rank == 0 if use_ddp else True
-    if use_ddp:
-        import torch.distributed as dist
-
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        if not dist.is_initialized():
-            dist.init_process_group(backend=backend, init_method="env://")
-
     output_root = Path(args.output_dir).expanduser().resolve()
-    if is_main_process:
-        output_root.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
     online_pairs_path = output_root / "online_pairs.jsonl"
     metrics_jsonl_path = output_root / "training_metrics.jsonl"
 
     def _write_metric(event: str, payload: Dict[str, Any]) -> None:
-        if not is_main_process:
-            return
         rec = {"event": event, **payload}
         with metrics_jsonl_path.open("a", encoding="utf-8") as mf:
             mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1297,14 +1226,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         model = wrap_model_with_lora(model, args)
         model.print_trainable_parameters()
 
-    if torch.cuda.is_available():
-        if use_ddp:
-            torch.cuda.set_device(local_rank)
-            device = torch.device(f"cuda:{local_rank}")
-        else:
-            device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
     if args.gradient_checkpointing:
@@ -1312,26 +1234,6 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         model.config.use_cache = False
         if args.use_lora:
             ensure_input_require_grads_for_checkpointing(model)
-
-    if use_ddp and args.hf_data_parallel:
-        raise ValueError("--hf_data_parallel cannot be true when launching with torchrun/DDP.")
-    if use_ddp and device.type != "cuda":
-        raise ValueError("torchrun/DDP for this script currently requires CUDA.")
-
-    if use_ddp and device.type == "cuda":
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
-        )
-        if is_main_process:
-            print(f"[online] DDP enabled: world_size={world_size}, local_rank={local_rank}", flush=True)
-
-    if args.hf_data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
-        n_gpu = torch.cuda.device_count()
-        model = torch.nn.DataParallel(model, device_ids=list(range(n_gpu)))
-        print(f"[online] HF DataParallel enabled on {n_gpu} GPUs", flush=True)
 
     optimizer = AdamW(
         (p for p in model.parameters() if p.requires_grad),
@@ -1403,11 +1305,8 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"online_pref_loss_only={args.online_pref_loss_only}, "
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
-        f"rollout_compute_entropy={args.rollout_compute_entropy}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
-        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}, "
-        f"gradient_checkpointing={args.gradient_checkpointing}, "
-        f"use_ddp={use_ddp}, world_size={world_size if use_ddp else 1}, rank={rank if use_ddp else 0}"
+        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}"
     )
     _write_metric(
         "run_start",
@@ -1424,18 +1323,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "lambda_pref": args.lambda_pref,
             "lambda_gt": args.lambda_gt,
             "metrics_jsonl": str(metrics_jsonl_path),
-            "gradient_checkpointing": bool(args.gradient_checkpointing),
-            "use_ddp": bool(use_ddp),
-            "world_size": int(world_size if use_ddp else 1),
-            "rank": int(rank if use_ddp else 0),
         },
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
         raise RuntimeError("online_rollout_backend=vllm requires a CUDA device.")
 
     # Persist sampled objectives immediately so online_pairs.jsonl is visible while the job runs.
-    fout = online_pairs_path.open("w", encoding="utf-8", buffering=1) if is_main_process else None
-    try:
+    with online_pairs_path.open("w", encoding="utf-8", buffering=1) as fout:
         for sample in source_iter:
             buffer.append(sample)
             scanned += 1
@@ -1463,53 +1357,24 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             ]
 
             vllm_staging_dir = output_root / "vllm_rollout_ckpt"
-            completion_flat: List[str]
-            if use_ddp:
-                if is_main_process:
-                    if args.online_rollout_backend == "vllm":
-                        completion_flat = _online_rollout_completions_flat_vllm(
-                            args,
-                            model=model,
-                            tokenizer=tokenizer,
-                            device=device,
-                            prompt_texts=prompt_texts,
-                            rollout_steps=rollout_steps,
-                            total_steps_str=total_steps_str,
-                            init_model_path=model_path,
-                            vllm_staging_dir=vllm_staging_dir,
-                            hf_updates_so_far=updates,
-                        )
-                    else:
-                        with torch.no_grad():
-                            completion_flat = _online_rollout_completions_flat_hf(
-                                model, tokenizer, device, prompt_texts, args
-                            )
-                else:
-                    completion_flat = []
-                import torch.distributed as dist
-
-                shared_obj: List[object] = [completion_flat]
-                dist.broadcast_object_list(shared_obj, src=0)
-                completion_flat = shared_obj[0]  # type: ignore[assignment]
+            if args.online_rollout_backend == "vllm":
+                completion_flat = _online_rollout_completions_flat_vllm(
+                    args,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    prompt_texts=prompt_texts,
+                    rollout_steps=rollout_steps,
+                    total_steps_str=total_steps_str,
+                    init_model_path=model_path,
+                    vllm_staging_dir=vllm_staging_dir,
+                    hf_updates_so_far=updates,
+                )
             else:
-                if args.online_rollout_backend == "vllm":
-                    completion_flat = _online_rollout_completions_flat_vllm(
-                        args,
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=device,
-                        prompt_texts=prompt_texts,
-                        rollout_steps=rollout_steps,
-                        total_steps_str=total_steps_str,
-                        init_model_path=model_path,
-                        vllm_staging_dir=vllm_staging_dir,
-                        hf_updates_so_far=updates,
+                with torch.no_grad():
+                    completion_flat = _online_rollout_completions_flat_hf(
+                        model, tokenizer, device, prompt_texts, args
                     )
-                else:
-                    with torch.no_grad():
-                        completion_flat = _online_rollout_completions_flat_hf(
-                            model, tokenizer, device, prompt_texts, args
-                        )
 
             model.train()
 
@@ -1776,11 +1641,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     all_trajectories=trajectories,
                     include_dense_rollouts=args.online_pairs_include_dense_rollouts,
                 )
-                if fout is not None:
-                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            if fout is not None:
-                fout.flush()
+            fout.flush()
 
             print(
                 f"[online] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
@@ -2039,10 +1902,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     )
 
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
-                        if is_main_process:
-                            ckpt_dir = output_root / f"checkpoint-update-{updates}"
-                            _save_model_and_tokenizer(model, tokenizer, ckpt_dir)
-                            print(f"[online] saved checkpoint to {ckpt_dir}")
+                        ckpt_dir = output_root / f"checkpoint-update-{updates}"
+                        ckpt_dir.mkdir(parents=True, exist_ok=True)
+                        model.save_pretrained(ckpt_dir)
+                        tokenizer.save_pretrained(ckpt_dir)
+                        print(f"[online] saved checkpoint to {ckpt_dir}")
 
             if rollout_objectives and updates_in_rollout == 0:
                 hint = (
@@ -2072,13 +1936,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
         if buffer and (args.online_steps is None or rollout_steps < args.online_steps):
             print("[online] remaining tail batch ignored to keep fixed rollout_batch_size behavior")
-    finally:
-        if fout is not None:
-            fout.close()
 
     final_dir = output_root / "final"
-    if is_main_process:
-        _save_model_and_tokenizer(model, tokenizer, final_dir)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
         f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, "
@@ -2108,12 +1970,6 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "metrics_jsonl": str(metrics_jsonl_path),
         },
     )
-    if use_ddp:
-        import torch.distributed as dist
-
-        dist.barrier()
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def main() -> None:

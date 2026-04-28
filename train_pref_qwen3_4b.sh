@@ -26,10 +26,6 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-world_size=${NPROC_PER_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0}" | awk -F, '{print NF}')}
-if [[ -z "${world_size}" || "${world_size}" -lt 1 ]]; then
-  world_size=1
-fi
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
@@ -37,23 +33,23 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
-online_steps=${ONLINE_STEPS:-80}
+online_steps=${ONLINE_STEPS:-20}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-32}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
 top_k=${TOP_K:-20}
 min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
-max_new_tokens=${MAX_NEW_TOKENS:-4096}
+max_new_tokens=${MAX_NEW_TOKENS:-3072}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
@@ -79,7 +75,6 @@ mkdir -p "${run_root}" "${train_out}"
 echo "[PREF] run_root=${run_root}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-echo "[PREF] python world_size=${world_size}"
 python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
@@ -114,8 +109,6 @@ python train_preference.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --gradient_checkpointing true \
-  --rollout_compute_entropy true \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \
