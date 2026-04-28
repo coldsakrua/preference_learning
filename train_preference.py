@@ -1217,11 +1217,12 @@ def _online_run_preference_optimizer_step(
 def run_online_preference_training(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    has_local_rank = "LOCAL_RANK" in os.environ
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    use_ddp = world_size > 1
-    is_main_process = rank == 0
+    use_ddp = has_local_rank and world_size > 1
+    is_main_process = rank == 0 if use_ddp else True
     if use_ddp:
         import torch.distributed as dist
 
@@ -1288,12 +1289,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     model.to(device)
     model.train()
     if args.gradient_checkpointing:
-        try:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        except TypeError:
-            model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable()
         model.config.use_cache = False
         if args.use_lora:
             ensure_input_require_grads_for_checkpointing(model)
@@ -1392,7 +1388,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
         f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}, "
         f"gradient_checkpointing={args.gradient_checkpointing}, "
-        f"world_size={world_size}, rank={rank}"
+        f"use_ddp={use_ddp}, world_size={world_size if use_ddp else 1}, rank={rank if use_ddp else 0}"
     )
     _write_metric(
         "run_start",
@@ -1409,9 +1405,10 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "lambda_pref": args.lambda_pref,
             "lambda_gt": args.lambda_gt,
             "metrics_jsonl": str(metrics_jsonl_path),
-            "world_size": int(world_size),
-            "rank": int(rank),
             "gradient_checkpointing": bool(args.gradient_checkpointing),
+            "use_ddp": bool(use_ddp),
+            "world_size": int(world_size if use_ddp else 1),
+            "rank": int(rank if use_ddp else 0),
         },
     )
     if args.online_rollout_backend == "vllm" and device.type != "cuda":
