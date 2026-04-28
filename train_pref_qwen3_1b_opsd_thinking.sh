@@ -26,8 +26,10 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export MASTER_PORT="${MASTER_PORT:-29500}"
+world_size=${NPROC_PER_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0}" | awk -F, '{print NF}')}
+if [[ -z "${world_size}" || "${world_size}" -lt 1 ]]; then
+  world_size=1
+fi
 
 # OPSD source can be a directory/file/glob.
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/OPSD}
@@ -62,15 +64,6 @@ lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
-use_deepspeed=${USE_DEEPSPEED:-true}
-deepspeed_config_path=${DEEPSPEED_CONFIG_PATH:-}
-deepspeed_zero_stage=${DEEPSPEED_ZERO_STAGE:-2}
-deepspeed_offload_optimizer=${DEEPSPEED_OFFLOAD_OPTIMIZER:-false}
-deepspeed_offload_param=${DEEPSPEED_OFFLOAD_PARAM:-false}
-deepspeed_reduce_bucket_size=${DEEPSPEED_REDUCE_BUCKET_SIZE:-50000000}
-deepspeed_allgather_bucket_size=${DEEPSPEED_ALLGATHER_BUCKET_SIZE:-50000000}
-deepspeed_stage3_param_persistence_threshold=${DEEPSPEED_STAGE3_PARAM_PERSISTENCE_THRESHOLD:-100000}
-deepspeed_stage3_prefetch_bucket_size=${DEEPSPEED_STAGE3_PREFETCH_BUCKET_SIZE:-50000000}
 
 opsd_processed_parquet=${OPSD_PROCESSED_PARQUET:-}
 opsd_overwrite_processed=${OPSD_OVERWRITE_PROCESSED:-false}
@@ -95,12 +88,10 @@ mkdir -p "${run_root}" "${train_out}"
 echo "[PREF-OPSD] run_root=${run_root}"
 echo "[PREF-OPSD] dataset_path=${dataset_path}"
 echo "[PREF-OPSD] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[PREF-OPSD] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[PREF-OPSD] online mode: vLLM rollout + HF preference update (thinking enabled)"
 
-launcher=(deepspeed --num_gpus=1)
-
-"${launcher[@]}" train_preference_opsd_thinking.py \
+echo "[PREF-OPSD] torchrun world_size=${world_size}"
+torchrun --nproc_per_node="${world_size}" --master_port="${MASTER_PORT:-29501}" train_preference_opsd_thinking.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -133,16 +124,8 @@ launcher=(deepspeed --num_gpus=1)
   --lora_alpha "${lora_alpha}" \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
-  --use_deepspeed "${use_deepspeed}" \
-  --deepspeed_config_path "${deepspeed_config_path}" \
-  --deepspeed_zero_stage "${deepspeed_zero_stage}" \
-  --deepspeed_offload_optimizer "${deepspeed_offload_optimizer}" \
-  --deepspeed_offload_param "${deepspeed_offload_param}" \
-  --deepspeed_reduce_bucket_size "${deepspeed_reduce_bucket_size}" \
-  --deepspeed_allgather_bucket_size "${deepspeed_allgather_bucket_size}" \
-  --deepspeed_stage3_param_persistence_threshold "${deepspeed_stage3_param_persistence_threshold}" \
-  --deepspeed_stage3_prefetch_bucket_size "${deepspeed_stage3_prefetch_bucket_size}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
+  --gradient_checkpointing true \
   --enable_thinking true \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \

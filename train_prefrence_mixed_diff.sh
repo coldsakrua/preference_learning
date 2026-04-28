@@ -75,7 +75,7 @@ echo "[PREF-MIXED-DIFF] run_root=${run_root}"
 echo "[PREF-MIXED-DIFF] model_path=${model_path}"
 echo "[PREF-MIXED-DIFF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF-MIXED-DIFF] mixed prompt loss = DPO-style on (mean correct logp - mean wrong logp)"
-deepspeed --num_gpus=1 train_preference_mixed_diff.py \
+python train_preference_mixed_diff.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
