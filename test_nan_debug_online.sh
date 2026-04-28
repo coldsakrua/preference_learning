@@ -25,6 +25,8 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export MASTER_PORT="${MASTER_PORT:-29500}"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
@@ -90,7 +92,13 @@ run_case() {
   echo "[NAN-DEBUG] case=${case_name} -> ${log_file}"
   echo "[NAN-DEBUG] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 
-  python train_preference.py \
+  if [[ "${use_deepspeed}" == "true" ]]; then
+    launcher=(deepspeed --num_gpus=1)
+  else
+    launcher=(python)
+  fi
+
+  "${launcher[@]}" train_preference.py \
     --seed "${seed}" \
     --dataset_path "${dataset_path}" \
     --model_path "${model_path}" \

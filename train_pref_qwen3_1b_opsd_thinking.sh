@@ -26,6 +26,8 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export MASTER_PORT="${MASTER_PORT:-29500}"
 
 # OPSD source can be a directory/file/glob.
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/OPSD}
@@ -96,7 +98,13 @@ echo "[PREF-OPSD] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}
 echo "[PREF-OPSD] use_deepspeed=${use_deepspeed} zero_stage=${deepspeed_zero_stage} offload_opt=${deepspeed_offload_optimizer}"
 echo "[PREF-OPSD] online mode: vLLM rollout + HF preference update (thinking enabled)"
 
-python train_preference_opsd_thinking.py \
+if [[ "${use_deepspeed}" == "true" ]]; then
+  launcher=(deepspeed --num_gpus=1)
+else
+  launcher=(python)
+fi
+
+"${launcher[@]}" train_preference_opsd_thinking.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \

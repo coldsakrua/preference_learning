@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -1388,6 +1389,26 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     ds_config: Optional[Dict[str, Any]] = None
     if use_deepspeed:
         import deepspeed
+
+        # Avoid MPI discovery (mpi4py/libmpi) dependency in single-node jobs.
+        if "RANK" not in os.environ:
+            os.environ["RANK"] = "0"
+        if "WORLD_SIZE" not in os.environ:
+            os.environ["WORLD_SIZE"] = "1"
+        if "LOCAL_RANK" not in os.environ:
+            os.environ["LOCAL_RANK"] = "0"
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(getattr(args, "master_port", 29500))
+
+        dist_backend = "nccl" if torch.cuda.is_available() else "gloo"
+        deepspeed.init_distributed(
+            dist_backend=dist_backend,
+            auto_mpi_discovery=False,
+            init_method="env://",
+            verbose=True,
+        )
 
         ds_config = _load_deepspeed_config(args)
         model, optimizer, _, _ = deepspeed.initialize(
