@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -30,6 +32,124 @@ def _first_nonfinite_grad(model: object) -> tuple[str, int, int]:
             if nan_cnt > 0 or inf_cnt > 0:
                 return str(name), nan_cnt, inf_cnt
     return "", 0, 0
+
+
+def _collect_nonfinite_grad_params(model: object, max_items: int) -> List[Dict[str, Any]]:
+    named_params = getattr(model, "named_parameters", None)
+    if not callable(named_params):
+        return []
+    out: List[Dict[str, Any]] = []
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p is None or (not getattr(p, "requires_grad", False)) or p.grad is None:
+                continue
+            g = p.grad.detach()
+            nan_cnt = int(torch.isnan(g).sum().item())
+            inf_cnt = int(torch.isinf(g).sum().item())
+            if nan_cnt <= 0 and inf_cnt <= 0:
+                continue
+            finite_mask = torch.isfinite(g)
+            finite_cnt = int(finite_mask.sum().item())
+            max_abs_finite = 0.0
+            if finite_cnt > 0:
+                max_abs_finite = float(g[finite_mask].abs().max().item())
+            out.append(
+                {
+                    "name": str(name),
+                    "shape": list(g.shape),
+                    "numel": int(g.numel()),
+                    "nan_cnt": nan_cnt,
+                    "inf_cnt": inf_cnt,
+                    "finite_cnt": finite_cnt,
+                    "max_abs_finite": max_abs_finite,
+                }
+            )
+            if len(out) >= max_items:
+                break
+    return out
+
+
+def _tensor_stats(t: torch.Tensor, name: str) -> Dict[str, Any]:
+    x = t.detach()
+    numel = int(x.numel())
+    finite_mask = torch.isfinite(x)
+    finite_cnt = int(finite_mask.sum().item())
+    nan_cnt = int(torch.isnan(x).sum().item())
+    inf_cnt = int(torch.isinf(x).sum().item())
+    out: Dict[str, Any] = {
+        "name": name,
+        "shape": list(x.shape),
+        "numel": numel,
+        "finite_cnt": finite_cnt,
+        "nan_cnt": nan_cnt,
+        "inf_cnt": inf_cnt,
+    }
+    if finite_cnt > 0:
+        f = x[finite_mask]
+        out.update(
+            {
+                "min": float(f.min().item()),
+                "max": float(f.max().item()),
+                "mean": float(f.mean().item()),
+                "std": float(f.std(unbiased=False).item()) if finite_cnt > 1 else 0.0,
+                "max_abs": float(f.abs().max().item()),
+            }
+        )
+    return out
+
+
+def _stats_line(stats: Dict[str, Any]) -> str:
+    base_line = (
+        f"{stats['name']} shape={stats['shape']} numel={stats['numel']} "
+        f"finite={stats['finite_cnt']} nan={stats['nan_cnt']} inf={stats['inf_cnt']}"
+    )
+    if "min" not in stats:
+        return base_line
+    return (
+        base_line
+        + f" min={stats['min']:.6f} max={stats['max']:.6f}"
+        + f" mean={stats['mean']:.6f} std={stats['std']:.6f} max_abs={stats['max_abs']:.6f}"
+    )
+
+
+def _grad_overview(model: object) -> Dict[str, Any]:
+    named_params = getattr(model, "named_parameters", None)
+    if not callable(named_params):
+        return {}
+    total_numel = 0
+    finite_cnt = 0
+    nan_cnt = 0
+    inf_cnt = 0
+    grad_param_cnt = 0
+    nonfinite_param_cnt = 0
+    max_abs_finite = 0.0
+    with torch.no_grad():
+        for _name, p in model.named_parameters():
+            if p is None or (not getattr(p, "requires_grad", False)) or p.grad is None:
+                continue
+            grad_param_cnt += 1
+            g = p.grad.detach()
+            total_numel += int(g.numel())
+            finite_mask = torch.isfinite(g)
+            cur_finite = int(finite_mask.sum().item())
+            cur_nan = int(torch.isnan(g).sum().item())
+            cur_inf = int(torch.isinf(g).sum().item())
+            finite_cnt += cur_finite
+            nan_cnt += cur_nan
+            inf_cnt += cur_inf
+            if cur_nan > 0 or cur_inf > 0:
+                nonfinite_param_cnt += 1
+            if cur_finite > 0:
+                max_abs_finite = max(max_abs_finite, float(g[finite_mask].abs().max().item()))
+    return {
+        "grad_param_cnt": grad_param_cnt,
+        "nonfinite_param_cnt": nonfinite_param_cnt,
+        "total_numel": total_numel,
+        "finite_cnt": finite_cnt,
+        "nan_cnt": nan_cnt,
+        "inf_cnt": inf_cnt,
+        "max_abs_finite": max_abs_finite,
+    }
 
 
 def _first_nonfinite_tensor(t: torch.Tensor, name: str) -> Optional[str]:
@@ -70,6 +190,17 @@ def _trace(msg: str, args: argparse.Namespace) -> None:
         print(f"[nan-trace] {msg}", flush=True)
 
 
+def _trace_event(args: argparse.Namespace, event: str, payload: Dict[str, Any]) -> None:
+    if not getattr(args, "nan_trace_write_jsonl", True):
+        return
+    path = getattr(args, "_nan_trace_jsonl_path", "")
+    if not path:
+        return
+    rec = {"event": event, **payload}
+    with Path(path).open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def _online_run_pref_only_nan_trace_step(
     model: object,
     tokenizer: object,
@@ -108,6 +239,11 @@ def _online_run_pref_only_nan_trace_step(
     pref_weight_sum = 0.0
 
     _trace(f"optimizer_step_start pref_batch={pref_batch} total_weight={total_weight:.6f} mb_pref={mb_pref}", args)
+    _trace_event(
+        args,
+        "optimizer_step_start",
+        {"pref_batch": int(pref_batch), "total_weight": float(total_weight), "mb_pref": int(mb_pref)},
+    )
 
     for start in range(0, pref_batch, mb_pref):
         end = min(start + mb_pref, pref_batch)
@@ -118,6 +254,10 @@ def _online_run_pref_only_nan_trace_step(
 
         _trace(f"chunk[{start}:{end}] forward/chosen_logps", args)
         chosen_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, ch, args.max_length, device)
+        if args.nan_trace_log_tensor_stats:
+            stats = _tensor_stats(chosen_logps, f"pref.chosen_logps[{start}:{end}]")
+            _trace(_stats_line(stats), args)
+            _trace_event(args, "tensor_stats", stats)
         bad_msg = _first_nonfinite_tensor(chosen_logps, f"pref.chosen_logps[{start}:{end}]")
         if bad_msg is not None:
             optimizer.zero_grad(set_to_none=True)
@@ -125,6 +265,10 @@ def _online_run_pref_only_nan_trace_step(
 
         _trace(f"chunk[{start}:{end}] forward/rejected_logps", args)
         rejected_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, rj, args.max_length, device)
+        if args.nan_trace_log_tensor_stats:
+            stats = _tensor_stats(rejected_logps, f"pref.rejected_logps[{start}:{end}]")
+            _trace(_stats_line(stats), args)
+            _trace_event(args, "tensor_stats", stats)
         bad_msg = _first_nonfinite_tensor(rejected_logps, f"pref.rejected_logps[{start}:{end}]")
         if bad_msg is not None:
             optimizer.zero_grad(set_to_none=True)
@@ -133,12 +277,20 @@ def _online_run_pref_only_nan_trace_step(
         preference_gap = chosen_logps - rejected_logps
         if args.online_gap_clip_abs > 0:
             preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
+        if args.nan_trace_log_tensor_stats:
+            stats = _tensor_stats(preference_gap, f"pref.gap[{start}:{end}]")
+            _trace(_stats_line(stats), args)
+            _trace_event(args, "tensor_stats", stats)
         bad_msg = _first_nonfinite_tensor(preference_gap, f"pref.gap[{start}:{end}]")
         if bad_msg is not None:
             optimizer.zero_grad(set_to_none=True)
             return _build_zero_stats(f"nonfinite_detected_in_gap({bad_msg})")
 
         pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
+        if args.nan_trace_log_tensor_stats:
+            stats = _tensor_stats(pref_loss_vec, f"pref.loss_vec[{start}:{end}]")
+            _trace(_stats_line(stats), args)
+            _trace_event(args, "tensor_stats", stats)
         bad_msg = _first_nonfinite_tensor(pref_loss_vec, f"pref.loss_vec[{start}:{end}]")
         if bad_msg is not None:
             optimizer.zero_grad(set_to_none=True)
@@ -157,9 +309,39 @@ def _online_run_pref_only_nan_trace_step(
 
         _trace(f"chunk[{start}:{end}] backward(loss={loss_chunk_val:.6f})", args)
         loss_chunk.backward()
+        if args.nan_trace_log_grad_overview:
+            overview = _grad_overview(model)
+            _trace(
+                "grad_overview "
+                f"chunk=[{start},{end}) grad_param_cnt={overview.get('grad_param_cnt', 0)} "
+                f"nonfinite_param_cnt={overview.get('nonfinite_param_cnt', 0)} "
+                f"nan_cnt={overview.get('nan_cnt', 0)} inf_cnt={overview.get('inf_cnt', 0)} "
+                f"max_abs_finite={overview.get('max_abs_finite', 0.0):.6f}",
+                args,
+            )
+            _trace_event(args, "grad_overview", {"chunk_start": int(start), "chunk_end": int(end), **overview})
 
         bad_param, nan_cnt, inf_cnt = _first_nonfinite_grad(model)
         if bad_param:
+            bad_list = _collect_nonfinite_grad_params(model, max_items=args.nan_trace_max_bad_params)
+            _trace(
+                f"nonfinite_grad_params_detected count={len(bad_list)} "
+                f"(showing up to {args.nan_trace_max_bad_params})",
+                args,
+            )
+            for item in bad_list:
+                _trace(
+                    "bad_grad "
+                    f"name={item['name']} shape={item['shape']} numel={item['numel']} "
+                    f"nan={item['nan_cnt']} inf={item['inf_cnt']} finite={item['finite_cnt']} "
+                    f"max_abs_finite={item['max_abs_finite']:.6f}",
+                    args,
+                )
+            _trace_event(
+                args,
+                "bad_grad_list",
+                {"chunk_start": int(start), "chunk_end": int(end), "items": bad_list},
+            )
             optimizer.zero_grad(set_to_none=True)
             return _build_zero_stats(
                 "nonfinite_grad_after_backward("
@@ -238,8 +420,33 @@ def main() -> None:
         default=True,
         help="Print detailed step-by-step NaN trace logs.",
     )
+    parser.add_argument(
+        "--nan_trace_log_tensor_stats",
+        type=str2bool,
+        default=True,
+        help="Print and record tensor stats for chosen/rejected/gap/loss_vec on every chunk.",
+    )
+    parser.add_argument(
+        "--nan_trace_log_grad_overview",
+        type=str2bool,
+        default=True,
+        help="Print and record grad aggregate stats after each backward.",
+    )
+    parser.add_argument(
+        "--nan_trace_max_bad_params",
+        type=int,
+        default=20,
+        help="Max number of nonfinite-gradient parameters to print when detected.",
+    )
+    parser.add_argument(
+        "--nan_trace_write_jsonl",
+        type=str2bool,
+        default=True,
+        help="Write structured debug records to output_dir/nan_trace_debug.jsonl.",
+    )
     args = parser.parse_args()
     set_seed(args.seed)
+    args._nan_trace_jsonl_path = str(Path(args.output_dir).expanduser().resolve() / "nan_trace_debug.jsonl")
 
     # Keep semantics aligned with base main(): 0 means "no limit".
     if args.max_source_samples == 0:
@@ -266,7 +473,8 @@ def main() -> None:
         "[nan-trace] mode=pref-only "
         f"lambda_pref={args.lambda_pref} "
         f"logprob_micro_batch_size={args.logprob_micro_batch_size} "
-        f"gradient_checkpointing={args.gradient_checkpointing}",
+        f"gradient_checkpointing={args.gradient_checkpointing} "
+        f"jsonl={args._nan_trace_jsonl_path}",
         flush=True,
     )
 
