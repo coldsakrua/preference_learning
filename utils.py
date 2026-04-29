@@ -562,15 +562,6 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--positive_weight_tau", type=float, default=1.0, help="Tau in softmax(tau * avg_nll) for correct trajectories.")
     parser.add_argument("--hidden_layer_offset", type=int, default=4, help="Use hidden_states[-hidden_layer_offset] for hidden-state pooling.")
     parser.add_argument("--rollout_feature_micro_batch_size", type=int, default=8, help="Micro-batch size for rollout feature extraction (avg_logprob + hidden_vec).")
-    parser.add_argument(
-        "--rollout_compute_entropy",
-        type=str2bool,
-        default=True,
-        help=(
-            "Whether to compute rollout sequence entropy from full-vocab logits. "
-            "Disable to reduce VRAM during rollout feature extraction."
-        ),
-    )
     parser.add_argument("--use_all_wrong_gt_preference", type=str2bool, default=True, help="Enable GT-positive preference branch for all-wrong prompts.")
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument(
@@ -622,15 +613,9 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
-    parser.add_argument(
-        "--hf_data_parallel",
-        type=str2bool,
-        default=False,
-        help=(
-            "Online HF training forward/backward uses torch.nn.DataParallel on visible GPUs "
-            "when CUDA device count > 1. Keeps single-process control flow compatible with vLLM rollout."
-        ),
-    )
+    # Hidden compatibility switches: older debug scripts may still pass them.
+    parser.add_argument("--rollout_compute_entropy", type=str2bool, default=True, help=argparse.SUPPRESS)
+    parser.add_argument("--hf_data_parallel", type=str2bool, default=True, help=argparse.SUPPRESS)
     parser.add_argument("--use_lora", type=str2bool, default=False, help="Train with PEFT LoRA (HF forward + preference loss); vLLM rollout loads base + adapter.")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank.")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling.")

@@ -547,6 +547,7 @@ def _compute_sequence_logps_and_hidden_batch(
     max_length: int,
     device: torch.device,
     hidden_layer_offset: int,
+    compute_entropy: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_ids, attention_mask, labels = _labeled_batch_tensors(
         tokenizer, prompt_texts, completion_texts, max_length, device
@@ -558,7 +559,10 @@ def _compute_sequence_logps_and_hidden_batch(
         use_cache=False,
     )
     seq_logps = _seq_logps_from_logits_labels(outputs.logits, labels)
-    seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
+    if compute_entropy:
+        seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
+    else:
+        seq_entropy = torch.full_like(seq_logps, float("nan"))
     hidden_states = outputs.hidden_states
     if hidden_states is None or len(hidden_states) == 0:
         raise RuntimeError("Model did not return hidden_states; cannot run hidden-state pair mining.")
@@ -611,6 +615,7 @@ def build_rollout_trajectories_for_prompt(
                 max_length=args.max_length,
                 device=device,
                 hidden_layer_offset=args.hidden_layer_offset,
+                compute_entropy=bool(getattr(args, "rollout_compute_entropy", True)),
             )
             avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
             avg_entropies.extend([float(v) for v in seq_entropy.detach().cpu().tolist()])
@@ -1033,7 +1038,11 @@ def _online_run_preference_optimizer_step(
         rejected: List[str],
         weights: torch.Tensor,
     ) -> Tuple[List[str], List[str], List[str], torch.Tensor, int]:
-        if args.online_pref_min_avg_logprob_chosen is None and args.online_pref_min_avg_logprob_rejected is None:
+        if (
+            args.online_pref_min_avg_logprob_chosen is None
+            and args.online_pref_min_avg_logprob_rejected is None
+            and args.online_gap_clip_abs <= 0
+        ):
             return prompts, chosen, rejected, weights, int(weights.numel())
 
         was_training = bool(getattr(model, "training", False))
@@ -1068,12 +1077,15 @@ def _online_run_preference_optimizer_step(
             keep_mask = keep_mask & (chosen_logps >= float(args.online_pref_min_avg_logprob_chosen))
         if args.online_pref_min_avg_logprob_rejected is not None:
             keep_mask = keep_mask & (rejected_logps >= float(args.online_pref_min_avg_logprob_rejected))
+        if args.online_gap_clip_abs > 0:
+            keep_mask = keep_mask & (torch.abs(raw_gap) <= float(args.online_gap_clip_abs))
 
         kept = int(keep_mask.sum().item())
         total = int(keep_mask.numel())
         if kept < total:
             chosen_floor_drop = 0
             rejected_floor_drop = 0
+            gap_cap_drop = 0
             if args.online_pref_min_avg_logprob_chosen is not None:
                 chosen_floor_drop = int(
                     (finite_mask & (chosen_logps < float(args.online_pref_min_avg_logprob_chosen))).sum().item()
@@ -1082,12 +1094,15 @@ def _online_run_preference_optimizer_step(
                 rejected_floor_drop = int(
                     (finite_mask & (rejected_logps < float(args.online_pref_min_avg_logprob_rejected))).sum().item()
                 )
+            if args.online_gap_clip_abs > 0:
+                gap_cap_drop = int((finite_mask & (torch.abs(raw_gap) > float(args.online_gap_clip_abs))).sum().item())
             print(
                 f"[online] {branch} train_prefilter chunk=[{start},{end}) "
                 f"kept={kept}/{total} dropped_before_autograd={total - kept} "
                 f"drop_nonfinite={int((~finite_mask).sum().item())} "
                 f"drop_chosen_floor={chosen_floor_drop} "
-                f"drop_rejected_floor={rejected_floor_drop}",
+                f"drop_rejected_floor={rejected_floor_drop} "
+                f"drop_raw_gap_cap={gap_cap_drop}",
                 flush=True,
             )
         if kept <= 0:
@@ -1102,60 +1117,35 @@ def _online_run_preference_optimizer_step(
             kept,
         )
 
-    def _pref_autograd_guard_allows_backward(
+    def _run_pref_like_branch(
         branch: str,
-        start: int,
-        end: int,
-        chosen_logps: torch.Tensor,
-        rejected_logps: torch.Tensor,
-    ) -> bool:
-        if args.online_pref_min_avg_logprob_chosen is None and args.online_pref_min_avg_logprob_rejected is None:
-            return True
+        train_prompts: List[str],
+        chosen: List[str],
+        rejected: List[str],
+        weights: List[float],
+        micro_batch: int,
+    ) -> Optional[OnlineStepLossStats]:
+        nonlocal pref_loss_weighted_sum
+        nonlocal gt_pref_loss_weighted_sum
+        nonlocal gap_weighted_sum
+        nonlocal pref_weight_sum
+        nonlocal gt_pref_weight_sum
+        nonlocal gap_weight_sum
+        nonlocal pref_pairs_used
+        nonlocal gt_pref_pairs_used
 
-        chosen_detached = chosen_logps.detach()
-        rejected_detached = rejected_logps.detach()
-        raw_gap = chosen_detached - rejected_detached
-        keep_mask = torch.isfinite(chosen_detached) & torch.isfinite(rejected_detached) & torch.isfinite(raw_gap)
-        finite_mask = keep_mask.clone()
-        if args.online_pref_min_avg_logprob_chosen is not None:
-            keep_mask = keep_mask & (chosen_detached >= float(args.online_pref_min_avg_logprob_chosen))
-        if args.online_pref_min_avg_logprob_rejected is not None:
-            keep_mask = keep_mask & (rejected_detached >= float(args.online_pref_min_avg_logprob_rejected))
+        branch_batch = len(train_prompts)
+        if branch_batch <= 0:
+            return None
 
-        kept = int(keep_mask.sum().item())
-        total = int(keep_mask.numel())
-        if kept >= total:
-            return True
-
-        chosen_floor_drop = 0
-        rejected_floor_drop = 0
-        if args.online_pref_min_avg_logprob_chosen is not None:
-            chosen_floor_drop = int(
-                (finite_mask & (chosen_detached < float(args.online_pref_min_avg_logprob_chosen))).sum().item()
-            )
-        if args.online_pref_min_avg_logprob_rejected is not None:
-            rejected_floor_drop = int(
-                (finite_mask & (rejected_detached < float(args.online_pref_min_avg_logprob_rejected))).sum().item()
-            )
-        print(
-            f"[online] {branch} autograd_guard chunk=[{start},{end}) "
-            f"kept={kept}/{total} no_backward=true "
-            f"drop_nonfinite={int((~finite_mask).sum().item())} "
-            f"drop_chosen_floor={chosen_floor_drop} "
-            f"drop_rejected_floor={rejected_floor_drop}",
-            flush=True,
-        )
-        return False
-
-    if pref_batch > 0:
-        for start in range(0, pref_batch, mb_pref):
-            end = min(start + mb_pref, pref_batch)
-            tp = pref_train_prompts[start:end]
-            ch = pref_chosen[start:end]
-            rj = pref_rejected[start:end]
-            w = torch.tensor(pref_weights[start:end], device=device, dtype=torch.float32)
+        for start in range(0, branch_batch, micro_batch):
+            end = min(start + micro_batch, branch_batch)
+            tp = train_prompts[start:end]
+            ch = chosen[start:end]
+            rj = rejected[start:end]
+            w = torch.tensor(weights[start:end], device=device, dtype=torch.float32)
             tp, ch, rj, w, chunk_pairs_used = _prefilter_pref_chunk_before_autograd(
-                "pref",
+                branch,
                 start,
                 end,
                 tp,
@@ -1181,85 +1171,59 @@ def _online_run_preference_optimizer_step(
                 args.max_length,
                 device,
             )
-            if not _pref_autograd_guard_allows_backward("pref", start, end, chosen_logps, rejected_logps):
-                continue
             preference_gap = chosen_logps - rejected_logps
             if args.online_gap_clip_abs > 0:
                 preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
-            pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
-            loss_chunk = (pref_loss_vec * w).sum() / total_weight
+            pref_like_loss_vec = -F.logsigmoid(args.beta * preference_gap)
+            loss_chunk = (pref_like_loss_vec * w).sum() / total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
             failed = _check_chunk_and_backward(
                 loss_chunk=loss_chunk,
                 loss_chunk_val=loss_chunk_val,
-                skip_prefix="pref",
+                skip_prefix=branch,
                 start=start,
                 end=end,
             )
             if failed is not None:
                 return failed
-            pref_loss_weighted_sum += (pref_loss_vec * w).sum().item()
-            gap_weighted_sum += (preference_gap * w).sum().item()
-            pref_weight_sum += w.sum().item()
-            gap_weight_sum += w.sum().item()
-            pref_pairs_used += chunk_pairs_used
+            loss_sum = (pref_like_loss_vec * w).sum().item()
+            gap_sum = (preference_gap * w).sum().item()
+            w_sum = w.sum().item()
 
-    if gt_pref_batch > 0:
-        for start in range(0, gt_pref_batch, mb_gt_pref):
-            end = min(start + mb_gt_pref, gt_pref_batch)
-            tp = gt_pref_train_prompts[start:end]
-            ch = gt_pref_chosen[start:end]
-            rj = gt_pref_rejected[start:end]
-            w = torch.tensor(gt_pref_weights[start:end], device=device, dtype=torch.float32)
-            tp, ch, rj, w, chunk_pairs_used = _prefilter_pref_chunk_before_autograd(
-                "gt_pref",
-                start,
-                end,
-                tp,
-                ch,
-                rj,
-                w,
-            )
-            if chunk_pairs_used <= 0:
-                continue
-            chosen_logps = _compute_sequence_logps_batch(
-                model,
-                tokenizer,
-                tp,
-                ch,
-                args.max_length,
-                device,
-            )
-            rejected_logps = _compute_sequence_logps_batch(
-                model,
-                tokenizer,
-                tp,
-                rj,
-                args.max_length,
-                device,
-            )
-            if not _pref_autograd_guard_allows_backward("gt_pref", start, end, chosen_logps, rejected_logps):
-                continue
-            preference_gap = chosen_logps - rejected_logps
-            if args.online_gap_clip_abs > 0:
-                preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
-            gt_pref_loss_vec = -F.logsigmoid(args.beta * preference_gap)
-            loss_chunk = (gt_pref_loss_vec * w).sum() / total_weight
-            loss_chunk_val = float(loss_chunk.detach().item())
-            failed = _check_chunk_and_backward(
-                loss_chunk=loss_chunk,
-                loss_chunk_val=loss_chunk_val,
-                skip_prefix="gt_pref",
-                start=start,
-                end=end,
-            )
-            if failed is not None:
-                return failed
-            gt_pref_loss_weighted_sum += (gt_pref_loss_vec * w).sum().item()
-            gap_weighted_sum += (preference_gap * w).sum().item()
-            gt_pref_weight_sum += w.sum().item()
-            gap_weight_sum += w.sum().item()
-            gt_pref_pairs_used += chunk_pairs_used
+            if branch == "pref":
+                pref_loss_weighted_sum += loss_sum
+                pref_weight_sum += w_sum
+                pref_pairs_used += chunk_pairs_used
+            else:
+                gt_pref_loss_weighted_sum += loss_sum
+                gt_pref_weight_sum += w_sum
+                gt_pref_pairs_used += chunk_pairs_used
+
+            gap_weighted_sum += gap_sum
+            gap_weight_sum += w_sum
+        return None
+
+    failed = _run_pref_like_branch(
+        branch="pref",
+        train_prompts=pref_train_prompts,
+        chosen=pref_chosen,
+        rejected=pref_rejected,
+        weights=pref_weights,
+        micro_batch=mb_pref,
+    )
+    if failed is not None:
+        return failed
+
+    failed = _run_pref_like_branch(
+        branch="gt_pref",
+        train_prompts=gt_pref_train_prompts,
+        chosen=gt_pref_chosen,
+        rejected=gt_pref_rejected,
+        weights=gt_pref_weights,
+        micro_batch=mb_gt_pref,
+    )
+    if failed is not None:
+        return failed
 
     if mle_batch > 0:
         for start in range(0, mle_batch, mb_mle):
@@ -1402,7 +1366,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     model.to(device)
     model.train()
     cuda_device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if device.type == "cuda" and cuda_device_count > 1:
+    if bool(getattr(args, "hf_data_parallel", True)) and device.type == "cuda" and cuda_device_count > 1:
         model = torch.nn.DataParallel(model)
         print(f"[online] enabled DataParallel for training across {cuda_device_count} GPUs")
     if args.gradient_checkpointing:
@@ -1607,11 +1571,17 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     split=split,
                     args=args,
                 )
-                rollout_all_entropy_values.extend([float(t.avg_entropy) for t in trajectories])
+                rollout_all_entropy_values.extend(
+                    [float(t.avg_entropy) for t in trajectories if math.isfinite(float(t.avg_entropy))]
+                )
                 correct_trajs = [trajectories[i] for i in split.correct_kept_indices]
                 wrong_trajs = [trajectories[i] for i in split.wrong_kept_indices]
-                rollout_correct_entropy_values.extend([float(t.avg_entropy) for t in correct_trajs])
-                rollout_wrong_entropy_values.extend([float(t.avg_entropy) for t in wrong_trajs])
+                rollout_correct_entropy_values.extend(
+                    [float(t.avg_entropy) for t in correct_trajs if math.isfinite(float(t.avg_entropy))]
+                )
+                rollout_wrong_entropy_values.extend(
+                    [float(t.avg_entropy) for t in wrong_trajs if math.isfinite(float(t.avg_entropy))]
+                )
                 objective: Optional[OnlinePendingObjective] = None
 
                 if args.online_pref_loss_only:
@@ -1782,8 +1752,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                                 gt_positive = gt_trajectories[0]
 
                     if gt_positive is not None and wrong_trajs:
-                        rollout_all_entropy_values.append(float(gt_positive.avg_entropy))
-                        rollout_gt_entropy_values.append(float(gt_positive.avg_entropy))
+                        if math.isfinite(float(gt_positive.avg_entropy)):
+                            rollout_all_entropy_values.append(float(gt_positive.avg_entropy))
+                            rollout_gt_entropy_values.append(float(gt_positive.avg_entropy))
                         objective = OnlinePendingObjective(
                             sample_id=sample_obj.sample_id,
                             ground_truth=sample_obj.ground_truth,
