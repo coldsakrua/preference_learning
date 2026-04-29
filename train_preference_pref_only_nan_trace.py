@@ -15,6 +15,8 @@ from torch.optim import AdamW
 import train_preference as base
 from utils import set_seed, str2bool
 
+_ORIG_WRAP_MODEL_WITH_LORA = base.wrap_model_with_lora
+
 
 def _first_nonfinite_grad(model: object) -> tuple[str, int, int]:
     named_params = getattr(model, "named_parameters", None)
@@ -150,6 +152,90 @@ def _grad_overview(model: object) -> Dict[str, Any]:
         "inf_cnt": inf_cnt,
         "max_abs_finite": max_abs_finite,
     }
+
+
+def _lora_param_init_stats(model: object, max_items: int) -> Dict[str, Any]:
+    named_params = getattr(model, "named_parameters", None)
+    if not callable(named_params):
+        return {}
+    total_numel = 0
+    finite_cnt = 0
+    nan_cnt = 0
+    inf_cnt = 0
+    max_abs = 0.0
+    items: List[Dict[str, Any]] = []
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "lora_" not in name:
+                continue
+            if p is None:
+                continue
+            x = p.detach().float()
+            n = int(x.numel())
+            total_numel += n
+            cur_nan = int(torch.isnan(x).sum().item())
+            cur_inf = int(torch.isinf(x).sum().item())
+            cur_finite = int(torch.isfinite(x).sum().item())
+            nan_cnt += cur_nan
+            inf_cnt += cur_inf
+            finite_cnt += cur_finite
+            cur_max_abs = 0.0
+            cur_mean = 0.0
+            cur_std = 0.0
+            finite_mask = torch.isfinite(x)
+            if cur_finite > 0:
+                xf = x[finite_mask]
+                cur_max_abs = float(xf.abs().max().item())
+                cur_mean = float(xf.mean().item())
+                cur_std = float(xf.std(unbiased=False).item()) if cur_finite > 1 else 0.0
+                max_abs = max(max_abs, cur_max_abs)
+            if len(items) < max_items:
+                items.append(
+                    {
+                        "name": str(name),
+                        "shape": list(x.shape),
+                        "numel": n,
+                        "nan_cnt": cur_nan,
+                        "inf_cnt": cur_inf,
+                        "finite_cnt": cur_finite,
+                        "mean": cur_mean,
+                        "std": cur_std,
+                        "max_abs": cur_max_abs,
+                    }
+                )
+    return {
+        "lora_param_cnt_shown": len(items),
+        "lora_total_numel": total_numel,
+        "lora_finite_cnt": finite_cnt,
+        "lora_nan_cnt": nan_cnt,
+        "lora_inf_cnt": inf_cnt,
+        "lora_global_max_abs": max_abs,
+        "items": items,
+    }
+
+
+def _wrap_model_with_lora_and_log(model: Any, args: argparse.Namespace) -> Any:
+    wrapped = _ORIG_WRAP_MODEL_WITH_LORA(model, args)
+    stats = _lora_param_init_stats(wrapped, max_items=args.nan_trace_max_bad_params)
+    if stats:
+        _trace(
+            "lora_init_overview "
+            f"total_numel={stats.get('lora_total_numel', 0)} "
+            f"finite={stats.get('lora_finite_cnt', 0)} "
+            f"nan={stats.get('lora_nan_cnt', 0)} inf={stats.get('lora_inf_cnt', 0)} "
+            f"global_max_abs={stats.get('lora_global_max_abs', 0.0):.6f}",
+            args,
+        )
+        for item in stats.get("items", []):
+            _trace(
+                "lora_init_param "
+                f"name={item['name']} shape={item['shape']} numel={item['numel']} "
+                f"nan={item['nan_cnt']} inf={item['inf_cnt']} finite={item['finite_cnt']} "
+                f"mean={item['mean']:.6f} std={item['std']:.6f} max_abs={item['max_abs']:.6f}",
+                args,
+            )
+        _trace_event(args, "lora_init_stats", stats)
+    return wrapped
 
 
 def _first_nonfinite_tensor(t: torch.Tensor, name: str) -> Optional[str]:
@@ -477,6 +563,9 @@ def main() -> None:
         f"jsonl={args._nan_trace_jsonl_path}",
         flush=True,
     )
+
+    # Monkey-patch LoRA wrapping to emit initialization stats.
+    base.wrap_model_with_lora = _wrap_model_with_lora_and_log
 
     # Monkey-patch the optimizer step with detailed trace version.
     base._online_run_preference_optimizer_step = _online_run_pref_only_nan_trace_step
