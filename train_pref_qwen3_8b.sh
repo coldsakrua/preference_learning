@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -o logs/pref_8b.%j.out
+#SBATCH -o logs/pref_8b_2gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=72:00:00
-#SBATCH --exclude=gpua800n13
+#SBATCH --exclude=gpua800n13,gpua800n04
 
 set -eo pipefail
 nvidia-smi
@@ -26,7 +26,6 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-world_size=1
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-8b-base}
@@ -35,7 +34,7 @@ seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
 online_steps=${ONLINE_STEPS:-20}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
+online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-8}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
@@ -43,18 +42,17 @@ top_p=${TOP_P:-0.8}
 top_k=${TOP_K:-20}
 min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
-max_new_tokens=${MAX_NEW_TOKENS:-3072}
+max_new_tokens=${MAX_NEW_TOKENS:-4096}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
-tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
+tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.6}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.8}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
-hf_data_parallel=${HF_DATA_PARALLEL:-false}
 
 use_lora=${USE_LORA:-true}
 lora_r=${LORA_R:-64}
@@ -69,17 +67,34 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/pref_8b_1gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/pref_8b_2gpu/${run_name}}
 train_out="${run_root}/train"
+
+world_size=${NPROC_PER_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0,1}" | awk -F, '{print NF}')}
+if [[ -z "${world_size}" || "${world_size}" -lt 1 ]]; then
+  world_size=1
+fi
+if [[ "${world_size}" -ne 2 ]]; then
+  echo "[PREF][warn] expected 2 GPUs for this script, got world_size=${world_size}"
+fi
+if (( rollout_batch_size % world_size != 0 )); then
+  echo "[PREF][error] rollout_batch_size=${rollout_batch_size} must be divisible by world_size=${world_size} for even split."
+  exit 1
+fi
+if (( logprob_micro_batch_size > 0 )) && (( logprob_micro_batch_size % world_size != 0 )); then
+  echo "[PREF][error] logprob_micro_batch_size=${logprob_micro_batch_size} must be divisible by world_size=${world_size} for even backprop split."
+  exit 1
+fi
 
 mkdir -p "${run_root}" "${train_out}"
 
 echo "[PREF] run_root=${run_root}"
+echo "[PREF] world_size=${world_size} rollout_batch_per_gpu=$((rollout_batch_size / world_size)) rollout_n=${rollout_n}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[PREF] hf_data_parallel=${hf_data_parallel}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-echo "[PREF] python world_size=${world_size}"
-python train_preference.py \
+master_port=${MASTER_PORT:-29500}
+echo "[PREF] launcher=torchrun nproc_per_node=${world_size} master_port=${master_port}"
+torchrun --standalone --nproc_per_node "${world_size}" --master_port "${master_port}" train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -113,9 +128,6 @@ python train_preference.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --gradient_checkpointing true \
-  --rollout_compute_entropy false \
-  --hf_data_parallel "${hf_data_parallel}" \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \

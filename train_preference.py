@@ -686,6 +686,13 @@ def ensure_input_require_grads_for_checkpointing(model: Any) -> None:
     setattr(model, "_pref_input_require_grads_hook", hook)
 
 
+def unwrap_model_for_save(model: object) -> object:
+    """Return the underlying HF/PEFT model when wrapped by DataParallel."""
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
+
+
 def _online_rollout_completions_flat_vllm(
     args: argparse.Namespace,
     *,
@@ -707,7 +714,7 @@ def _online_rollout_completions_flat_vllm(
         vllm_staging_dir.mkdir(parents=True, exist_ok=True)
         adapter_dir = vllm_staging_dir / "lora_adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(adapter_dir)
+        unwrap_model_for_save(model).save_pretrained(adapter_dir)
         tokenizer.save_pretrained(adapter_dir)
         ckpt = init_model_path
         try:
@@ -740,7 +747,7 @@ def _online_rollout_completions_flat_vllm(
         }
     elif hf_updates_so_far > 0:
         vllm_staging_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(vllm_staging_dir)
+        unwrap_model_for_save(model).save_pretrained(vllm_staging_dir)
         tokenizer.save_pretrained(vllm_staging_dir)
         ckpt = str(vllm_staging_dir)
         print(
@@ -1229,11 +1236,16 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
+    cuda_device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if device.type == "cuda" and cuda_device_count > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"[online] enabled DataParallel for training across {cuda_device_count} GPUs")
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        model.config.use_cache = False
+        base_model = unwrap_model_for_save(model)
+        base_model.gradient_checkpointing_enable()
+        base_model.config.use_cache = False
         if args.use_lora:
-            ensure_input_require_grads_for_checkpointing(model)
+            ensure_input_require_grads_for_checkpointing(base_model)
 
     optimizer = AdamW(
         (p for p in model.parameters() if p.requires_grad),
@@ -1904,7 +1916,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     if args.online_save_every_updates > 0 and updates % args.online_save_every_updates == 0:
                         ckpt_dir = output_root / f"checkpoint-update-{updates}"
                         ckpt_dir.mkdir(parents=True, exist_ok=True)
-                        model.save_pretrained(ckpt_dir)
+                        unwrap_model_for_save(model).save_pretrained(ckpt_dir)
                         tokenizer.save_pretrained(ckpt_dir)
                         print(f"[online] saved checkpoint to {ckpt_dir}")
 
@@ -1939,7 +1951,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
     final_dir = output_root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_dir)
+    unwrap_model_for_save(model).save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
