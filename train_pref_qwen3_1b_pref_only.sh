@@ -52,6 +52,8 @@ learning_rate=${LEARNING_RATE:-2e-6}
 beta=${BETA:-0.3}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-16}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
+online_pref_min_avg_logprob_chosen="${ONLINE_PREF_MIN_AVG_LOGPROB_CHOSEN:--3}"
+online_pref_min_avg_logprob_rejected="${ONLINE_PREF_MIN_AVG_LOGPROB_REJECTED:--3}"
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.95}
@@ -110,6 +112,8 @@ python train_preference.py \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
   --online_gap_clip_abs "${online_gap_clip_abs}" \
+  --online_pref_min_avg_logprob_chosen "${online_pref_min_avg_logprob_chosen}" \
+  --online_pref_min_avg_logprob_rejected "${online_pref_min_avg_logprob_rejected}" \
   --lambda_mle 0.0 \
   --lambda_pref 1.0 \
   --lambda_gt 0.0 \

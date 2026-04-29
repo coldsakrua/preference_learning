@@ -287,6 +287,37 @@ def _trace_event(args: argparse.Namespace, event: str, payload: Dict[str, Any]) 
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _filter_list_by_mask(items: List[str], keep_mask: torch.Tensor) -> List[str]:
+    keep = [bool(x) for x in keep_mask.detach().cpu().tolist()]
+    return [item for item, should_keep in zip(items, keep) if should_keep]
+
+
+def _compute_prefilter_logps_no_grad(
+    model: object,
+    tokenizer: object,
+    prompt_texts: List[str],
+    completion_texts: List[str],
+    max_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    was_training = bool(getattr(model, "training", False))
+    if was_training:
+        model.eval()
+    try:
+        with torch.no_grad():
+            return base._compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                prompt_texts,
+                completion_texts,
+                max_length,
+                device,
+            )
+    finally:
+        if was_training:
+            model.train()
+
+
 def _second_filter_pref_pairs(
     chosen_logps: torch.Tensor,
     rejected_logps: torch.Tensor,
@@ -491,40 +522,49 @@ def _online_run_pref_only_nan_trace_step(
         w_raw_for_probe = w.detach().clone()
 
         probe_keep_mask: Optional[torch.Tensor] = None
+        chunk_pairs_for_training = 0
 
-        _trace(f"chunk[{start}:{end}] forward/chosen_logps", args)
-        chosen_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, ch, args.max_length, device)
-        if args.nan_trace_log_tensor_stats:
-            stats = _tensor_stats(chosen_logps, f"pref.chosen_logps[{start}:{end}]")
-            _trace(_stats_line(stats), args)
-            _trace_event(args, "tensor_stats", stats)
-        bad_msg = _first_nonfinite_tensor(chosen_logps, f"pref.chosen_logps[{start}:{end}]")
-        if bad_msg is not None:
-            optimizer.zero_grad(set_to_none=True)
-            return _build_zero_stats(f"nonfinite_detected_before_gap({bad_msg})")
-
-        _trace(f"chunk[{start}:{end}] forward/rejected_logps", args)
-        rejected_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, rj, args.max_length, device)
-        if args.nan_trace_log_tensor_stats:
-            stats = _tensor_stats(rejected_logps, f"pref.rejected_logps[{start}:{end}]")
-            _trace(_stats_line(stats), args)
-            _trace_event(args, "tensor_stats", stats)
-        bad_msg = _first_nonfinite_tensor(rejected_logps, f"pref.rejected_logps[{start}:{end}]")
-        if bad_msg is not None:
-            optimizer.zero_grad(set_to_none=True)
-            return _build_zero_stats(f"nonfinite_detected_before_gap({bad_msg})")
-
-        raw_gap = chosen_logps - rejected_logps
         if args.train_pref_second_filter_enabled:
-            second_filter = _second_filter_pref_pairs(chosen_logps, rejected_logps, args)
-            raw_gap = second_filter["raw_gap"]
-            keep_mask = second_filter["keep_mask"]
+            _trace(f"chunk[{start}:{end}] prefilter_no_grad/chosen_logps", args)
+            prefilter_chosen_logps = _compute_prefilter_logps_no_grad(
+                model,
+                tokenizer,
+                tp,
+                ch,
+                args.max_length,
+                device,
+            )
+            if args.nan_trace_log_tensor_stats:
+                stats = _tensor_stats(prefilter_chosen_logps, f"pref.prefilter_chosen_logps[{start}:{end}]")
+                _trace(_stats_line(stats), args)
+                _trace_event(args, "tensor_stats", stats)
+
+            _trace(f"chunk[{start}:{end}] prefilter_no_grad/rejected_logps", args)
+            prefilter_rejected_logps = _compute_prefilter_logps_no_grad(
+                model,
+                tokenizer,
+                tp,
+                rj,
+                args.max_length,
+                device,
+            )
+            if args.nan_trace_log_tensor_stats:
+                stats = _tensor_stats(prefilter_rejected_logps, f"pref.prefilter_rejected_logps[{start}:{end}]")
+                _trace(_stats_line(stats), args)
+                _trace_event(args, "tensor_stats", stats)
+
+            second_filter = _second_filter_pref_pairs(
+                prefilter_chosen_logps,
+                prefilter_rejected_logps,
+                args,
+            )
+            keep_mask = second_filter["keep_mask"].detach()
             keep_cnt = int(second_filter["kept"])
             total_cnt = int(second_filter["total"])
             drop_cnt = total_cnt - keep_cnt
             dropped_by_second_filter += drop_cnt
             _trace(
-                f"chunk[{start}:{end}] second_filter kept={keep_cnt}/{total_cnt} "
+                f"chunk[{start}:{end}] prefilter_second_filter kept={keep_cnt}/{total_cnt} "
                 f"drop_nonfinite={second_filter['drop_nonfinite']} "
                 f"drop_chosen_floor={second_filter['drop_chosen_floor']} "
                 f"drop_rejected_floor={second_filter['drop_rejected_floor']} "
@@ -533,7 +573,7 @@ def _online_run_pref_only_nan_trace_step(
             )
             _trace_event(
                 args,
-                "second_filter",
+                "prefilter_second_filter",
                 {
                     "chunk_start": int(start),
                     "chunk_end": int(end),
@@ -547,20 +587,90 @@ def _online_run_pref_only_nan_trace_step(
             )
             if keep_cnt < int(args.train_pref_second_filter_min_pairs_per_chunk):
                 _trace(
-                    f"chunk[{start}:{end}] skipped_by_second_filter "
+                    f"chunk[{start}:{end}] skipped_by_prefilter_second_filter "
                     f"(kept={keep_cnt} < min_pairs_per_chunk={args.train_pref_second_filter_min_pairs_per_chunk})",
                     args,
                 )
                 continue
 
-            chosen_logps = chosen_logps[keep_mask]
-            rejected_logps = rejected_logps[keep_mask]
-            raw_gap = raw_gap[keep_mask]
-            w = w[keep_mask]
-            probe_keep_mask = keep_mask.detach().cpu()
-            effective_pairs_used += keep_cnt
+            tp = _filter_list_by_mask(tp, keep_mask)
+            ch = _filter_list_by_mask(ch, keep_mask)
+            rj = _filter_list_by_mask(rj, keep_mask)
+            w = w[keep_mask.to(device=w.device)]
+            w_raw_for_probe = w.detach().clone()
+            chunk_pairs_for_training = keep_cnt
+
+            _trace(
+                f"chunk[{start}:{end}] autograd_inputs kept_pairs={len(tp)} "
+                "dropped pairs will not enter autograd",
+                args,
+            )
+            _trace_event(
+                args,
+                "autograd_inputs",
+                {"chunk_start": int(start), "chunk_end": int(end), "kept_pairs": int(len(tp))},
+            )
+
+        _trace(f"chunk[{start}:{end}] autograd_forward/chosen_logps", args)
+        chosen_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, ch, args.max_length, device)
+        if args.nan_trace_log_tensor_stats:
+            stats = _tensor_stats(chosen_logps, f"pref.chosen_logps[{start}:{end}]")
+            _trace(_stats_line(stats), args)
+            _trace_event(args, "tensor_stats", stats)
+        bad_msg = _first_nonfinite_tensor(chosen_logps, f"pref.chosen_logps[{start}:{end}]")
+        if bad_msg is not None:
+            optimizer.zero_grad(set_to_none=True)
+            return _build_zero_stats(f"nonfinite_detected_before_gap({bad_msg})")
+
+        _trace(f"chunk[{start}:{end}] autograd_forward/rejected_logps", args)
+        rejected_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, rj, args.max_length, device)
+        if args.nan_trace_log_tensor_stats:
+            stats = _tensor_stats(rejected_logps, f"pref.rejected_logps[{start}:{end}]")
+            _trace(_stats_line(stats), args)
+            _trace_event(args, "tensor_stats", stats)
+        bad_msg = _first_nonfinite_tensor(rejected_logps, f"pref.rejected_logps[{start}:{end}]")
+        if bad_msg is not None:
+            optimizer.zero_grad(set_to_none=True)
+            return _build_zero_stats(f"nonfinite_detected_before_gap({bad_msg})")
+
+        raw_gap = chosen_logps - rejected_logps
+        if not args.train_pref_second_filter_enabled:
+            chunk_pairs_for_training = int(raw_gap.numel())
         else:
-            effective_pairs_used += int(raw_gap.numel())
+            autograd_guard = _second_filter_pref_pairs(
+                chosen_logps.detach(),
+                rejected_logps.detach(),
+                args,
+            )
+            guard_kept = int(autograd_guard["kept"])
+            guard_total = int(autograd_guard["total"])
+            if guard_kept < guard_total:
+                guard_drop = guard_total - guard_kept
+                dropped_by_second_filter += guard_drop
+                _trace(
+                    f"chunk[{start}:{end}] skipped_by_autograd_guard "
+                    f"kept={guard_kept}/{guard_total} no_backward=true "
+                    f"drop_nonfinite={autograd_guard['drop_nonfinite']} "
+                    f"drop_chosen_floor={autograd_guard['drop_chosen_floor']} "
+                    f"drop_rejected_floor={autograd_guard['drop_rejected_floor']} "
+                    f"drop_raw_gap_cap={autograd_guard['drop_raw_gap_cap']}",
+                    args,
+                )
+                _trace_event(
+                    args,
+                    "autograd_guard_skipped_chunk",
+                    {
+                        "chunk_start": int(start),
+                        "chunk_end": int(end),
+                        "kept": guard_kept,
+                        "total": guard_total,
+                        "drop_nonfinite": int(autograd_guard["drop_nonfinite"]),
+                        "drop_chosen_floor": int(autograd_guard["drop_chosen_floor"]),
+                        "drop_rejected_floor": int(autograd_guard["drop_rejected_floor"]),
+                        "drop_raw_gap_cap": int(autograd_guard["drop_raw_gap_cap"]),
+                    },
+                )
+                continue
 
         preference_gap = raw_gap
         if args.online_gap_clip_abs > 0:
@@ -691,6 +801,7 @@ def _online_run_pref_only_nan_trace_step(
                 f"branch=pref,chunk=[{start},{end}),param={bad_param},nan={nan_cnt},inf={inf_cnt})"
             )
 
+        effective_pairs_used += chunk_pairs_for_training
         pref_loss_weighted_sum += (pref_loss_vec * w).sum().item()
         gap_weighted_sum += (preference_gap * w).sum().item()
         pref_weight_sum += w.sum().item()
@@ -872,6 +983,7 @@ def main() -> None:
         f"logprob_micro_batch_size={args.logprob_micro_batch_size} "
         f"gradient_checkpointing={args.gradient_checkpointing} "
         f"second_filter={args.train_pref_second_filter_enabled} "
+        f"prefilter_before_autograd={args.train_pref_second_filter_enabled} "
         f"chosen_floor={args.train_pref_second_filter_min_chosen_logp} "
         f"rejected_floor={args.train_pref_second_filter_min_rejected_logp} "
         f"raw_gap_cap={args.train_pref_second_filter_max_abs_raw_gap} "

@@ -990,7 +990,11 @@ def _online_run_preference_optimizer_step(
     gap_weighted_sum = 0.0
     pref_weight_sum = 0.0
     gt_pref_weight_sum = 0.0
+    mle_weight_sum_used = 0.0
     gap_weight_sum = 0.0
+    pref_pairs_used = 0
+    gt_pref_pairs_used = 0
+    mle_samples_used = 0
 
     def _check_chunk_and_backward(
         loss_chunk: torch.Tensor,
@@ -1016,6 +1020,133 @@ def _online_run_preference_optimizer_step(
         loss_chunk.backward()
         return None
 
+    def _filter_list_by_mask(items: List[str], keep_mask: torch.Tensor) -> List[str]:
+        keep = [bool(x) for x in keep_mask.detach().cpu().tolist()]
+        return [item for item, should_keep in zip(items, keep) if should_keep]
+
+    def _prefilter_pref_chunk_before_autograd(
+        branch: str,
+        start: int,
+        end: int,
+        prompts: List[str],
+        chosen: List[str],
+        rejected: List[str],
+        weights: torch.Tensor,
+    ) -> Tuple[List[str], List[str], List[str], torch.Tensor, int]:
+        if args.online_pref_min_avg_logprob_chosen is None and args.online_pref_min_avg_logprob_rejected is None:
+            return prompts, chosen, rejected, weights, int(weights.numel())
+
+        was_training = bool(getattr(model, "training", False))
+        if was_training:
+            model.eval()
+        try:
+            with torch.no_grad():
+                chosen_logps = _compute_sequence_logps_batch(
+                    model,
+                    tokenizer,
+                    prompts,
+                    chosen,
+                    args.max_length,
+                    device,
+                )
+                rejected_logps = _compute_sequence_logps_batch(
+                    model,
+                    tokenizer,
+                    prompts,
+                    rejected,
+                    args.max_length,
+                    device,
+                )
+        finally:
+            if was_training:
+                model.train()
+
+        raw_gap = chosen_logps - rejected_logps
+        keep_mask = torch.isfinite(chosen_logps) & torch.isfinite(rejected_logps) & torch.isfinite(raw_gap)
+        finite_mask = keep_mask.clone()
+        if args.online_pref_min_avg_logprob_chosen is not None:
+            keep_mask = keep_mask & (chosen_logps >= float(args.online_pref_min_avg_logprob_chosen))
+        if args.online_pref_min_avg_logprob_rejected is not None:
+            keep_mask = keep_mask & (rejected_logps >= float(args.online_pref_min_avg_logprob_rejected))
+
+        kept = int(keep_mask.sum().item())
+        total = int(keep_mask.numel())
+        if kept < total:
+            chosen_floor_drop = 0
+            rejected_floor_drop = 0
+            if args.online_pref_min_avg_logprob_chosen is not None:
+                chosen_floor_drop = int(
+                    (finite_mask & (chosen_logps < float(args.online_pref_min_avg_logprob_chosen))).sum().item()
+                )
+            if args.online_pref_min_avg_logprob_rejected is not None:
+                rejected_floor_drop = int(
+                    (finite_mask & (rejected_logps < float(args.online_pref_min_avg_logprob_rejected))).sum().item()
+                )
+            print(
+                f"[online] {branch} train_prefilter chunk=[{start},{end}) "
+                f"kept={kept}/{total} dropped_before_autograd={total - kept} "
+                f"drop_nonfinite={int((~finite_mask).sum().item())} "
+                f"drop_chosen_floor={chosen_floor_drop} "
+                f"drop_rejected_floor={rejected_floor_drop}",
+                flush=True,
+            )
+        if kept <= 0:
+            return [], [], [], weights[:0], 0
+
+        keep_mask = keep_mask.detach()
+        return (
+            _filter_list_by_mask(prompts, keep_mask),
+            _filter_list_by_mask(chosen, keep_mask),
+            _filter_list_by_mask(rejected, keep_mask),
+            weights[keep_mask.to(device=weights.device)],
+            kept,
+        )
+
+    def _pref_autograd_guard_allows_backward(
+        branch: str,
+        start: int,
+        end: int,
+        chosen_logps: torch.Tensor,
+        rejected_logps: torch.Tensor,
+    ) -> bool:
+        if args.online_pref_min_avg_logprob_chosen is None and args.online_pref_min_avg_logprob_rejected is None:
+            return True
+
+        chosen_detached = chosen_logps.detach()
+        rejected_detached = rejected_logps.detach()
+        raw_gap = chosen_detached - rejected_detached
+        keep_mask = torch.isfinite(chosen_detached) & torch.isfinite(rejected_detached) & torch.isfinite(raw_gap)
+        finite_mask = keep_mask.clone()
+        if args.online_pref_min_avg_logprob_chosen is not None:
+            keep_mask = keep_mask & (chosen_detached >= float(args.online_pref_min_avg_logprob_chosen))
+        if args.online_pref_min_avg_logprob_rejected is not None:
+            keep_mask = keep_mask & (rejected_detached >= float(args.online_pref_min_avg_logprob_rejected))
+
+        kept = int(keep_mask.sum().item())
+        total = int(keep_mask.numel())
+        if kept >= total:
+            return True
+
+        chosen_floor_drop = 0
+        rejected_floor_drop = 0
+        if args.online_pref_min_avg_logprob_chosen is not None:
+            chosen_floor_drop = int(
+                (finite_mask & (chosen_detached < float(args.online_pref_min_avg_logprob_chosen))).sum().item()
+            )
+        if args.online_pref_min_avg_logprob_rejected is not None:
+            rejected_floor_drop = int(
+                (finite_mask & (rejected_detached < float(args.online_pref_min_avg_logprob_rejected))).sum().item()
+            )
+        print(
+            f"[online] {branch} autograd_guard chunk=[{start},{end}) "
+            f"kept={kept}/{total} no_backward=true "
+            f"drop_nonfinite={int((~finite_mask).sum().item())} "
+            f"drop_chosen_floor={chosen_floor_drop} "
+            f"drop_rejected_floor={rejected_floor_drop}",
+            flush=True,
+        )
+        return False
+
     if pref_batch > 0:
         for start in range(0, pref_batch, mb_pref):
             end = min(start + mb_pref, pref_batch)
@@ -1023,6 +1154,17 @@ def _online_run_preference_optimizer_step(
             ch = pref_chosen[start:end]
             rj = pref_rejected[start:end]
             w = torch.tensor(pref_weights[start:end], device=device, dtype=torch.float32)
+            tp, ch, rj, w, chunk_pairs_used = _prefilter_pref_chunk_before_autograd(
+                "pref",
+                start,
+                end,
+                tp,
+                ch,
+                rj,
+                w,
+            )
+            if chunk_pairs_used <= 0:
+                continue
             chosen_logps = _compute_sequence_logps_batch(
                 model,
                 tokenizer,
@@ -1039,6 +1181,8 @@ def _online_run_preference_optimizer_step(
                 args.max_length,
                 device,
             )
+            if not _pref_autograd_guard_allows_backward("pref", start, end, chosen_logps, rejected_logps):
+                continue
             preference_gap = chosen_logps - rejected_logps
             if args.online_gap_clip_abs > 0:
                 preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
@@ -1058,6 +1202,7 @@ def _online_run_preference_optimizer_step(
             gap_weighted_sum += (preference_gap * w).sum().item()
             pref_weight_sum += w.sum().item()
             gap_weight_sum += w.sum().item()
+            pref_pairs_used += chunk_pairs_used
 
     if gt_pref_batch > 0:
         for start in range(0, gt_pref_batch, mb_gt_pref):
@@ -1066,6 +1211,17 @@ def _online_run_preference_optimizer_step(
             ch = gt_pref_chosen[start:end]
             rj = gt_pref_rejected[start:end]
             w = torch.tensor(gt_pref_weights[start:end], device=device, dtype=torch.float32)
+            tp, ch, rj, w, chunk_pairs_used = _prefilter_pref_chunk_before_autograd(
+                "gt_pref",
+                start,
+                end,
+                tp,
+                ch,
+                rj,
+                w,
+            )
+            if chunk_pairs_used <= 0:
+                continue
             chosen_logps = _compute_sequence_logps_batch(
                 model,
                 tokenizer,
@@ -1082,6 +1238,8 @@ def _online_run_preference_optimizer_step(
                 args.max_length,
                 device,
             )
+            if not _pref_autograd_guard_allows_backward("gt_pref", start, end, chosen_logps, rejected_logps):
+                continue
             preference_gap = chosen_logps - rejected_logps
             if args.online_gap_clip_abs > 0:
                 preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
@@ -1101,6 +1259,7 @@ def _online_run_preference_optimizer_step(
             gap_weighted_sum += (preference_gap * w).sum().item()
             gt_pref_weight_sum += w.sum().item()
             gap_weight_sum += w.sum().item()
+            gt_pref_pairs_used += chunk_pairs_used
 
     if mle_batch > 0:
         for start in range(0, mle_batch, mb_mle):
@@ -1129,6 +1288,12 @@ def _online_run_preference_optimizer_step(
             if failed is not None:
                 return failed
             mle_loss_weighted_sum += (mle_loss_vec * w).sum().item()
+            mle_weight_sum_used += w.sum().item()
+            mle_samples_used += int(w.numel())
+
+    if pref_weight_sum + gt_pref_weight_sum + mle_weight_sum_used <= 0:
+        optimizer.zero_grad(set_to_none=True)
+        return _build_zero_stats("all_train_samples_filtered_before_autograd")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
@@ -1172,9 +1337,9 @@ def _online_run_preference_optimizer_step(
         pref_loss=pref_loss,
         gt_pref_loss=gt_pref_loss,
         mean_gap=mean_gap,
-        pref_pairs_used=pref_batch,
-        gt_pref_pairs_used=gt_pref_batch,
-        mle_samples_used=mle_batch,
+        pref_pairs_used=pref_pairs_used,
+        gt_pref_pairs_used=gt_pref_pairs_used,
+        mle_samples_used=mle_samples_used,
         lora_mean_abs=lora_health["lora_mean_abs"],
         lora_max_abs=lora_health["lora_max_abs"],
         lora_nan_ratio=lora_health["lora_nan_ratio"],
