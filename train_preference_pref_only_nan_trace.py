@@ -311,6 +311,131 @@ def _second_filter_pref_pairs(
     }
 
 
+def _trace_grad_of_tensor(t: torch.Tensor, name: str, args: argparse.Namespace) -> None:
+    grad = getattr(t, "grad", None)
+    if grad is None:
+        _trace(f"{name}.grad is None", args)
+        _trace_event(args, "tensor_grad_missing", {"name": name})
+        return
+    stats = _tensor_stats(grad, f"{name}.grad")
+    _trace(_stats_line(stats), args)
+    _trace_event(args, "tensor_grad_stats", stats)
+
+
+def _backward_with_optional_anomaly(
+    loss: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    tag: str,
+) -> Optional[str]:
+    try:
+        if getattr(args, "nan_trace_detect_anomaly", False):
+            with torch.autograd.detect_anomaly(check_nan=True):
+                loss.backward()
+        else:
+            loss.backward()
+        return None
+    except RuntimeError as e:
+        return f"{tag}: backward_exception={type(e).__name__}: {e}"
+
+
+def _run_chunk_backward_probes(
+    model: object,
+    tokenizer: object,
+    optimizer: AdamW,
+    device: torch.device,
+    args: argparse.Namespace,
+    tp: List[str],
+    ch: List[str],
+    rj: List[str],
+    w: torch.Tensor,
+    total_weight: float,
+    keep_mask: Optional[torch.Tensor],
+    start: int,
+    end: int,
+) -> List[Dict[str, Any]]:
+    probe_results: List[Dict[str, Any]] = []
+    denom = float(total_weight) if float(total_weight) > 0 else 1.0
+    probe_defs = ["chosen_linear", "rejected_linear", "gap_linear", "pref_logsigmoid"]
+
+    def _apply_mask(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return x
+        return x[mask.to(device=x.device)]
+
+    for probe_name in probe_defs:
+        optimizer.zero_grad(set_to_none=True)
+        chosen_lp = base._compute_sequence_logps_batch(model, tokenizer, tp, ch, args.max_length, device)
+        rejected_lp = base._compute_sequence_logps_batch(model, tokenizer, tp, rj, args.max_length, device)
+        w_local = w
+
+        if keep_mask is not None:
+            chosen_lp = _apply_mask(chosen_lp, keep_mask)
+            rejected_lp = _apply_mask(rejected_lp, keep_mask)
+            w_local = _apply_mask(w_local, keep_mask)
+
+        num_pairs = int(chosen_lp.numel())
+        if num_pairs <= 0:
+            probe_results.append(
+                {
+                    "probe": probe_name,
+                    "status": "skipped_empty_after_mask",
+                    "chunk_start": int(start),
+                    "chunk_end": int(end),
+                }
+            )
+            continue
+
+        raw_gap = chosen_lp - rejected_lp
+        gap_for_pref = raw_gap
+        if args.online_gap_clip_abs > 0:
+            gap_for_pref = gap_for_pref.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
+
+        if probe_name == "chosen_linear":
+            loss_probe = -((chosen_lp * w_local).sum() / denom)
+        elif probe_name == "rejected_linear":
+            loss_probe = (rejected_lp * w_local).sum() / denom
+        elif probe_name == "gap_linear":
+            loss_probe = -((raw_gap * w_local).sum() / denom)
+        else:
+            loss_probe = (-F.logsigmoid(args.beta * gap_for_pref) * w_local).sum() / denom
+
+        result: Dict[str, Any] = {
+            "probe": probe_name,
+            "chunk_start": int(start),
+            "chunk_end": int(end),
+            "num_pairs": num_pairs,
+            "loss": float(loss_probe.detach().item()),
+        }
+        if not torch.isfinite(loss_probe.detach()):
+            result["status"] = "nonfinite_loss"
+            probe_results.append(result)
+            continue
+
+        backward_err = _backward_with_optional_anomaly(loss_probe, args, tag=f"probe={probe_name}")
+        if backward_err is not None:
+            result["status"] = "backward_exception"
+            result["error"] = backward_err
+            probe_results.append(result)
+            continue
+
+        bad_param, nan_cnt, inf_cnt = _first_nonfinite_grad(model)
+        overview = _grad_overview(model)
+        result["grad_nonfinite_param_cnt"] = int(overview.get("nonfinite_param_cnt", 0))
+        result["grad_max_abs_finite"] = float(overview.get("max_abs_finite", 0.0))
+        if bad_param:
+            result["status"] = "nonfinite_grad"
+            result["bad_param"] = bad_param
+            result["nan_cnt"] = int(nan_cnt)
+            result["inf_cnt"] = int(inf_cnt)
+        else:
+            result["status"] = "ok"
+        probe_results.append(result)
+
+    optimizer.zero_grad(set_to_none=True)
+    return probe_results
+
+
 def _online_run_pref_only_nan_trace_step(
     model: object,
     tokenizer: object,
@@ -363,6 +488,9 @@ def _online_run_pref_only_nan_trace_step(
         ch = pref_chosen[start:end]
         rj = pref_rejected[start:end]
         w = torch.tensor(pref_weights[start:end], device=device, dtype=torch.float32)
+        w_raw_for_probe = w.detach().clone()
+
+        probe_keep_mask: Optional[torch.Tensor] = None
 
         _trace(f"chunk[{start}:{end}] forward/chosen_logps", args)
         chosen_logps = base._compute_sequence_logps_batch(model, tokenizer, tp, ch, args.max_length, device)
@@ -429,6 +557,7 @@ def _online_run_pref_only_nan_trace_step(
             rejected_logps = rejected_logps[keep_mask]
             raw_gap = raw_gap[keep_mask]
             w = w[keep_mask]
+            probe_keep_mask = keep_mask.detach().cpu()
             effective_pairs_used += keep_cnt
         else:
             effective_pairs_used += int(raw_gap.numel())
@@ -455,6 +584,12 @@ def _online_run_pref_only_nan_trace_step(
             optimizer.zero_grad(set_to_none=True)
             return _build_zero_stats(f"nonfinite_detected_in_pref_loss({bad_msg})")
 
+        if args.nan_trace_log_chain_grads:
+            chosen_logps.retain_grad()
+            rejected_logps.retain_grad()
+            preference_gap.retain_grad()
+            pref_loss_vec.retain_grad()
+
         loss_chunk = (pref_loss_vec * w).sum() / total_weight
         loss_chunk_val = float(loss_chunk.detach().item())
         if args.online_skip_nonfinite_loss and not torch.isfinite(loss_chunk.detach()):
@@ -467,7 +602,23 @@ def _online_run_pref_only_nan_trace_step(
             )
 
         _trace(f"chunk[{start}:{end}] backward(loss={loss_chunk_val:.6f})", args)
-        loss_chunk.backward()
+        backward_err = _backward_with_optional_anomaly(loss_chunk, args, tag=f"chunk=[{start},{end})")
+        if backward_err is not None:
+            _trace(backward_err, args)
+            _trace_event(
+                args,
+                "backward_exception",
+                {"chunk_start": int(start), "chunk_end": int(end), "error": backward_err},
+            )
+            optimizer.zero_grad(set_to_none=True)
+            return _build_zero_stats(f"backward_exception(branch=pref,chunk=[{start},{end}))")
+
+        if args.nan_trace_log_chain_grads:
+            _trace_grad_of_tensor(pref_loss_vec, f"pref.loss_vec[{start}:{end}]", args)
+            _trace_grad_of_tensor(preference_gap, f"pref.gap[{start}:{end}]", args)
+            _trace_grad_of_tensor(chosen_logps, f"pref.chosen_logps[{start}:{end}]", args)
+            _trace_grad_of_tensor(rejected_logps, f"pref.rejected_logps[{start}:{end}]", args)
+
         if args.nan_trace_log_grad_overview:
             overview = _grad_overview(model)
             _trace(
@@ -501,6 +652,39 @@ def _online_run_pref_only_nan_trace_step(
                 "bad_grad_list",
                 {"chunk_start": int(start), "chunk_end": int(end), "items": bad_list},
             )
+            if args.nan_trace_backward_probe_on_failure:
+                _trace(f"chunk[{start}:{end}] running_backward_probes_on_failure", args)
+                probe_results = _run_chunk_backward_probes(
+                    model=model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    device=device,
+                    args=args,
+                    tp=tp,
+                    ch=ch,
+                    rj=rj,
+                    w=w_raw_for_probe,
+                    total_weight=total_weight,
+                    keep_mask=probe_keep_mask,
+                    start=start,
+                    end=end,
+                )
+                for pr in probe_results:
+                    _trace(
+                        "probe_result "
+                        f"chunk=[{pr.get('chunk_start')},{pr.get('chunk_end')}) "
+                        f"name={pr.get('probe')} status={pr.get('status')} "
+                        f"loss={pr.get('loss', 0.0):.6f} "
+                        f"grad_nonfinite_param_cnt={pr.get('grad_nonfinite_param_cnt', 0)} "
+                        f"grad_max_abs_finite={pr.get('grad_max_abs_finite', 0.0):.6f} "
+                        f"bad_param={pr.get('bad_param', '')}",
+                        args,
+                    )
+                _trace_event(
+                    args,
+                    "backward_probe_results",
+                    {"chunk_start": int(start), "chunk_end": int(end), "results": probe_results},
+                )
             optimizer.zero_grad(set_to_none=True)
             return _build_zero_stats(
                 "nonfinite_grad_after_backward("
@@ -608,6 +792,24 @@ def main() -> None:
         type=str2bool,
         default=True,
         help="Write structured debug records to output_dir/nan_trace_debug.jsonl.",
+    )
+    parser.add_argument(
+        "--nan_trace_log_chain_grads",
+        type=str2bool,
+        default=True,
+        help="Log grad stats for pref_loss_vec/gap/chosen_logps/rejected_logps after each backward.",
+    )
+    parser.add_argument(
+        "--nan_trace_detect_anomaly",
+        type=str2bool,
+        default=False,
+        help="Enable torch autograd anomaly detection to pinpoint backward op failures.",
+    )
+    parser.add_argument(
+        "--nan_trace_backward_probe_on_failure",
+        type=str2bool,
+        default=True,
+        help="When nonfinite grad appears, rerun chosen/rejected/gap/pref probe backward passes on same chunk.",
     )
     parser.add_argument(
         "--train_pref_second_filter_enabled",
