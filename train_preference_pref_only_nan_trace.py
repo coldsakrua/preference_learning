@@ -241,6 +241,12 @@ def main() -> None:
     args = parser.parse_args()
     set_seed(args.seed)
 
+    # Keep semantics aligned with base main(): 0 means "no limit".
+    if args.max_source_samples == 0:
+        args.max_source_samples = None
+    if args.online_steps == 0:
+        args.online_steps = None
+
     # Force pref-only debug mode.
     args.online_pref_loss_only = True
     args.online_mle_on_correct_only = False

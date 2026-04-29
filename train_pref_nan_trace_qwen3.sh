@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -o logs/pref_nan_trace_4b_2gpu.%j.out
+#SBATCH -o logs/pref_nan_trace.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=72:00:00
 #SBATCH --exclude=gpua800n13,gpua800n04
@@ -20,19 +20,19 @@ mkdir -p logs
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-1.7b-base}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
-online_steps=${ONLINE_STEPS:-20}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
+online_steps=${ONLINE_STEPS:-10}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-8}
 rollout_n=${ROLLOUT_N:-8}
@@ -47,7 +47,7 @@ beta=${BETA:-0.3}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 online_hard_grad_norm_cap=${ONLINE_HARD_GRAD_NORM_CAP:-5.0}
-tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
+tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.85}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
