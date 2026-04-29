@@ -34,7 +34,7 @@ max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
 online_steps=${ONLINE_STEPS:-10}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-16}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-8}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-4}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
@@ -44,7 +44,7 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-3072}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-4}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 online_hard_grad_norm_cap=${ONLINE_HARD_GRAD_NORM_CAP:-5.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
@@ -114,7 +114,7 @@ python train_preference_pref_only_nan_trace.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
-  --gradient_checkpointing true \
+  --gradient_checkpointing false \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \
