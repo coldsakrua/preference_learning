@@ -287,6 +287,30 @@ def _trace_event(args: argparse.Namespace, event: str, payload: Dict[str, Any]) 
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _second_filter_pref_pairs(
+    chosen_logps: torch.Tensor,
+    rejected_logps: torch.Tensor,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    raw_gap = chosen_logps - rejected_logps
+    finite_mask = torch.isfinite(chosen_logps) & torch.isfinite(rejected_logps) & torch.isfinite(raw_gap)
+    chosen_ok = chosen_logps >= float(args.train_pref_second_filter_min_chosen_logp)
+    rejected_ok = rejected_logps >= float(args.train_pref_second_filter_min_rejected_logp)
+    gap_ok = torch.abs(raw_gap) <= float(args.train_pref_second_filter_max_abs_raw_gap)
+    keep_mask = finite_mask & chosen_ok & rejected_ok & gap_ok
+
+    return {
+        "keep_mask": keep_mask,
+        "raw_gap": raw_gap,
+        "drop_nonfinite": int((~finite_mask).sum().item()),
+        "drop_chosen_floor": int((finite_mask & (~chosen_ok)).sum().item()),
+        "drop_rejected_floor": int((finite_mask & (~rejected_ok)).sum().item()),
+        "drop_raw_gap_cap": int((finite_mask & (~gap_ok)).sum().item()),
+        "kept": int(keep_mask.sum().item()),
+        "total": int(keep_mask.numel()),
+    }
+
+
 def _online_run_pref_only_nan_trace_step(
     model: object,
     tokenizer: object,
@@ -323,6 +347,8 @@ def _online_run_pref_only_nan_trace_step(
     pref_loss_weighted_sum = 0.0
     gap_weighted_sum = 0.0
     pref_weight_sum = 0.0
+    effective_pairs_used = 0
+    dropped_by_second_filter = 0
 
     _trace(f"optimizer_step_start pref_batch={pref_batch} total_weight={total_weight:.6f} mb_pref={mb_pref}", args)
     _trace_event(
@@ -360,7 +386,54 @@ def _online_run_pref_only_nan_trace_step(
             optimizer.zero_grad(set_to_none=True)
             return _build_zero_stats(f"nonfinite_detected_before_gap({bad_msg})")
 
-        preference_gap = chosen_logps - rejected_logps
+        raw_gap = chosen_logps - rejected_logps
+        if args.train_pref_second_filter_enabled:
+            second_filter = _second_filter_pref_pairs(chosen_logps, rejected_logps, args)
+            raw_gap = second_filter["raw_gap"]
+            keep_mask = second_filter["keep_mask"]
+            keep_cnt = int(second_filter["kept"])
+            total_cnt = int(second_filter["total"])
+            drop_cnt = total_cnt - keep_cnt
+            dropped_by_second_filter += drop_cnt
+            _trace(
+                f"chunk[{start}:{end}] second_filter kept={keep_cnt}/{total_cnt} "
+                f"drop_nonfinite={second_filter['drop_nonfinite']} "
+                f"drop_chosen_floor={second_filter['drop_chosen_floor']} "
+                f"drop_rejected_floor={second_filter['drop_rejected_floor']} "
+                f"drop_raw_gap_cap={second_filter['drop_raw_gap_cap']}",
+                args,
+            )
+            _trace_event(
+                args,
+                "second_filter",
+                {
+                    "chunk_start": int(start),
+                    "chunk_end": int(end),
+                    "kept": keep_cnt,
+                    "total": total_cnt,
+                    "drop_nonfinite": int(second_filter["drop_nonfinite"]),
+                    "drop_chosen_floor": int(second_filter["drop_chosen_floor"]),
+                    "drop_rejected_floor": int(second_filter["drop_rejected_floor"]),
+                    "drop_raw_gap_cap": int(second_filter["drop_raw_gap_cap"]),
+                },
+            )
+            if keep_cnt < int(args.train_pref_second_filter_min_pairs_per_chunk):
+                _trace(
+                    f"chunk[{start}:{end}] skipped_by_second_filter "
+                    f"(kept={keep_cnt} < min_pairs_per_chunk={args.train_pref_second_filter_min_pairs_per_chunk})",
+                    args,
+                )
+                continue
+
+            chosen_logps = chosen_logps[keep_mask]
+            rejected_logps = rejected_logps[keep_mask]
+            raw_gap = raw_gap[keep_mask]
+            w = w[keep_mask]
+            effective_pairs_used += keep_cnt
+        else:
+            effective_pairs_used += int(raw_gap.numel())
+
+        preference_gap = raw_gap
         if args.online_gap_clip_abs > 0:
             preference_gap = preference_gap.clamp(-args.online_gap_clip_abs, args.online_gap_clip_abs)
         if args.nan_trace_log_tensor_stats:
@@ -438,6 +511,12 @@ def _online_run_pref_only_nan_trace_step(
         gap_weighted_sum += (preference_gap * w).sum().item()
         pref_weight_sum += w.sum().item()
 
+    if effective_pairs_used <= 0 or pref_weight_sum <= 0:
+        optimizer.zero_grad(set_to_none=True)
+        return _build_zero_stats(
+            f"all_pairs_filtered_in_step(dropped={dropped_by_second_filter},total={pref_batch})"
+        )
+
     trainable = [p for p in model.parameters() if p.requires_grad]
     if args.max_grad_norm > 0:
         total_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
@@ -485,7 +564,7 @@ def _online_run_pref_only_nan_trace_step(
         pref_loss=pref_loss,
         gt_pref_loss=0.0,
         mean_gap=mean_gap,
-        pref_pairs_used=pref_batch,
+        pref_pairs_used=effective_pairs_used,
         gt_pref_pairs_used=0,
         mle_samples_used=0,
         lora_mean_abs=lora_health["lora_mean_abs"],
@@ -530,6 +609,36 @@ def main() -> None:
         default=True,
         help="Write structured debug records to output_dir/nan_trace_debug.jsonl.",
     )
+    parser.add_argument(
+        "--train_pref_second_filter_enabled",
+        type=str2bool,
+        default=True,
+        help="Enable per-chunk second-stage pair filtering before backward.",
+    )
+    parser.add_argument(
+        "--train_pref_second_filter_min_chosen_logp",
+        type=float,
+        default=-3.0,
+        help="Second filter: keep only pairs with chosen_logp >= this threshold.",
+    )
+    parser.add_argument(
+        "--train_pref_second_filter_min_rejected_logp",
+        type=float,
+        default=-4.5,
+        help="Second filter: keep only pairs with rejected_logp >= this threshold.",
+    )
+    parser.add_argument(
+        "--train_pref_second_filter_max_abs_raw_gap",
+        type=float,
+        default=2.0,
+        help="Second filter: keep only pairs with abs(raw_gap) <= this threshold before gap clip.",
+    )
+    parser.add_argument(
+        "--train_pref_second_filter_min_pairs_per_chunk",
+        type=int,
+        default=1,
+        help="If kept pairs in chunk is below this number, skip this chunk.",
+    )
     args = parser.parse_args()
     set_seed(args.seed)
     args._nan_trace_jsonl_path = str(Path(args.output_dir).expanduser().resolve() / "nan_trace_debug.jsonl")
@@ -560,6 +669,10 @@ def main() -> None:
         f"lambda_pref={args.lambda_pref} "
         f"logprob_micro_batch_size={args.logprob_micro_batch_size} "
         f"gradient_checkpointing={args.gradient_checkpointing} "
+        f"second_filter={args.train_pref_second_filter_enabled} "
+        f"chosen_floor={args.train_pref_second_filter_min_chosen_logp} "
+        f"rejected_floor={args.train_pref_second_filter_min_rejected_logp} "
+        f"raw_gap_cap={args.train_pref_second_filter_max_abs_raw_gap} "
         f"jsonl={args._nan_trace_jsonl_path}",
         flush=True,
     )
