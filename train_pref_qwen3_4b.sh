@@ -48,8 +48,6 @@ beta=${BETA:-0.3}
 lambda_gt=${LAMBDA_GT:-0.0}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
-online_mle_min_avg_logprob=${ONLINE_MLE_MIN_AVG_LOGPROB:--3}
-positive_weight_mode=${POSITIVE_WEIGHT_MODE:-uniform}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.85}
@@ -80,7 +78,6 @@ mkdir -p "${run_root}" "${train_out}"
 echo "[PREF] run_root=${run_root}"
 echo "[PREF] world_size=${world_size} rollout_batch_per_gpu=$((rollout_batch_size / world_size)) rollout_n=${rollout_n}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[PREF] positive_weight_mode=${positive_weight_mode} online_mle_min_avg_logprob=${online_mle_min_avg_logprob}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
 echo "[PREF] launcher=python(single-process, vLLM tensor_parallel_size=${tensor_parallel_size})"
 python train_preference.py \
@@ -112,8 +109,6 @@ python train_preference.py \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
   --online_gap_clip_abs "${online_gap_clip_abs}" \
-  --online_mle_min_avg_logprob "${online_mle_min_avg_logprob}" \
-  --positive_weight_mode "${positive_weight_mode}" \
   --use_lora "${use_lora}" \
   --lora_r "${lora_r}" \
   --lora_alpha "${lora_alpha}" \

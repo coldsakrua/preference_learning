@@ -499,14 +499,8 @@ def _seq_logps_from_logits_labels(
     shifted_labels = labels[:, 1:]
     valid_mask = shifted_labels.ne(-100)
     safe_labels = shifted_labels.masked_fill(~valid_mask, 0)
-    # Use fp32 for vocab normalization, and sanitize before logsumexp so a finite
-    # scalar loss cannot hide non-finite logits that would poison backward().
-    shifted_logits_f = torch.nan_to_num(
-        shifted_logits.float(),
-        nan=-1.0e4,
-        neginf=-1.0e4,
-        posinf=1.0e4,
-    )
+    # Use fp32 for vocab normalization, but avoid materializing full-vocab log_softmax.
+    shifted_logits_f = shifted_logits.float()
     target_logits = shifted_logits_f.gather(
         dim=-1, index=safe_labels.unsqueeze(-1)
     ).squeeze(-1)
@@ -1126,61 +1120,6 @@ def _online_run_preference_optimizer_step(
             kept,
         )
 
-    def _prefilter_mle_chunk_before_autograd(
-        start: int,
-        end: int,
-        prompts: List[str],
-        completions: List[str],
-        weights: torch.Tensor,
-    ) -> Tuple[List[str], List[str], torch.Tensor, int]:
-        min_avg_logprob = getattr(args, "online_mle_min_avg_logprob", None)
-        if min_avg_logprob is None:
-            return prompts, completions, weights, int(weights.numel())
-
-        was_training = bool(getattr(model, "training", False))
-        if was_training:
-            model.eval()
-        try:
-            with torch.no_grad():
-                logps = _compute_sequence_logps_batch(
-                    model,
-                    tokenizer,
-                    prompts,
-                    completions,
-                    args.max_length,
-                    device,
-                )
-        finally:
-            if was_training:
-                model.train()
-
-        keep_mask = torch.isfinite(logps)
-        finite_mask = keep_mask.clone()
-        keep_mask = keep_mask & (logps >= float(min_avg_logprob))
-        kept = int(keep_mask.sum().item())
-        total = int(keep_mask.numel())
-        if kept < total:
-            floor_drop = int(
-                (finite_mask & (logps < float(min_avg_logprob))).sum().item()
-            )
-            print(
-                f"[online] mle train_prefilter chunk=[{start},{end}) "
-                f"kept={kept}/{total} dropped_before_autograd={total - kept} "
-                f"drop_nonfinite={int((~finite_mask).sum().item())} "
-                f"drop_mle_floor={floor_drop}",
-                flush=True,
-            )
-        if kept <= 0:
-            return [], [], weights[:0], 0
-
-        keep_mask = keep_mask.detach()
-        return (
-            _filter_list_by_mask(prompts, keep_mask),
-            _filter_list_by_mask(completions, keep_mask),
-            weights[keep_mask.to(device=weights.device)],
-            kept,
-        )
-
     def _run_pref_like_branch(
         branch: str,
         train_prompts: List[str],
@@ -1295,15 +1234,6 @@ def _online_run_preference_optimizer_step(
             tp = mle_train_prompts[start:end]
             cp = mle_completions[start:end]
             w = torch.tensor(mle_weights[start:end], device=device, dtype=torch.float32)
-            tp, cp, w, chunk_mle_used = _prefilter_mle_chunk_before_autograd(
-                start,
-                end,
-                tp,
-                cp,
-                w,
-            )
-            if chunk_mle_used <= 0:
-                continue
             logps = _compute_sequence_logps_batch(
                 model,
                 tokenizer,
@@ -1326,7 +1256,7 @@ def _online_run_preference_optimizer_step(
                 return failed
             mle_loss_weighted_sum += (mle_loss_vec * w).sum().item()
             mle_weight_sum_used += w.sum().item()
-            mle_samples_used += chunk_mle_used
+            mle_samples_used += int(w.numel())
 
     if pref_weight_sum + gt_pref_weight_sum + mle_weight_sum_used <= 0:
         optimizer.zero_grad(set_to_none=True)
@@ -1359,7 +1289,7 @@ def _online_run_preference_optimizer_step(
     mean_gap = gap_weighted_sum / gap_weight_sum if gap_weight_sum > 0 else 0.0
     pref_loss = pref_loss_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
     gt_pref_loss = gt_pref_loss_weighted_sum / gt_pref_weight_sum if gt_pref_weight_sum > 0 else 0.0
-    mle_weight_sum = mle_weight_sum_used
+    mle_weight_sum = float(sum(mle_weights))
     mle_loss = mle_loss_weighted_sum / mle_weight_sum if mle_weight_sum > 0 else 0.0
     total_loss = (pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum) / total_weight
     lora_health = _compute_lora_param_health(model)
@@ -1520,8 +1450,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
-        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}, "
-        f"mle_min_avg_logprob={getattr(args, 'online_mle_min_avg_logprob', None)}"
+        f"pref_min_avg_logprob_rejected={args.online_pref_min_avg_logprob_rejected}"
     )
     _write_metric(
         "run_start",
@@ -1537,7 +1466,6 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "lambda_mle": args.lambda_mle,
             "lambda_pref": args.lambda_pref,
             "lambda_gt": args.lambda_gt,
-            "online_mle_min_avg_logprob": getattr(args, "online_mle_min_avg_logprob", None),
             "metrics_jsonl": str(metrics_jsonl_path),
         },
     )

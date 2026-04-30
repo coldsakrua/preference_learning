@@ -608,16 +608,6 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
             "correlates with grad NaN in bf16). Typical try: -4 to -6. Omit to disable."
         ),
     )
-    parser.add_argument(
-        "--online_mle_min_avg_logprob",
-        type=float,
-        default=None,
-        help=(
-            "Online: require MLE/correct trajectory avg_logprob >= this value before "
-            "autograd. This keeps low-confidence correct samples from creating bf16 "
-            "non-finite gradients. Omit to disable."
-        ),
-    )
     parser.add_argument("--online_skip_nonfinite_loss", type=str2bool, default=True, help="Online only: skip update when loss chunk or grad norm is non-finite.")
     parser.add_argument("--online_abort_on_lora_nan", type=str2bool, default=True, help="Online only: immediately stop if LoRA params become NaN after optimizer step.")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
