@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -2124,6 +2125,14 @@ def main() -> None:
     parser = build_cli_parser(DEFAULT_SYSTEM_PROMPT)
     args = parser.parse_args()
     set_seed(args.seed)
+
+    launcher_world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    if launcher_world_size > 1:
+        raise SystemExit(
+            "error: train_preference.py is a single-process online trainer. "
+            "Do not launch it with torchrun/DDP; use one Python process with "
+            "CUDA_VISIBLE_DEVICES=0,1 and --tensor_parallel_size 2 for dual-GPU vLLM rollout."
+        )
 
     if args.online_mle_on_correct_only and args.online_pref_loss_only:
         raise SystemExit(

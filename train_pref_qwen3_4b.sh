@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -o logs/pref_4b_1gpu.%j.out
+#SBATCH -o logs/pref_4b_2gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=81920M
 #SBATCH --time=72:00:00
 #SBATCH --exclude=gpua800n13,gpua800n04
@@ -21,7 +21,7 @@ mkdir -p logs
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -47,7 +47,7 @@ learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-0.3}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-8}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
-tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
+tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-2}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.85}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
@@ -67,10 +67,10 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/pref_4b_1gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/pref_4b_2gpu/${run_name}}
 train_out="${run_root}/train"
 
-world_size=1
+world_size=2
 
 mkdir -p "${run_root}" "${train_out}"
 
@@ -78,7 +78,7 @@ echo "[PREF] run_root=${run_root}"
 echo "[PREF] world_size=${world_size} rollout_batch_per_gpu=$((rollout_batch_size / world_size)) rollout_n=${rollout_n}"
 echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
 echo "[PREF] online mode: vLLM rollout + HF preference update"
-echo "[PREF] launcher=python(single-process)"
+echo "[PREF] launcher=python(single-process, vLLM tensor_parallel_size=${tensor_parallel_size})"
 python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
@@ -116,7 +116,7 @@ python train_preference.py \
   --enable_thinking false \
   --use_all_wrong_gt_preference false \
   --online_pref_min_avg_logprob_chosen -3 \
-  --online_pref_min_avg_logprob_rejected -3 \
+  --online_pref_min_avg_logprob_rejected -3
 
 echo "[PREF] done"
 echo "train_output=${train_out}"
