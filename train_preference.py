@@ -1563,6 +1563,28 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     w_max=args.prompt_weight_max,
                 )
 
+                if n_correct_total == 0 and (
+                    not args.use_all_wrong_gt_preference or float(args.lambda_gt) <= 0.0
+                ):
+                    skipped_all_wrong += 1
+                    skipped_all_wrong_in_rollout += 1
+                    record = build_online_bootstrap_jsonl_record(
+                        sample_id=sample_obj.sample_id,
+                        prompt=sample_obj.prompt,
+                        prompt_user_effective=sample_obj.prompt + rollout_user_suffix,
+                        system_prompt=system_prompts[idx],
+                        ground_truth=sample_obj.ground_truth,
+                        candidates=candidates,
+                        split=split,
+                        objective=None,
+                        prompt_weight=prompt_weight,
+                        rho_hat=rho_hat,
+                        all_trajectories=[],
+                        include_dense_rollouts=False,
+                    )
+                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    continue
+
                 trajectories = build_rollout_trajectories_for_prompt(
                     model=model,
                     tokenizer=tokenizer,
