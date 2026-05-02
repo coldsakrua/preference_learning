@@ -33,9 +33,9 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
-online_steps=${ONLINE_STEPS:-80}
+online_steps=${ONLINE_STEPS:-40}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-8}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-8}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
@@ -43,13 +43,10 @@ top_k=${TOP_K:-20}
 min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
-learning_rate=${LEARNING_RATE:-5e-7}
-beta=${BETA:-2.0}
-simpo_margin=${SIMPO_MARGIN:-0.5}
-simpo_low_vram_backward=${SIMPO_LOW_VRAM_BACKWARD:-true}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-1}
-rollout_feature_micro_batch_size=${ROLLOUT_FEATURE_MICRO_BATCH_SIZE:-4}
-online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-2.0}
+learning_rate=${LEARNING_RATE:-1e-6}
+beta=${BETA:-1}
+logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
+online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.70}
@@ -60,8 +57,11 @@ online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 use_lora=${USE_LORA:-true}
 lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
-lora_dropout=${LORA_DROPOUT:-0.0}
+lora_dropout=${LORA_DROPOUT:-0.05}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
+
+simpo_margin=${SIMPO_MARGIN:-0.5}
+simpo_low_vram_backward=${SIMPO_LOW_VRAM_BACKWARD:-true}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -93,8 +93,8 @@ mkdir -p "${run_root}" "${train_out}"
 
 echo "[SIMPO] run_root=${run_root}"
 echo "[SIMPO] world_size=${world_size} rollout_batch_per_gpu=$((rollout_batch_size / world_size)) rollout_n=${rollout_n}"
-echo "[SIMPO] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha} lora_dropout=${lora_dropout}"
-echo "[SIMPO] online mode: mixed-region SimPO loss only beta=${beta} margin=${simpo_margin}"
+echo "[SIMPO] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
+echo "[SIMPO] online mode: SimPO (preference-only lambdas; beta=${beta} margin=${simpo_margin})"
 python train_simpo.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
@@ -124,13 +124,11 @@ python train_simpo.py \
   --simpo_low_vram_backward "${simpo_low_vram_backward}" \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
-  --rollout_feature_micro_batch_size "${rollout_feature_micro_batch_size}" \
   --online_gap_clip_abs "${online_gap_clip_abs}" \
   --lambda_mle 0.0 \
   --lambda_pref 1.0 \
   --lambda_gt 0.0 \
   --online_mle_on_correct_only false \
-  --online_pref_loss_only true \
   --use_all_wrong_gt_preference false \
   --use_lora "${use_lora}" \
   --lora_r "${lora_r}" \
