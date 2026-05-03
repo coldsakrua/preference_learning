@@ -45,6 +45,11 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
 beta=${BETA:-1}
+pref_loss_type=${PREF_LOSS_TYPE:-group_mass}
+group_pref_tau=${GROUP_PREF_TAU:-0.5}
+group_pref_score_norm=${GROUP_PREF_SCORE_NORM:-none}
+group_pref_score_std_floor=${GROUP_PREF_SCORE_STD_FLOOR:-0.05}
+group_pref_score_clip_abs=${GROUP_PREF_SCORE_CLIP_ABS:-0.0}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
 online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
@@ -91,7 +96,7 @@ mkdir -p "${run_root}" "${train_out}"
 echo "[PREF-ONLY] run_root=${run_root}"
 echo "[PREF-ONLY] world_size=${world_size} rollout_batch_per_gpu=$((rollout_batch_size / world_size)) rollout_n=${rollout_n}"
 echo "[PREF-ONLY] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[PREF-ONLY] online mode: preference loss only"
+echo "[PREF-ONLY] online mode: preference loss only (${pref_loss_type})"
 python train_preference.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
@@ -117,6 +122,11 @@ python train_preference.py \
   --max_new_tokens "${max_new_tokens}" \
   --learning_rate "${learning_rate}" \
   --beta "${beta}" \
+  --pref_loss_type "${pref_loss_type}" \
+  --group_pref_tau "${group_pref_tau}" \
+  --group_pref_score_norm "${group_pref_score_norm}" \
+  --group_pref_score_std_floor "${group_pref_score_std_floor}" \
+  --group_pref_score_clip_abs "${group_pref_score_clip_abs}" \
   --max_length "${max_length}" \
   --logprob_micro_batch_size "${logprob_micro_batch_size}" \
   --online_gap_clip_abs "${online_gap_clip_abs}" \

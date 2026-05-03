@@ -68,7 +68,7 @@ class OnlinePendingObjective:
     sample_id: str
     ground_truth: str
     train_prompt: str
-    objective_type: str  # "mixed" | "all_correct" | "all_wrong" | "correct_only_mle" | "mixed_pref_only"
+    objective_type: str  # "mixed_group" | "all_correct" | "all_wrong" | "correct_only_mle" | "mixed_pref_only"
     rho_hat: float
     prompt_weight: float
     correct: List["RolloutTrajectory"]
@@ -101,7 +101,9 @@ class OnlineStepLossStats:
     mean_gap: float
     pref_pairs_used: int
     gt_pref_pairs_used: int
+    pref_groups_used: int
     mle_samples_used: int
+    group_correct_mass: float
     lora_mean_abs: float
     lora_max_abs: float
     lora_nan_ratio: float
@@ -323,20 +325,6 @@ def compute_correct_trajectory_weights(
     return [float(x) for x in weights.tolist()]
 
 
-def build_hidden_nn_pairs(
-    correct_trajs: Sequence[RolloutTrajectory],
-    wrong_trajs: Sequence[RolloutTrajectory],
-) -> List[Tuple[int, int]]:
-    if not correct_trajs or not wrong_trajs:
-        return []
-    correct_h = torch.tensor([t.hidden_vec for t in correct_trajs], dtype=torch.float32)
-    wrong_h = torch.tensor([t.hidden_vec for t in wrong_trajs], dtype=torch.float32)
-    # hidden_vec has already been L2-normalized; dot product equals cosine.
-    sim = wrong_h @ correct_h.transpose(0, 1)
-    nn_correct_idx = sim.argmax(dim=1).tolist()
-    return [(int(c_idx), int(w_idx)) for w_idx, c_idx in enumerate(nn_correct_idx)]
-
-
 def _pref_pair_passes_avg_logprob_floor(
     chosen_avg_logprob: float,
     rejected_avg_logprob: float,
@@ -349,24 +337,6 @@ def _pref_pair_passes_avg_logprob_floor(
     if min_rejected is not None and rejected_avg_logprob < min_rejected:
         return False
     return True
-
-
-def filter_mixed_pref_pairs_by_avg_logprob(
-    mixed_pairs: Sequence[Tuple[int, int]],
-    correct_trajs: Sequence[RolloutTrajectory],
-    wrong_trajs: Sequence[RolloutTrajectory],
-    min_chosen: Optional[float],
-    min_rejected: Optional[float],
-) -> List[Tuple[int, int]]:
-    if min_chosen is None and min_rejected is None:
-        return [(int(a), int(b)) for a, b in mixed_pairs]
-    out: List[Tuple[int, int]] = []
-    for c_idx, w_idx in mixed_pairs:
-        c_lp = correct_trajs[c_idx].avg_logprob
-        w_lp = wrong_trajs[w_idx].avg_logprob
-        if _pref_pair_passes_avg_logprob_floor(c_lp, w_lp, min_chosen, min_rejected):
-            out.append((int(c_idx), int(w_idx)))
-    return out
 
 
 def _mean_or_nan(values: Sequence[float]) -> float:
@@ -542,6 +512,27 @@ def _compute_sequence_logps_batch(
     return _seq_logps_from_logits_labels(logits, labels)
 
 
+def _compute_sequence_logps_entropy_batch(
+    model: object,
+    tokenizer: object,
+    prompt_texts: Sequence[str],
+    completion_texts: Sequence[str],
+    max_length: int,
+    device: torch.device,
+    compute_entropy: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_ids, attention_mask, labels = _labeled_batch_tensors(
+        tokenizer, prompt_texts, completion_texts, max_length, device
+    )
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    seq_logps = _seq_logps_from_logits_labels(outputs.logits, labels)
+    if compute_entropy:
+        seq_entropy = _seq_entropy_from_logits_labels(outputs.logits, labels)
+    else:
+        seq_entropy = torch.full_like(seq_logps, float("nan"))
+    return seq_logps, seq_entropy
+
+
 def _compute_sequence_logps_and_hidden_batch(
     model: object,
     tokenizer: object,
@@ -602,6 +593,7 @@ def build_rollout_trajectories_for_prompt(
     avg_entropies: List[float] = []
     hidden_vecs: List[List[float]] = []
     mb = args.rollout_feature_micro_batch_size if args.rollout_feature_micro_batch_size > 0 else len(candidates)
+    needs_hidden_pairs = False
 
     was_training = bool(getattr(model, "training", False))
     model.eval()
@@ -610,19 +602,31 @@ def build_rollout_trajectories_for_prompt(
             end = min(start + mb, len(candidates))
             batch_prompts = prompt_texts[start:end]
             batch_completions = list(candidates[start:end])
-            seq_logps, seq_entropy, batch_hidden = _compute_sequence_logps_and_hidden_batch(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_texts=batch_prompts,
-                completion_texts=batch_completions,
-                max_length=args.max_length,
-                device=device,
-                hidden_layer_offset=args.hidden_layer_offset,
-                compute_entropy=bool(getattr(args, "rollout_compute_entropy", True)),
-            )
+            if needs_hidden_pairs:
+                seq_logps, seq_entropy, batch_hidden = _compute_sequence_logps_and_hidden_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=batch_prompts,
+                    completion_texts=batch_completions,
+                    max_length=args.max_length,
+                    device=device,
+                    hidden_layer_offset=args.hidden_layer_offset,
+                    compute_entropy=bool(getattr(args, "rollout_compute_entropy", True)),
+                )
+                hidden_vecs.extend([[float(x) for x in row] for row in batch_hidden.detach().cpu().tolist()])
+            else:
+                seq_logps, seq_entropy = _compute_sequence_logps_entropy_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=batch_prompts,
+                    completion_texts=batch_completions,
+                    max_length=args.max_length,
+                    device=device,
+                    compute_entropy=bool(getattr(args, "rollout_compute_entropy", True)),
+                )
+                hidden_vecs.extend([[] for _ in range(end - start)])
             avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
             avg_entropies.extend([float(v) for v in seq_entropy.detach().cpu().tolist()])
-            hidden_vecs.extend([[float(x) for x in row] for row in batch_hidden.detach().cpu().tolist()])
     if was_training:
         model.train()
 
@@ -950,6 +954,10 @@ def _online_run_preference_optimizer_step(
     pref_chosen: List[str],
     pref_rejected: List[str],
     pref_weights: List[float],
+    group_pref_train_prompts: List[str],
+    group_pref_correct: List[List[str]],
+    group_pref_wrong: List[List[str]],
+    group_pref_weights: List[float],
     gt_pref_train_prompts: List[str],
     gt_pref_chosen: List[str],
     gt_pref_rejected: List[str],
@@ -962,7 +970,9 @@ def _online_run_preference_optimizer_step(
     pref_batch = len(pref_train_prompts)
     gt_pref_batch = len(gt_pref_train_prompts)
     mle_batch = len(mle_train_prompts)
-    total_weight = float(sum(pref_weights) + sum(gt_pref_weights) + sum(mle_weights))
+    total_weight = float(
+        sum(pref_weights) + sum(group_pref_weights) + sum(gt_pref_weights) + sum(mle_weights)
+    )
 
     def _build_zero_stats(reason: str, grad_norm_value: float = 0.0) -> OnlineStepLossStats:
         return OnlineStepLossStats(
@@ -973,7 +983,9 @@ def _online_run_preference_optimizer_step(
             mean_gap=0.0,
             pref_pairs_used=0,
             gt_pref_pairs_used=0,
+            pref_groups_used=0,
             mle_samples_used=0,
+            group_correct_mass=0.0,
             lora_mean_abs=0.0,
             lora_max_abs=0.0,
             lora_nan_ratio=0.0,
@@ -996,12 +1008,14 @@ def _online_run_preference_optimizer_step(
     gt_pref_loss_weighted_sum = 0.0
     mle_loss_weighted_sum = 0.0
     gap_weighted_sum = 0.0
+    group_mass_weighted_sum = 0.0
     pref_weight_sum = 0.0
     gt_pref_weight_sum = 0.0
     mle_weight_sum_used = 0.0
     gap_weight_sum = 0.0
     pref_pairs_used = 0
     gt_pref_pairs_used = 0
+    pref_groups_used = 0
     mle_samples_used = 0
 
     def _check_chunk_and_backward(
@@ -1206,6 +1220,96 @@ def _online_run_preference_optimizer_step(
             gap_weight_sum += w_sum
         return None
 
+    def _normalize_group_pref_scores(scores: torch.Tensor) -> torch.Tensor:
+        mode = str(getattr(args, "group_pref_score_norm", "none"))
+        if mode == "none":
+            out = scores
+        elif mode == "zscore":
+            detached = scores.detach()
+            center = detached.mean()
+            scale = detached.std(unbiased=False).clamp_min(float(args.group_pref_score_std_floor))
+            out = (scores - center) / scale
+        else:
+            raise ValueError(f"Unsupported group_pref_score_norm: {mode}")
+        clip_abs = float(getattr(args, "group_pref_score_clip_abs", 0.0))
+        if clip_abs > 0:
+            out = out.clamp(-clip_abs, clip_abs)
+        return out
+
+    def _run_group_pref_branch() -> Optional[OnlineStepLossStats]:
+        nonlocal pref_loss_weighted_sum
+        nonlocal gap_weighted_sum
+        nonlocal group_mass_weighted_sum
+        nonlocal pref_weight_sum
+        nonlocal gap_weight_sum
+        nonlocal pref_groups_used
+
+        tau = float(args.group_pref_tau)
+        for group_idx, (train_prompt, correct, wrong, weight) in enumerate(
+            zip(group_pref_train_prompts, group_pref_correct, group_pref_wrong, group_pref_weights)
+        ):
+            if not correct or not wrong or weight <= 0:
+                continue
+            completions = list(correct) + list(wrong)
+            prompts = [train_prompt for _ in completions]
+            scores = _compute_sequence_logps_batch(
+                model,
+                tokenizer,
+                prompts,
+                completions,
+                args.max_length,
+                device,
+            )
+            pos_mask = torch.zeros(scores.shape[0], device=device, dtype=torch.bool)
+            pos_mask[: len(correct)] = True
+
+            keep_mask = torch.isfinite(scores)
+            if args.online_pref_min_avg_logprob_chosen is not None:
+                keep_mask = keep_mask & (~pos_mask | (scores >= float(args.online_pref_min_avg_logprob_chosen)))
+            if args.online_pref_min_avg_logprob_rejected is not None:
+                keep_mask = keep_mask & (pos_mask | (scores >= float(args.online_pref_min_avg_logprob_rejected)))
+
+            kept_pos = int((keep_mask & pos_mask).sum().item())
+            kept_wrong = int((keep_mask & ~pos_mask).sum().item())
+            if kept_pos <= 0 or kept_wrong <= 0:
+                print(
+                    f"[online] group_pref train_prefilter group={group_idx} "
+                    f"kept_pos={kept_pos}/{len(correct)} kept_wrong={kept_wrong}/{len(wrong)} "
+                    f"dropped_before_autograd={int((~keep_mask).sum().item())}",
+                    flush=True,
+                )
+                continue
+
+            scores = scores[keep_mask]
+            pos_mask = pos_mask[keep_mask]
+            train_scores = _normalize_group_pref_scores(scores)
+            logits = train_scores / tau
+            log_pos_mass = torch.logsumexp(logits[pos_mask], dim=0)
+            log_all_mass = torch.logsumexp(logits, dim=0)
+            group_loss = log_all_mass - log_pos_mass
+            w = float(weight)
+            loss_chunk = group_loss * w / total_weight
+            loss_chunk_val = float(loss_chunk.detach().item())
+            failed = _check_chunk_and_backward(
+                loss_chunk=loss_chunk,
+                loss_chunk_val=loss_chunk_val,
+                skip_prefix="group_pref",
+                start=group_idx,
+                end=group_idx + 1,
+            )
+            if failed is not None:
+                return failed
+
+            raw_gap = scores[pos_mask].mean() - scores[~pos_mask].mean()
+            correct_mass = torch.exp((log_pos_mass - log_all_mass).detach()).clamp(0.0, 1.0)
+            pref_loss_weighted_sum += float(group_loss.detach().item()) * w
+            gap_weighted_sum += float(raw_gap.detach().item()) * w
+            group_mass_weighted_sum += float(correct_mass.item()) * w
+            pref_weight_sum += w
+            gap_weight_sum += w
+            pref_groups_used += 1
+        return None
+
     failed = _run_pref_like_branch(
         branch="pref",
         train_prompts=pref_train_prompts,
@@ -1214,6 +1318,10 @@ def _online_run_preference_optimizer_step(
         weights=pref_weights,
         micro_batch=mb_pref,
     )
+    if failed is not None:
+        return failed
+
+    failed = _run_group_pref_branch()
     if failed is not None:
         return failed
 
@@ -1289,6 +1397,7 @@ def _online_run_preference_optimizer_step(
     mean_gap = gap_weighted_sum / gap_weight_sum if gap_weight_sum > 0 else 0.0
     pref_loss = pref_loss_weighted_sum / pref_weight_sum if pref_weight_sum > 0 else 0.0
     gt_pref_loss = gt_pref_loss_weighted_sum / gt_pref_weight_sum if gt_pref_weight_sum > 0 else 0.0
+    group_correct_mass = group_mass_weighted_sum / pref_weight_sum if pref_groups_used > 0 and pref_weight_sum > 0 else 0.0
     mle_weight_sum = float(sum(mle_weights))
     mle_loss = mle_loss_weighted_sum / mle_weight_sum if mle_weight_sum > 0 else 0.0
     total_loss = (pref_loss_weighted_sum + gt_pref_loss_weighted_sum + mle_loss_weighted_sum) / total_weight
@@ -1306,7 +1415,9 @@ def _online_run_preference_optimizer_step(
         mean_gap=mean_gap,
         pref_pairs_used=pref_pairs_used,
         gt_pref_pairs_used=gt_pref_pairs_used,
+        pref_groups_used=pref_groups_used,
         mle_samples_used=mle_samples_used,
+        group_correct_mass=group_correct_mass,
         lora_mean_abs=lora_health["lora_mean_abs"],
         lora_max_abs=lora_health["lora_max_abs"],
         lora_nan_ratio=lora_health["lora_nan_ratio"],
@@ -1421,6 +1532,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     rollout_steps = 0
     scanned = 0
     kept_pref_pairs = 0
+    kept_pref_groups = 0
     kept_gt_pref_pairs = 0
     kept_mle_samples = 0
     skipped_all_wrong = 0
@@ -1447,6 +1559,9 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
         f"pos_weight_mode={args.positive_weight_mode}, "
         f"online_mle_on_correct_only={args.online_mle_on_correct_only}, "
         f"online_pref_loss_only={args.online_pref_loss_only}, "
+        f"pref_loss_type={args.pref_loss_type}, "
+        f"group_pref_tau={args.group_pref_tau}, "
+        f"group_pref_score_norm={args.group_pref_score_norm}, "
         f"lambda_mle={args.lambda_mle}, lambda_pref={args.lambda_pref}, lambda_gt={args.lambda_gt}, "
         f"gap_clip_abs={args.online_gap_clip_abs}, "
         f"pref_min_avg_logprob_chosen={args.online_pref_min_avg_logprob_chosen}, "
@@ -1463,6 +1578,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "rollout_n": args.rollout_n,
             "learning_rate": args.learning_rate,
             "beta": args.beta,
+            "pref_loss_type": str(args.pref_loss_type),
+            "group_pref_tau": float(args.group_pref_tau),
+            "group_pref_score_norm": str(args.group_pref_score_norm),
+            "group_pref_score_std_floor": float(args.group_pref_score_std_floor),
+            "group_pref_score_clip_abs": float(args.group_pref_score_clip_abs),
             "lambda_mle": args.lambda_mle,
             "lambda_pref": args.lambda_pref,
             "lambda_gt": args.lambda_gt,
@@ -1611,34 +1731,22 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
                 if args.online_pref_loss_only:
                     if n_correct_total > 0 and n_correct_total < n_total and correct_trajs and wrong_trajs:
-                        mixed_pairs = build_hidden_nn_pairs(correct_trajs, wrong_trajs)
-                        mixed_pairs = filter_mixed_pref_pairs_by_avg_logprob(
-                            mixed_pairs,
-                            correct_trajs,
-                            wrong_trajs,
-                            args.online_pref_min_avg_logprob_chosen,
-                            args.online_pref_min_avg_logprob_rejected,
+                        objective = OnlinePendingObjective(
+                            sample_id=sample_obj.sample_id,
+                            ground_truth=sample_obj.ground_truth,
+                            train_prompt=prompt_texts[idx],
+                            objective_type="mixed_pref_only",
+                            rho_hat=rho_hat,
+                            prompt_weight=prompt_weight,
+                            correct=correct_trajs,
+                            wrong=wrong_trajs,
+                            correct_traj_weights=[],
+                            mixed_pref_pairs=[],
+                            gt_positive=None,
                         )
-                        if mixed_pairs:
-                            objective = OnlinePendingObjective(
-                                sample_id=sample_obj.sample_id,
-                                ground_truth=sample_obj.ground_truth,
-                                train_prompt=prompt_texts[idx],
-                                objective_type="mixed_pref_only",
-                                rho_hat=rho_hat,
-                                prompt_weight=prompt_weight,
-                                correct=correct_trajs,
-                                wrong=wrong_trajs,
-                                correct_traj_weights=[],
-                                mixed_pref_pairs=mixed_pairs,
-                                gt_positive=None,
-                            )
-                            rollout_objectives.append(objective)
-                            mixed_objectives_in_rollout += 1
-                            logged_mixed_objectives += 1
-                        else:
-                            skipped_after_filter += 1
-                            skipped_after_filter_in_rollout += 1
+                        rollout_objectives.append(objective)
+                        mixed_objectives_in_rollout += 1
+                        logged_mixed_objectives += 1
                     else:
                         skipped_after_filter += 1
                         skipped_after_filter_in_rollout += 1
@@ -1680,34 +1788,22 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                             mode=args.positive_weight_mode,
                             tau=args.positive_weight_tau,
                         )
-                        mixed_pairs = build_hidden_nn_pairs(correct_trajs, wrong_trajs)
-                        mixed_pairs = filter_mixed_pref_pairs_by_avg_logprob(
-                            mixed_pairs,
-                            correct_trajs,
-                            wrong_trajs,
-                            args.online_pref_min_avg_logprob_chosen,
-                            args.online_pref_min_avg_logprob_rejected,
+                        objective = OnlinePendingObjective(
+                            sample_id=sample_obj.sample_id,
+                            ground_truth=sample_obj.ground_truth,
+                            train_prompt=prompt_texts[idx],
+                            objective_type="mixed_group",
+                            rho_hat=rho_hat,
+                            prompt_weight=prompt_weight,
+                            correct=correct_trajs,
+                            wrong=wrong_trajs,
+                            correct_traj_weights=correct_weights,
+                            mixed_pref_pairs=[],
+                            gt_positive=None,
                         )
-                        if mixed_pairs:
-                            objective = OnlinePendingObjective(
-                                sample_id=sample_obj.sample_id,
-                                ground_truth=sample_obj.ground_truth,
-                                train_prompt=prompt_texts[idx],
-                                objective_type="mixed",
-                                rho_hat=rho_hat,
-                                prompt_weight=prompt_weight,
-                                correct=correct_trajs,
-                                wrong=wrong_trajs,
-                                correct_traj_weights=correct_weights,
-                                mixed_pref_pairs=mixed_pairs,
-                                gt_positive=None,
-                            )
-                            rollout_objectives.append(objective)
-                            mixed_objectives_in_rollout += 1
-                            logged_mixed_objectives += 1
-                        else:
-                            skipped_after_filter += 1
-                            skipped_after_filter_in_rollout += 1
+                        rollout_objectives.append(objective)
+                        mixed_objectives_in_rollout += 1
+                        logged_mixed_objectives += 1
                     else:
                         skipped_after_filter += 1
                         skipped_after_filter_in_rollout += 1
@@ -1875,6 +1971,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
 
             updates_in_rollout = 0
             consumed_pref_pairs_in_rollout = 0
+            consumed_pref_groups_in_rollout = 0
             consumed_gt_pref_pairs_in_rollout = 0
             consumed_mle_samples_in_rollout = 0
             dropped_pref_pairs_by_truncation_in_rollout = 0
@@ -1888,6 +1985,10 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     pref_chosen_raw: List[str] = []
                     pref_rejected_raw: List[str] = []
                     pref_weights_raw: List[float] = []
+                    group_pref_train_prompts_raw: List[str] = []
+                    group_pref_correct_raw: List[List[str]] = []
+                    group_pref_wrong_raw: List[List[str]] = []
+                    group_pref_weights_raw: List[float] = []
                     gt_pref_train_prompts_raw: List[str] = []
                     gt_pref_chosen_raw: List[str] = []
                     gt_pref_rejected_raw: List[str] = []
@@ -1897,20 +1998,20 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     mle_weights_raw: List[float] = []
 
                     for objective in chunk:
-                        if objective.objective_type == "mixed":
+                        if objective.objective_type == "mixed_group":
                             for traj, traj_weight in zip(objective.correct, objective.correct_traj_weights):
                                 mle_train_prompts_raw.append(objective.train_prompt)
                                 mle_completions_raw.append(traj.response_text)
                                 mle_weights_raw.append(
                                     float(args.lambda_mle) * float(objective.prompt_weight) * float(traj_weight)
                                 )
-                            if objective.mixed_pref_pairs:
-                                pair_weight = float(args.lambda_pref) / float(len(objective.mixed_pref_pairs))
-                                for c_idx, w_idx in objective.mixed_pref_pairs:
-                                    pref_train_prompts_raw.append(objective.train_prompt)
-                                    pref_chosen_raw.append(objective.correct[c_idx].response_text)
-                                    pref_rejected_raw.append(objective.wrong[w_idx].response_text)
-                                    pref_weights_raw.append(pair_weight)
+                            if objective.correct and objective.wrong:
+                                group_pref_train_prompts_raw.append(objective.train_prompt)
+                                group_pref_correct_raw.append([t.response_text for t in objective.correct])
+                                group_pref_wrong_raw.append([t.response_text for t in objective.wrong])
+                                group_pref_weights_raw.append(
+                                    float(args.lambda_pref) * float(objective.prompt_weight)
+                                )
                         elif objective.objective_type in {"all_correct", "correct_only_mle"}:
                             for traj, traj_weight in zip(objective.correct, objective.correct_traj_weights):
                                 mle_train_prompts_raw.append(objective.train_prompt)
@@ -1919,13 +2020,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                                     float(args.lambda_mle) * float(objective.prompt_weight) * float(traj_weight)
                                 )
                         elif objective.objective_type == "mixed_pref_only":
-                            if objective.mixed_pref_pairs:
-                                pair_weight = float(args.lambda_pref) / float(len(objective.mixed_pref_pairs))
-                                for c_idx, w_idx in objective.mixed_pref_pairs:
-                                    pref_train_prompts_raw.append(objective.train_prompt)
-                                    pref_chosen_raw.append(objective.correct[c_idx].response_text)
-                                    pref_rejected_raw.append(objective.wrong[w_idx].response_text)
-                                    pref_weights_raw.append(pair_weight)
+                            if objective.correct and objective.wrong:
+                                group_pref_train_prompts_raw.append(objective.train_prompt)
+                                group_pref_correct_raw.append([t.response_text for t in objective.correct])
+                                group_pref_wrong_raw.append([t.response_text for t in objective.wrong])
+                                group_pref_weights_raw.append(
+                                    float(args.lambda_pref) * float(objective.prompt_weight)
+                                )
                         elif objective.objective_type == "all_wrong":
                             if objective.gt_positive is None or not objective.wrong:
                                 continue
@@ -1994,9 +2095,14 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     )
                     dropped_mle_by_truncation_in_rollout += mle_trunc_stats.dropped_samples
 
-                    if not pref_train_prompts and not gt_pref_train_prompts and not mle_train_prompts:
+                    if (
+                        not pref_train_prompts
+                        and not group_pref_train_prompts_raw
+                        and not gt_pref_train_prompts
+                        and not mle_train_prompts
+                    ):
                         continue
-                    if (sum(pref_weights) + sum(gt_pref_weights) + sum(mle_weights)) <= 0:
+                    if (sum(pref_weights) + sum(group_pref_weights_raw) + sum(gt_pref_weights) + sum(mle_weights)) <= 0:
                         continue
 
                     loss_stats = _online_run_preference_optimizer_step(
@@ -2009,6 +2115,10 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         pref_chosen=pref_chosen,
                         pref_rejected=pref_rejected,
                         pref_weights=pref_weights,
+                        group_pref_train_prompts=group_pref_train_prompts_raw,
+                        group_pref_correct=group_pref_correct_raw,
+                        group_pref_wrong=group_pref_wrong_raw,
+                        group_pref_weights=group_pref_weights_raw,
                         gt_pref_train_prompts=gt_pref_train_prompts,
                         gt_pref_chosen=gt_pref_chosen,
                         gt_pref_rejected=gt_pref_rejected,
@@ -2037,9 +2147,11 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     updates += 1
                     updates_in_rollout += 1
                     consumed_pref_pairs_in_rollout += loss_stats.pref_pairs_used
+                    consumed_pref_groups_in_rollout += loss_stats.pref_groups_used
                     consumed_gt_pref_pairs_in_rollout += loss_stats.gt_pref_pairs_used
                     consumed_mle_samples_in_rollout += loss_stats.mle_samples_used
                     kept_pref_pairs += loss_stats.pref_pairs_used
+                    kept_pref_groups += loss_stats.pref_groups_used
                     kept_gt_pref_pairs += loss_stats.gt_pref_pairs_used
                     kept_mle_samples += loss_stats.mle_samples_used
                     print(
@@ -2047,6 +2159,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                         f"optimizer_step={updates} "
                         f"pref_loss={loss_stats.pref_loss:.6f} "
                         f"mean_gap={loss_stats.mean_gap:.6f} "
+                        f"group_correct_mass={loss_stats.group_correct_mass:.6f} "
                         f"gt_pref_loss={loss_stats.gt_pref_loss:.6f} "
                         f"mle_loss={loss_stats.mle_loss:.6f} "
                         f"total_loss={loss_stats.total_loss:.6f} "
@@ -2060,11 +2173,13 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                             "optimizer_step": int(updates),
                             "pref_loss": float(loss_stats.pref_loss),
                             "mean_gap": float(loss_stats.mean_gap),
+                            "group_correct_mass": float(loss_stats.group_correct_mass),
                             "gt_pref_loss": float(loss_stats.gt_pref_loss),
                             "mle_loss": float(loss_stats.mle_loss),
                             "total_loss": float(loss_stats.total_loss),
                             "grad_norm": float(loss_stats.grad_norm),
                             "pref_pairs_used": int(loss_stats.pref_pairs_used),
+                            "pref_groups_used": int(loss_stats.pref_groups_used),
                             "gt_pref_pairs_used": int(loss_stats.gt_pref_pairs_used),
                             "mle_samples_used": int(loss_stats.mle_samples_used),
                             "lora_mean_abs": float(loss_stats.lora_mean_abs),
@@ -2096,6 +2211,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
                     f"[online] rollout_step={rollout_steps}/{total_steps_str} "
                     f"updates_in_rollout={updates_in_rollout} "
                     f"consumed_pref_pairs_in_rollout={consumed_pref_pairs_in_rollout} "
+                    f"consumed_pref_groups_in_rollout={consumed_pref_groups_in_rollout} "
                     f"consumed_gt_pref_pairs_in_rollout={consumed_gt_pref_pairs_in_rollout} "
                     f"consumed_mle_samples_in_rollout={consumed_mle_samples_in_rollout} "
                     f"dropped_pref_pairs_by_truncation_in_rollout={dropped_pref_pairs_by_truncation_in_rollout} "
@@ -2116,7 +2232,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
     tokenizer.save_pretrained(final_dir)
     print(
         f"[online] finished. rollout_steps={rollout_steps}, optimizer_steps={updates}, "
-        f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, "
+        f"scanned={scanned}, kept_pref_pairs={kept_pref_pairs}, kept_pref_groups={kept_pref_groups}, "
         f"kept_gt_pref_pairs={kept_gt_pref_pairs}, kept_mle_samples={kept_mle_samples}, "
         f"logged_mixed_objectives={logged_mixed_objectives}, "
         f"logged_all_correct_objectives={logged_all_correct_objectives}, "
@@ -2131,6 +2247,7 @@ def run_online_preference_training(args: argparse.Namespace) -> None:
             "optimizer_steps": int(updates),
             "scanned": int(scanned),
             "kept_pref_pairs": int(kept_pref_pairs),
+            "kept_pref_groups": int(kept_pref_groups),
             "kept_gt_pref_pairs": int(kept_gt_pref_pairs),
             "kept_mle_samples": int(kept_mle_samples),
             "logged_mixed_objectives": int(logged_mixed_objectives),
@@ -2182,6 +2299,9 @@ def main() -> None:
         (args.online_pairs_per_step < 1, "error: --online-pairs-per-step must be >= 1"),
         (args.rollout_n < 2, "error: --rollout_n must be >= 2"),
         (args.beta <= 0, "error: --beta must be > 0"),
+        (args.group_pref_tau <= 0, "error: --group_pref_tau must be > 0"),
+        (args.group_pref_score_std_floor <= 0, "error: --group_pref_score_std_floor must be > 0"),
+        (args.group_pref_score_clip_abs < 0, "error: --group_pref_score_clip_abs must be >= 0"),
         (
             args.lambda_mle < 0 or args.lambda_pref < 0 or args.lambda_gt < 0,
             "error: --lambda_mle/--lambda_pref/--lambda_gt must be >= 0",

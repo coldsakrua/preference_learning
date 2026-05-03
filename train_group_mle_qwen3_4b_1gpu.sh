@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -o logs/pref_4b_1gpu.%j.out
+#SBATCH -o logs/group_mle_4b_1gpu.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -34,7 +34,7 @@ seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
 online_steps=${ONLINE_STEPS:-80}
-online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-8}
+online_objectives_per_step=${ONLINE_OBJECTIVES_PER_STEP:-8}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
@@ -44,16 +44,12 @@ min_p=${MIN_P:-0.0}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
-beta=${BETA:-0.3}
 lambda_mle=${LAMBDA_MLE:-1.0}
 lambda_group=${LAMBDA_GROUP:-0.25}
-lambda_gt=${LAMBDA_GT:-0.0}
-group_pref_tau=${GROUP_PREF_TAU:-0.5}
-group_pref_score_norm=${GROUP_PREF_SCORE_NORM:-none}
-group_pref_score_std_floor=${GROUP_PREF_SCORE_STD_FLOOR:-0.05}
-group_pref_score_clip_abs=${GROUP_PREF_SCORE_CLIP_ABS:-0.0}
-logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
-online_gap_clip_abs=${ONLINE_GAP_CLIP_ABS:-1.0}
+group_tau=${GROUP_TAU:-0.5}
+group_score_norm=${GROUP_SCORE_NORM:-none}
+group_score_std_floor=${GROUP_SCORE_STD_FLOOR:-0.05}
+group_score_clip_abs=${GROUP_SCORE_CLIP_ABS:-0.0}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.70}
@@ -64,8 +60,9 @@ online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
 use_lora=${USE_LORA:-true}
 lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
-lora_dropout=${LORA_DROPOUT:-0.05}
+lora_dropout=${LORA_DROPOUT:-0.0}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
+log_rollout_text=${LOG_ROLLOUT_TEXT:-false}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -74,7 +71,7 @@ else
   run_name="${stamp}"
 fi
 
-run_root=${RUN_ROOT:-outputs/pref_4b_1gpu/${run_name}}
+run_root=${RUN_ROOT:-outputs/group_mle_4b_1gpu/${run_name}}
 train_out="${run_root}/train"
 
 world_size=${NPROC_PER_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0}" | awk -F, '{print NF}')}
@@ -82,25 +79,20 @@ if [[ -z "${world_size}" || "${world_size}" -lt 1 ]]; then
   world_size=1
 fi
 if [[ "${world_size}" -ne 1 ]]; then
-  echo "[PREF][warn] expected 1 GPU for this script, got world_size=${world_size}"
+  echo "[GROUP-MLE][warn] expected 1 GPU for this script, got world_size=${world_size}"
 fi
 if (( rollout_batch_size % world_size != 0 )); then
-  echo "[PREF][error] rollout_batch_size=${rollout_batch_size} must be divisible by world_size=${world_size} for even split."
-  exit 1
-fi
-if (( logprob_micro_batch_size > 0 )) && (( logprob_micro_batch_size % world_size != 0 )); then
-  echo "[PREF][error] logprob_micro_batch_size=${logprob_micro_batch_size} must be divisible by world_size=${world_size} for even backprop split."
+  echo "[GROUP-MLE][error] rollout_batch_size=${rollout_batch_size} must be divisible by world_size=${world_size}."
   exit 1
 fi
 
 mkdir -p "${run_root}" "${train_out}"
 
-echo "[PREF] run_root=${run_root}"
-echo "[PREF] world_size=${world_size} rollout_batch_per_gpu=$((rollout_batch_size / world_size)) rollout_n=${rollout_n}"
-echo "[PREF] use_lora=${use_lora} lora_r=${lora_r} lora_alpha=${lora_alpha}"
-echo "[PREF] online mode: MLE(correct) + mixed group softmax"
-master_port=${MASTER_PORT:-29500}
-python train_preference.py \
+echo "[GROUP-MLE] run_root=${run_root}"
+echo "[GROUP-MLE] model_path=${model_path}"
+echo "[GROUP-MLE] rollout_batch_size=${rollout_batch_size} rollout_n=${rollout_n}"
+echo "[GROUP-MLE] lambda_mle=${lambda_mle} lambda_group=${lambda_group} group_tau=${group_tau}"
+python train_group_mle.py \
   --seed "${seed}" \
   --dataset_path "${dataset_path}" \
   --model_path "${model_path}" \
@@ -113,7 +105,7 @@ python train_preference.py \
   --prompt_mode none \
   --max_source_samples "${max_source_samples}" \
   --online_steps "${online_steps}" \
-  --online-pairs-per-step "${online_pairs_per_step}" \
+  --online-pairs-per-step "${online_objectives_per_step}" \
   --online_save_every_updates "${online_save_every_updates}" \
   --rollout_n "${rollout_n}" \
   --rollout_batch_size "${rollout_batch_size}" \
@@ -124,28 +116,22 @@ python train_preference.py \
   --presence_penalty "${presence_penalty}" \
   --max_new_tokens "${max_new_tokens}" \
   --learning_rate "${learning_rate}" \
-  --beta "${beta}" \
   --lambda_mle "${lambda_mle}" \
-  --lambda_pref "${lambda_group}" \
-  --lambda_gt "${lambda_gt}" \
-  --pref_loss_type group_mass \
-  --group_pref_tau "${group_pref_tau}" \
-  --group_pref_score_norm "${group_pref_score_norm}" \
-  --group_pref_score_std_floor "${group_pref_score_std_floor}" \
-  --group_pref_score_clip_abs "${group_pref_score_clip_abs}" \
+  --lambda_group "${lambda_group}" \
+  --group_tau "${group_tau}" \
+  --group_score_norm "${group_score_norm}" \
+  --group_score_std_floor "${group_score_std_floor}" \
+  --group_score_clip_abs "${group_score_clip_abs}" \
   --max_length "${max_length}" \
-  --logprob_micro_batch_size "${logprob_micro_batch_size}" \
-  --online_gap_clip_abs "${online_gap_clip_abs}" \
   --use_lora "${use_lora}" \
   --lora_r "${lora_r}" \
   --lora_alpha "${lora_alpha}" \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
+  --gradient_checkpointing true \
   --enable_thinking false \
-  --use_all_wrong_gt_preference false \
-  --online_pref_min_avg_logprob_chosen -3 \
-  --online_pref_min_avg_logprob_rejected -3
+  --log_rollout_text "${log_rollout_text}"
 
-echo "[PREF] done"
+echo "[GROUP-MLE] done"
 echo "train_output=${train_out}"

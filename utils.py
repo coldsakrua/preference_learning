@@ -527,8 +527,46 @@ def build_parser(default_system_prompt: str) -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--lambda_mle", type=float, default=1.0, help="Weight for L_mle.")
-    parser.add_argument("--lambda_pref", type=float, default=0.25, help="Weight for mixed-prompt L_pref.")
+    parser.add_argument("--lambda_pref", type=float, default=0.25, help="Weight for mixed-prompt group softmax loss.")
     parser.add_argument("--lambda_gt", type=float, default=0.5, help="Weight for all-wrong GT preference loss.")
+    parser.add_argument(
+        "--pref_loss_type",
+        type=str,
+        default="group_mass",
+        choices=["group_mass"],
+        help=(
+            "Mixed-prompt objective. 'group_mass' maximizes the rollout-group softmax "
+            "probability mass assigned to verified-correct trajectories."
+        ),
+    )
+    parser.add_argument(
+        "--group_pref_tau",
+        type=float,
+        default=0.5,
+        help="Temperature for --pref_loss_type group_mass: logsumexp(score / tau).",
+    )
+    parser.add_argument(
+        "--group_pref_score_norm",
+        type=str,
+        default="none",
+        choices=["none", "zscore"],
+        help=(
+            "Optional per-prompt score normalization for group_mass. 'none' uses length-normalized "
+            "avg logprob directly; 'zscore' divides by detached within-group std."
+        ),
+    )
+    parser.add_argument(
+        "--group_pref_score_std_floor",
+        type=float,
+        default=0.05,
+        help="Minimum detached within-group std used by group_pref_score_norm=zscore.",
+    )
+    parser.add_argument(
+        "--group_pref_score_clip_abs",
+        type=float,
+        default=0.0,
+        help="If >0, clamp group_mass scores after optional normalization to [-value, value].",
+    )
     parser.add_argument(
         "--online_mle_on_correct_only",
         type=str2bool,
