@@ -32,7 +32,7 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
-rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
+rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
 online_steps=${ONLINE_STEPS:-80}
 online_objectives_per_step=${ONLINE_OBJECTIVES_PER_STEP:-8}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
