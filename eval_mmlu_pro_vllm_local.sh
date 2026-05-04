@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -o logs/eval_math_local.%j.out
+#SBATCH -o eval_logs/eval_mmlu_pro_local.%j.out
 #SBATCH -p GPUA800
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --mem-per-cpu=81920M
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 
 set -eo pipefail
 nvidia-smi
@@ -15,7 +15,7 @@ cd /gpfs/share/home/2501210611/prefernce-learning/preference_learning
 source activate anchor
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 set -u
-mkdir -p logs outputs
+mkdir -p eval_logs outputs
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -26,11 +26,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
 
-
 NO_THINKING=${NO_THINKING:-1}
-datasets_csv=${DATASETS:-math500,aime24,aime25,aime26,gsm8k}
-data_format=${DATA_FORMAT:-auto}
-checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/onesided_group_mle_4b_1gpu/20260503_185058_job1535028/train/checkpoint-update-80}}
+dataset_name=${DATASET_NAME:-mmlu-pro}
+data_format=${DATA_FORMAT:-mmlu_pro_hf}
+mmlu_pro_config=${MMLU_PRO_CONFIG:-default}
+mmlu_pro_split=${MMLU_PRO_SPLIT:-test}
+checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/sft_lora_qwen3_4b/20260428_105621_job1479722/train/checkpoint-640}}
 max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-64}}
 use_lora=${USE_LORA:-1}
 num_samples=${NUM_SAMPLES:-0}
@@ -60,21 +61,24 @@ if [[ "${NO_THINKING}" == "1" ]]; then
 else
   _eval_cot_dir=cot
 fi
-output_json=${OUTPUT_JSON:-outputs/eval_math_local/${_eval_cot_dir}/eval_${run_tag}.json}
+output_json=${OUTPUT_JSON:-eval_outputs/eval_mmlu_pro_local/${_eval_cot_dir}/eval_${run_tag}.json}
 
 mkdir -p "$(dirname "${output_json}")"
-echo "[EVAL] model_path=${model_path}"
-echo "[EVAL] checkpoint_dir=${checkpoint_dir:-<none>}"
-echo "[EVAL] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
-echo "[EVAL] DATASETS=${datasets_csv}"
-echo "[EVAL] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
-echo "[EVAL] FORCE_BASE_TOKENIZER=${force_base_tokenizer} (1=base tokenizer/chat_template)"
-echo "[EVAL] output_json=${output_json}"
+echo "[EVAL-MMLU-PRO] model_path=${model_path}"
+echo "[EVAL-MMLU-PRO] checkpoint_dir=${checkpoint_dir:-<none>}"
+echo "[EVAL-MMLU-PRO] USE_LORA=${use_lora} (1=use LoRA, 0=disable LoRA)"
+echo "[EVAL-MMLU-PRO] dataset=${dataset_name} format=${data_format} config=${mmlu_pro_config} split=${mmlu_pro_split}"
+echo "[EVAL-MMLU-PRO] NO_THINKING=${NO_THINKING} (1=no CoT, 0=CoT) -> subdir=${_eval_cot_dir}"
+echo "[EVAL-MMLU-PRO] FORCE_BASE_TOKENIZER=${force_base_tokenizer} (1=base tokenizer/chat_template)"
+echo "[EVAL-MMLU-PRO] output_json=${output_json}"
 
 cmd=(
   python eval_math_vllm_local.py
   --model-path "${model_path}"
+  --dataset "${dataset_name}"
   --data-format "${data_format}"
+  --mmlu-pro-config "${mmlu_pro_config}"
+  --mmlu-pro-split "${mmlu_pro_split}"
   --output-json "${output_json}"
   --num-samples "${num_samples}"
   --val-n "${val_n}"
@@ -91,14 +95,6 @@ cmd=(
   --gpu-memory-utilization "${gpu_memory_utilization}"
   --max-model-len "${max_model_len}"
 )
-
-IFS=',' read -ra _ds <<< "${datasets_csv}"
-for _n in "${_ds[@]}"; do
-  _n="${_n#"${_n%%[![:space:]]*}"}"
-  _n="${_n%"${_n##*[![:space:]]}"}"
-  [[ -z "${_n}" ]] && continue
-  cmd+=(--dataset="${_n}")
-done
 
 if [[ "${use_lora}" == "1" ]]; then
   if [[ -n "${checkpoint_dir}" ]]; then
@@ -123,4 +119,4 @@ fi
 
 "${cmd[@]}"
 
-echo "[EVAL] done -> ${output_json}"
+echo "[EVAL-MMLU-PRO] done -> ${output_json}"

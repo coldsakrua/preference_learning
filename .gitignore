@@ -7,3 +7,6 @@ __pycache__/
 
 logs/
 outputs/
+
+eval_logs/
+eval_outputs/

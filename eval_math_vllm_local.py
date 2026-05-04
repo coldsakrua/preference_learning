@@ -145,6 +145,174 @@ def load_gsm8k_hf_examples(
     return rows
 
 
+def _choice_label(idx: int) -> str:
+    return chr(ord("A") + idx)
+
+
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip()).lower()
+
+
+def load_mmlu_pro_hf_examples(
+    path: Path,
+    limit: Optional[int],
+    mmlu_pro_config: str = "default",
+    mmlu_pro_split: str = "test",
+) -> List[Dict[str, Any]]:
+    """
+    Load MMLU-Pro from a HuggingFace-datasets style directory.
+    Expected fields: question, options, answer_index (and/or answer)
+    """
+    rows: List[Dict[str, Any]] = []
+
+    # 1) Prefer direct local parquet loading to avoid dataset_infos.json incompatibilities.
+    split_key = mmlu_pro_split.strip()
+    parquet_patterns = [
+        f"{split_key}-*.parquet",
+        f"{split_key}*.parquet",
+    ]
+    parquet_files: List[Path] = []
+    for base in (path / "data", path):
+        if not base.exists():
+            continue
+        for pat in parquet_patterns:
+            parquet_files.extend(sorted(base.glob(pat)))
+    if parquet_files:
+        print(
+            f"[eval] loading local MMLU-Pro split={split_key} from parquet files: {len(parquet_files)}",
+            flush=True,
+        )
+        for pf_path in parquet_files:
+            pf = pq.ParquetFile(pf_path)
+            cols = ["question", "options", "answer", "answer_index", "category", "question_id"]
+            existing_cols = [c for c in cols if c in pf.schema_arrow.names]
+            for batch in pf.iter_batches(batch_size=512, columns=existing_cols):
+                pyd = batch.to_pydict()
+                n = len(next(iter(pyd.values()))) if pyd else 0
+                for i in range(n):
+                    o = {k: pyd[k][i] for k in pyd}
+                    question = str(o.get("question", "")).strip()
+                    raw_options = o.get("options", [])
+                    if not isinstance(raw_options, list):
+                        raw_options = list(raw_options) if raw_options is not None else []
+                    options = [str(x).strip() for x in raw_options if str(x).strip()]
+                    if not question or not options:
+                        continue
+
+                    answer_index_raw = o.get("answer_index", None)
+                    answer_text_raw = str(o.get("answer", "")).strip()
+                    gt_idx: Optional[int] = None
+                    try:
+                        if answer_index_raw is not None:
+                            gt_idx = int(answer_index_raw)
+                    except Exception:
+                        gt_idx = None
+                    if gt_idx is None and answer_text_raw:
+                        ans_norm = _normalize_text(answer_text_raw)
+                        for oi, opt in enumerate(options):
+                            if _normalize_text(opt) == ans_norm:
+                                gt_idx = oi
+                                break
+                    if gt_idx is None or gt_idx < 0 or gt_idx >= len(options):
+                        continue
+
+                    gt_letter = _choice_label(gt_idx)
+                    option_lines = [f"{_choice_label(oi)}. {opt}" for oi, opt in enumerate(options)]
+                    prompt_text = question + "\n\nOptions:\n" + "\n".join(option_lines)
+                    sid = str(o.get("question_id", len(rows))).strip()
+                    category = str(o.get("category", "")).strip()
+                    rows.append(
+                        {
+                            "id": sid,
+                            "problem": prompt_text,
+                            "ground_truth": gt_letter,
+                            "ground_truth_choice": gt_letter,
+                            "ground_truth_text": options[gt_idx],
+                            "options": options,
+                            "category": category,
+                            "eval_type": "mcq",
+                        }
+                    )
+                    if limit is not None and len(rows) >= limit:
+                        return rows
+        if rows:
+            return rows
+
+    # 2) Fallback to datasets local directory/hub.
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise ImportError(
+            "Loading MMLU-Pro directory requires `datasets`. Install with: pip install datasets"
+        ) from e
+
+    ds = None
+    load_err: Optional[Exception] = None
+    try:
+        ds = load_dataset(str(path), mmlu_pro_config, split=mmlu_pro_split)
+    except Exception as e:
+        load_err = e
+        print(
+            f"[warn] Failed to load local MMLU-Pro via datasets from {path}: {e}\n"
+            "[warn] Falling back to HuggingFace hub dataset: TIGER-Lab/MMLU-Pro",
+            flush=True,
+        )
+        ds = load_dataset("TIGER-Lab/MMLU-Pro", mmlu_pro_config, split=mmlu_pro_split)
+    if ds is None:
+        raise RuntimeError(
+            f"Unable to load MMLU-Pro split={mmlu_pro_split} config={mmlu_pro_config} "
+            f"from local path {path} or hub fallback."
+        ) from load_err
+    for i, o in enumerate(ds):
+        question = str(o.get("question", "")).strip()
+        raw_options = o.get("options", [])
+        if not isinstance(raw_options, list):
+            raw_options = list(raw_options) if raw_options is not None else []
+        options = [str(x).strip() for x in raw_options if str(x).strip()]
+        if not question or not options:
+            continue
+
+        answer_index_raw = o.get("answer_index", None)
+        answer_text_raw = str(o.get("answer", "")).strip()
+
+        gt_idx: Optional[int] = None
+        try:
+            if answer_index_raw is not None:
+                gt_idx = int(answer_index_raw)
+        except Exception:
+            gt_idx = None
+        if gt_idx is None and answer_text_raw:
+            ans_norm = _normalize_text(answer_text_raw)
+            for oi, opt in enumerate(options):
+                if _normalize_text(opt) == ans_norm:
+                    gt_idx = oi
+                    break
+        if gt_idx is None or gt_idx < 0 or gt_idx >= len(options):
+            continue
+
+        gt_letter = _choice_label(gt_idx)
+        option_lines = [f"{_choice_label(oi)}. {opt}" for oi, opt in enumerate(options)]
+        prompt_text = question + "\n\nOptions:\n" + "\n".join(option_lines)
+
+        sid = str(o.get("question_id", i)).strip()
+        category = str(o.get("category", "")).strip()
+        rows.append(
+            {
+                "id": sid,
+                "problem": prompt_text,
+                "ground_truth": gt_letter,
+                "ground_truth_choice": gt_letter,
+                "ground_truth_text": options[gt_idx],
+                "options": options,
+                "category": category,
+                "eval_type": "mcq",
+            }
+        )
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows
+
+
 def _parquet_loader_kind(path: Path) -> str:
     """Return 'dapo', 'amo_qa', or 'problem_answer' based on Parquet schema."""
     schema = pq.ParquetFile(path).schema_arrow
@@ -270,13 +438,17 @@ def load_examples(
     limit: Optional[int],
     gsm8k_config: str = "main",
     gsm8k_split: str = "test",
+    mmlu_pro_config: str = "default",
+    mmlu_pro_split: str = "test",
 ) -> List[Dict[str, Any]]:
     if fmt == "auto" and path.is_dir():
-        has_gsm8k_meta = (
-            (path / "dataset_infos.json").is_file() and (path / "README.md").is_file()
-        )
+        has_hf_meta = (path / "dataset_infos.json").is_file() and (path / "README.md").is_file()
+        has_gsm8k_meta = has_hf_meta and (path / "dataset_info.json").is_file()
+        has_mmlu_pro_meta = has_hf_meta and "mmlu-pro" in path.name.lower()
         if has_gsm8k_meta:
             fmt = "gsm8k_hf"
+        elif has_mmlu_pro_meta:
+            fmt = "mmlu_pro_hf"
         else:
             raise ValueError(
                 f"Cannot auto-detect format for directory {path}; set --data-format explicitly."
@@ -305,6 +477,13 @@ def load_examples(
         return load_problem_answer_parquet_examples(path, limit)
     if fmt == "gsm8k_hf":
         return load_gsm8k_hf_examples(path, limit, gsm8k_config=gsm8k_config, gsm8k_split=gsm8k_split)
+    if fmt == "mmlu_pro_hf":
+        return load_mmlu_pro_hf_examples(
+            path,
+            limit,
+            mmlu_pro_config=mmlu_pro_config,
+            mmlu_pro_split=mmlu_pro_split,
+        )
     raise ValueError(f"Unknown --data-format: {fmt}")
 
 
@@ -452,6 +631,7 @@ for _aliases, _rel in (
     (("minerva",), "Minerva/test.parquet"),
     (("olympiad", "olympiad-bench", "olympiad_bench"), "Olympiad-Bench/test.parquet"),
     (("gsm8k",), "gsm8k/socratic/test-00000-of-00001.parquet"),
+    (("mmlu-pro", "mmlu_pro", "mmlupro"), "mmlu-pro"),
 ):
     for _a in _aliases:
         _DATASET_REL_PATH[_a] = _rel
@@ -471,6 +651,28 @@ def resolve_dataset_path(name: str, data_root: Path) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"Dataset {name!r} -> expected path missing: {p}")
     return p
+
+
+def extract_mcq_answer(text: str) -> Optional[str]:
+    if not text:
+        return None
+    boxed = extract_boxed_answer(text)
+    if boxed:
+        m = re.search(r"\b([A-J])\b", boxed.upper())
+        if m:
+            return m.group(1)
+
+    patterns = [
+        r"(?:final answer|answer|correct option|option)\s*[:：]\s*\(?\s*([A-J])\s*\)?",
+        r"\b([A-J])\b(?=\s*(?:\.|,|:|$))",
+        r"\(([A-J])\)",
+    ]
+    up = text.upper()
+    for pat in patterns:
+        m = re.search(pat, up)
+        if m:
+            return m.group(1)
+    return None
 
 
 def summarize_result_subset(
@@ -549,7 +751,15 @@ def main() -> None:
         "--data-format",
         type=str,
         default="auto",
-        choices=["auto", "jsonl", "dapo_parquet", "amo_qa_parquet", "problem_answer_parquet", "gsm8k_hf"],
+        choices=[
+            "auto",
+            "jsonl",
+            "dapo_parquet",
+            "amo_qa_parquet",
+            "problem_answer_parquet",
+            "gsm8k_hf",
+            "mmlu_pro_hf",
+        ],
     )
     parser.add_argument(
         "--gsm8k-config",
@@ -563,6 +773,18 @@ def main() -> None:
         type=str,
         default="test",
         help="Used when --data-format=gsm8k_hf (default: test).",
+    )
+    parser.add_argument(
+        "--mmlu-pro-config",
+        type=str,
+        default="default",
+        help="Used when --data-format=mmlu_pro_hf (default: default).",
+    )
+    parser.add_argument(
+        "--mmlu-pro-split",
+        type=str,
+        default="test",
+        help="Used when --data-format=mmlu_pro_hf (default: test).",
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -653,7 +875,7 @@ def main() -> None:
         for rel in sorted(by_rel.keys()):
             aliases = ", ".join(sorted(set(by_rel[rel])))
             p = root / rel
-            ok = "ok" if p.is_file() else "MISSING"
+            ok = "ok" if p.exists() else "MISSING"
             print(f"  [{ok}] {rel}")
             print(f"       names: {aliases}")
         raise SystemExit(0)
@@ -699,7 +921,7 @@ def main() -> None:
     tag_counts: Dict[str, int] = {}
     for raw, tag_override in load_queue:
         data_path = Path(raw).expanduser().resolve()
-        if args.data_format == "gsm8k_hf":
+        if args.data_format in {"gsm8k_hf", "mmlu_pro_hf"}:
             if not data_path.exists():
                 raise FileNotFoundError(data_path)
         else:
@@ -708,6 +930,13 @@ def main() -> None:
         resolved_paths.append(data_path)
         if args.data_format == "gsm8k_hf":
             batch = load_gsm8k_hf_examples(data_path, limit, gsm8k_config=args.gsm8k_config, gsm8k_split=args.gsm8k_split)
+        elif args.data_format == "mmlu_pro_hf":
+            batch = load_mmlu_pro_hf_examples(
+                data_path,
+                limit,
+                mmlu_pro_config=args.mmlu_pro_config,
+                mmlu_pro_split=args.mmlu_pro_split,
+            )
         else:
             batch = load_examples(
                 data_path,
@@ -715,6 +944,8 @@ def main() -> None:
                 limit,
                 gsm8k_config=args.gsm8k_config,
                 gsm8k_split=args.gsm8k_split,
+                mmlu_pro_config=args.mmlu_pro_config,
+                mmlu_pro_split=args.mmlu_pro_split,
             )
         base_tag = tag_override if tag_override is not None else data_path.stem
         tag_counts[base_tag] = tag_counts.get(base_tag, 0) + 1
@@ -803,11 +1034,16 @@ def main() -> None:
         except Exception as e:
             print(f"[warn] LoRA disabled: {e}")
 
-    user_suffix = (
-        "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
-    )
     all_prompts: List[str] = []
     for ex in examples:
+        eval_type = str(ex.get("eval_type", "boxed_math"))
+        if eval_type == "mcq":
+            user_suffix = (
+                "\n\nPlease reason step by step and provide the final answer as a single capital letter "
+                "(A, B, C, ...), wrapped in \\boxed{}."
+            )
+        else:
+            user_suffix = "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
         messages = [{"role": "user", "content": ex["problem"] + user_suffix}]
         kwargs = {
             "tokenize": False,
@@ -892,13 +1128,20 @@ def main() -> None:
             for o in output.outputs:
                 gen = o.text
                 generations.append(gen)
-                pred = extract_boxed_answer(gen)
-                formatted = pred is not None
+                eval_type = str(ex.get("eval_type", "boxed_math"))
+                if eval_type == "mcq":
+                    pred = extract_mcq_answer(gen)
+                    formatted = pred is not None
+                    gt_choice = str(ex.get("ground_truth_choice", ex["ground_truth"])).upper().strip()
+                    ok = bool(pred is not None and pred.upper() == gt_choice)
+                else:
+                    pred = extract_boxed_answer(gen)
+                    formatted = pred is not None
+                    ok = grade_answer(pred, gt)
                 if pred is None:
                     preds.append("[no boxed]")
                 else:
                     preds.append(pred)
-                ok = grade_answer(pred, gt)
                 correct_flags.append(ok)
                 formatted_flags.append(formatted)
                 total_solutions += 1
@@ -926,6 +1169,7 @@ def main() -> None:
                 {
                     "dataset_tag": ex.get("dataset_tag", ""),
                     "dataset_path": ex.get("dataset_path", ""),
+                    "category": ex.get("category", ""),
                     "problem_id": ex["id"],
                     "problem": ex["problem"],
                     "ground_truth": gt,
@@ -974,6 +1218,16 @@ def main() -> None:
                 **summarize_result_subset(sub, pass_at_k_list, gen_n),
             }
 
+        by_category: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for r in results:
+            cat = str(r.get("category", "")).strip()
+            if not cat:
+                cat = "__uncategorized__"
+            by_category[cat].append(r)
+        metrics_by_category: Dict[str, Any] = {}
+        for cat, sub in sorted(by_category.items(), key=lambda x: x[0]):
+            metrics_by_category[cat] = summarize_result_subset(sub, pass_at_k_list, gen_n)
+
         summary = {
             "model_path": args.model_path,
             "vllm_base_model_path": vllm_model_path,
@@ -998,6 +1252,7 @@ def main() -> None:
             "avg1_pct": avg1_pct,
             "avg16_pct": avg16_pct,
             "metrics_by_dataset": metrics_by_dataset,
+            "metrics_by_category": metrics_by_category,
             "num_problems": processed,
             "num_problems_total": n_prompts,
             "total_solutions": total_solutions,
@@ -1021,6 +1276,7 @@ def main() -> None:
     n = len(results)
     pass_at_k_summary = summary["pass_at_k"]
     metrics_by_dataset = summary["metrics_by_dataset"]
+    metrics_by_category = summary["metrics_by_category"]
 
     print(
         "[eval] writing final JSON with all generations (can take minutes on large n × problems) ...",
@@ -1041,6 +1297,14 @@ def main() -> None:
     print(f"  Avg16(overall correctness): {summary['avg16_pct']:.2f}%", flush=True)
     for tag, m in metrics_by_dataset.items():
         print(f"[{tag}] n={m['num_problems']}", flush=True)
+        for k in pass_at_k_list:
+            s = m["pass_at_k"][str(k)]
+            print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})", flush=True)
+        print(f"  Avg1(one-shot hit rate): {m['avg1_pct']:.2f}%", flush=True)
+        print(f"  Avg16(overall correctness): {m['avg16_pct']:.2f}%", flush=True)
+    print("[BY_CATEGORY]", flush=True)
+    for cat, m in metrics_by_category.items():
+        print(f"[{cat}] n={m['num_problems']}", flush=True)
         for k in pass_at_k_list:
             s = m["pass_at_k"][str(k)]
             print(f"  Pass@{k}: {s['pct']:.2f}% ({s['count']}/{m['num_problems']})", flush=True)
