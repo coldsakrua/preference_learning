@@ -122,21 +122,15 @@ def iter_dapo_samples(
     max_source_samples: Optional[int],
     gold_rationale_key_paths: Sequence[str],
     require_gold_rationale: bool,
-    shuffle: bool = False,
-    shuffle_seed: int = 42,
 ) -> Iterator[DapoSample]:
     parquet_file = pq.ParquetFile(parquet_path)
     yielded = 0
-    rng = random.Random(shuffle_seed)
     columns = ["prompt", "reward_model", "extra_info"]
     for record_batch in parquet_file.iter_batches(batch_size=scan_batch_size, columns=columns):
         prompt_col = record_batch.column("prompt").to_pylist()
         reward_col = record_batch.column("reward_model").to_pylist()
         extra_col = record_batch.column("extra_info").to_pylist()
-        rows = list(zip(prompt_col, reward_col, extra_col))
-        if shuffle and len(rows) > 1:
-            rng.shuffle(rows)
-        for prompt_obj, reward_obj, extra_obj in rows:
+        for prompt_obj, reward_obj, extra_obj in zip(prompt_col, reward_col, extra_col):
             prompt_text = extract_user_prompt(prompt_obj)
             if not prompt_text:
                 continue
@@ -223,22 +217,16 @@ def iter_math_hf_samples(
     max_source_samples: Optional[int],
     gold_rationale_key_paths: Sequence[str],
     require_gold_rationale: bool,
-    shuffle: bool = False,
-    shuffle_seed: int = 42,
 ) -> Iterator[DapoSample]:
     del gold_rationale_key_paths  # API symmetry with ``iter_dapo_samples``; unused here.
     del require_gold_rationale  # API symmetry with ``iter_dapo_samples``; unused here.
     parquet_file = pq.ParquetFile(parquet_path)
     yielded = 0
-    rng = random.Random(shuffle_seed)
     cols = ["problem", "solution"]
     for record_batch in parquet_file.iter_batches(batch_size=scan_batch_size, columns=cols):
         problems = record_batch.column("problem").to_pylist()
         solutions = record_batch.column("solution").to_pylist()
-        rows = list(zip(problems, solutions))
-        if shuffle and len(rows) > 1:
-            rng.shuffle(rows)
-        for problem_obj, solution_obj in rows:
+        for problem_obj, solution_obj in zip(problems, solutions):
             prompt_text = str(problem_obj or "").strip()
             solution_text = str(solution_obj or "").strip()
             if not prompt_text or not solution_text:

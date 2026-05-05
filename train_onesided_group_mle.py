@@ -95,8 +95,6 @@ def _load_source_iter(args: argparse.Namespace):
             max_source_samples=args.max_source_samples,
             gold_rationale_key_paths=(),
             require_gold_rationale=False,
-            shuffle=True,
-            shuffle_seed=args.seed,
         )
     elif layout == "math_hf":
         source_iter = iter_math_hf_samples(
@@ -105,8 +103,6 @@ def _load_source_iter(args: argparse.Namespace):
             max_source_samples=args.max_source_samples,
             gold_rationale_key_paths=(),
             require_gold_rationale=False,
-            shuffle=True,
-            shuffle_seed=args.seed,
         )
     else:
         raise ValueError(f"Unsupported --dataset_layout: {layout}")
