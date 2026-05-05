@@ -33,7 +33,7 @@ model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/q
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
-online_steps=${ONLINE_STEPS:-40}
+online_steps=${ONLINE_STEPS:-30}
 online_objectives_per_step=${ONLINE_OBJECTIVES_PER_STEP:-8}
 online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
 rollout_n=${ROLLOUT_N:-8}
@@ -69,6 +69,8 @@ prompt_weight_max=${PROMPT_WEIGHT_MAX:-1.0}
 token_weight_type=${TOKEN_WEIGHT_TYPE:-entropy}
 token_weight_alpha=${TOKEN_WEIGHT_ALPHA:-1.0}
 token_weight_topk_pct=${TOKEN_WEIGHT_TOPK_PCT:-0.2}
+max_grad_norm=${MAX_GRAD_NORM:-10.0}
+online_hard_grad_norm_cap=${ONLINE_HARD_GRAD_NORM_CAP:-10.0}
 
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
@@ -115,6 +117,8 @@ echo "[ONESIDED-V3] lambda_mle=${lambda_mle} lambda_answer=${lambda_answer} answ
 echo "[ONESIDED-V3] token_weight_type=${token_weight_type} alpha=${token_weight_alpha} topk_pct=${token_weight_topk_pct}"
 echo "[ONESIDED-V3] prompt_weight_gamma=${prompt_weight_gamma}"
 echo "[ONESIDED-V3] answer_min_cluster_count=${answer_min_cluster_count} answer_max_clusters=${answer_max_clusters} answer_use_normalized=${answer_use_normalized}"
+echo "[ONESIDED-V3] max_grad_norm=${max_grad_norm}"
+echo "[ONESIDED-V3] online_hard_grad_norm_cap=${online_hard_grad_norm_cap}"
 
 python train_onesided_v3.py \
   --seed "${seed}" \
@@ -150,6 +154,8 @@ python train_onesided_v3.py \
   --token_weight_type "${token_weight_type}" \
   --token_weight_alpha "${token_weight_alpha}" \
   --token_weight_topk_pct "${token_weight_topk_pct}" \
+  --max_grad_norm "${max_grad_norm}" \
+  --online_hard_grad_norm_cap "${online_hard_grad_norm_cap}" \
   --answer_tau "${answer_tau}" \
   --answer_cluster_weight "${answer_cluster_weight}" \
   --answer_min_cluster_count "${answer_min_cluster_count}" \

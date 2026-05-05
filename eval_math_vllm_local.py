@@ -177,6 +177,10 @@ def load_mmlu_pro_hf_examples(
             continue
         for pat in parquet_patterns:
             parquet_files.extend(sorted(base.glob(pat)))
+    # Deduplicate same parquet matched by multiple patterns (e.g. test-*.parquet
+    # also matches test*.parquet), while preserving stable order.
+    if parquet_files:
+        parquet_files = list(dict.fromkeys(p.resolve() for p in parquet_files))
     if parquet_files:
         print(
             f"[eval] loading local MMLU-Pro split={split_key} from parquet files: {len(parquet_files)}",
