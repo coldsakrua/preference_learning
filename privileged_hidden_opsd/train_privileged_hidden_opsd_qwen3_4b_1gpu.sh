@@ -50,7 +50,8 @@ lambda_gt=${LAMBDA_GT:-0.25}
 privileged_distill_loss=${PRIVILEGED_DISTILL_LOSS:-jsd}
 privileged_jsd_beta=${PRIVILEGED_JSD_BETA:--1.0}
 privileged_distill_temperature=${PRIVILEGED_DISTILL_TEMPERATURE:-1.0}
-privileged_pointwise_kl_clip=${PRIVILEGED_POINTWISE_KL_CLIP:-0.0}
+privileged_pointwise_kl_clip=${PRIVILEGED_POINTWISE_KL_CLIP:-0.05}
+privileged_logit_clip_abs=${PRIVILEGED_LOGIT_CLIP_ABS:-80.0}
 privileged_advantage_clip_abs=${PRIVILEGED_ADVANTAGE_CLIP_ABS:-1.0}
 privileged_trace_max_chars=${PRIVILEGED_TRACE_MAX_CHARS:-0}
 hidden_layer_offset=${HIDDEN_LAYER_OFFSET:-4}
@@ -58,7 +59,7 @@ rollout_feature_micro_batch_size=${ROLLOUT_FEATURE_MICRO_BATCH_SIZE:-4}
 logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE:-2}
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 vllm_dtype=${VLLM_DTYPE:-bfloat16}
-gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.70}
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.60}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
@@ -135,6 +136,7 @@ python privileged_hidden_opsd/train_privileged_hidden_opsd.py \
   --privileged_jsd_beta "${privileged_jsd_beta}" \
   --privileged_distill_temperature "${privileged_distill_temperature}" \
   --privileged_pointwise_kl_clip "${privileged_pointwise_kl_clip}" \
+  --privileged_logit_clip_abs "${privileged_logit_clip_abs}" \
   --privileged_advantage_clip_abs "${privileged_advantage_clip_abs}" \
   --privileged_trace_max_chars "${privileged_trace_max_chars}" \
   --hidden_layer_offset "${hidden_layer_offset}" \

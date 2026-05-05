@@ -571,8 +571,25 @@ def _opsd_generalized_jsd_row_loss_and_gap(
     beta_value = min(max(beta_value, 1e-6), 1.0 - 1e-6)
     beta = torch.tensor(beta_value, device=student_logits.device, dtype=torch.float32)
 
-    student_log_probs = F.log_softmax(student_logits.float() / temperature, dim=-1)
-    teacher_log_probs = F.log_softmax(teacher_logits.float() / temperature, dim=-1)
+    logit_clip_abs = float(getattr(args, "privileged_logit_clip_abs", 80.0))
+    student_logits_f = torch.nan_to_num(
+        student_logits.float(),
+        nan=0.0,
+        posinf=logit_clip_abs,
+        neginf=-logit_clip_abs,
+    )
+    teacher_logits_f = torch.nan_to_num(
+        teacher_logits.float(),
+        nan=0.0,
+        posinf=logit_clip_abs,
+        neginf=-logit_clip_abs,
+    )
+    if logit_clip_abs > 0:
+        student_logits_f = student_logits_f.clamp(-logit_clip_abs, logit_clip_abs)
+        teacher_logits_f = teacher_logits_f.clamp(-logit_clip_abs, logit_clip_abs)
+
+    student_log_probs = F.log_softmax(student_logits_f / temperature, dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_logits_f / temperature, dim=-1)
     mixture_log_probs = torch.logsumexp(
         torch.stack(
             [
@@ -585,6 +602,7 @@ def _opsd_generalized_jsd_row_loss_and_gap(
     kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
     kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
     pointwise_jsd = beta * kl_teacher + (1.0 - beta) * kl_student
+    pointwise_jsd = torch.nan_to_num(pointwise_jsd, nan=0.0, posinf=0.0, neginf=0.0)
     clip_max = float(getattr(args, "privileged_pointwise_kl_clip", 0.0))
     if clip_max > 0:
         pointwise_jsd = pointwise_jsd.clamp(max=clip_max)
@@ -1614,8 +1632,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--privileged_pointwise_kl_clip",
         type=float,
-        default=0.0,
+        default=0.05,
         help="If >0, clamp each vocab-entry contribution before summing token JSD, OPSD-style.",
+    )
+    parser.add_argument(
+        "--privileged_logit_clip_abs",
+        type=float,
+        default=80.0,
+        help="Clip fp32 student/teacher logits inside privileged JSD. Use <=0 to disable.",
     )
     parser.add_argument(
         "--privileged_advantage_clip_abs",
@@ -1669,6 +1693,7 @@ def main() -> None:
         (args.privileged_distill_temperature <= 0, "error: --privileged_distill_temperature must be > 0"),
         (args.privileged_jsd_beta > 0 and args.privileged_jsd_beta >= 1, "error: --privileged_jsd_beta must be < 1"),
         (args.privileged_pointwise_kl_clip < 0, "error: --privileged_pointwise_kl_clip must be >= 0"),
+        (args.privileged_logit_clip_abs < 0, "error: --privileged_logit_clip_abs must be >= 0"),
         (
             args.privileged_advantage_clip_abs < 0,
             "error: --privileged_advantage_clip_abs must be >= 0",

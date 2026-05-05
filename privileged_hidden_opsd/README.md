@@ -41,8 +41,10 @@ Important environment knobs:
 - `LAMBDA_GT`: all-wrong GT-privileged wrong-trajectory weight.
 - `PRIVILEGED_DISTILL_LOSS`: `jsd` by default, or `sampled_pg` fallback.
 - `PRIVILEGED_JSD_BETA`: beta for generalized JSD. `-1` reuses `BETA`.
-- `PRIVILEGED_POINTWISE_KL_CLIP`: optional OPSD-style per-entry clip before
-  summing token JSD.
+- `PRIVILEGED_POINTWISE_KL_CLIP`: OPSD-style per-entry clip before summing token
+  JSD. Default `0.05`.
+- `PRIVILEGED_LOGIT_CLIP_ABS`: fp32 logit clip inside privileged JSD for
+  numerical stability. Default `80.0`.
 - `PRIVILEGED_ADVANTAGE_CLIP_ABS`: only used by `sampled_pg`.
 - `LOGPROB_MICRO_BATCH_SIZE`: chunks batched privileged scoring and MLE forwards.
 - `ROLLOUT_FEATURE_MICRO_BATCH_SIZE`: chunks rollout feature extraction
