@@ -9,76 +9,48 @@ import math
 import os
 import random
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from train_preference import (  # noqa: E402
+from privileged_hidden_opsd.opsd_non_training import (
+    PrivilegedObjective,
+    build_gt_privileged_examples,
+    build_mixed_privileged_examples,
+    build_privileged_distill_batch,
+    build_rollout_record,
+    build_rollout_trajectories_with_hidden,
+    compute_sequence_logps_batch_local,
+    extract_completion_logits,
+    load_source_iter,
+    opsd_generalized_jsd_row_loss_and_gap,
+)
+from privileged_hidden_opsd.opsd_local_utils import (  # noqa: E402
+    DEFAULT_MATH_HF_USER_CONTENT_SUFFIX,
     DEFAULT_SYSTEM_PROMPT,
-    RolloutTrajectory,
+    DapoSample,
     _compute_lora_param_health,
-    _compute_sequence_logps_and_hidden_batch,
-    _compute_sequence_logps_batch,
-    _online_rollout_completions_flat_hf,
-    _online_rollout_completions_flat_vllm,
     apply_qwen_chat_template,
+    build_parser as build_cli_parser,
     build_prompt_pool,
     choose_system_prompt,
-    compute_correct_trajectory_weights,
     ensure_input_require_grads_for_checkpointing,
-    rollout_trajectory_to_json,
+    online_rollout_completions_flat_hf as _online_rollout_completions_flat_hf,
+    online_rollout_completions_flat_vllm as _online_rollout_completions_flat_vllm,
+    set_seed,
     split_rollout_candidates_for_training,
+    str2bool,
     unwrap_model_for_save,
     wrap_model_with_lora,
 )
-from utils import (  # noqa: E402
-    DEFAULT_MATH_HF_USER_CONTENT_SUFFIX,
-    DapoSample,
-    build_parser as build_cli_parser,
-    compute_prompt_rarity_weight,
-    compute_smoothed_correct_rate,
-    detect_parquet_dataset_layout,
-    iter_dapo_samples,
-    iter_math_hf_samples,
-    set_seed,
-    strip_prompt_prefix_from_text,
-    str2bool,
-)
-
-
-@dataclass
-class PrivilegedWrongExample:
-    train_prompt: str
-    privileged_prompt: str
-    wrong_response: str
-    source_type: str  # "nearest_correct" | "gt_rationale"
-    source_trace: str
-    weight: float
-    match_correct_index: int
-    match_similarity: float
-    wrong_avg_logprob: float
-
-
-@dataclass
-class PrivilegedObjective:
-    sample_id: str
-    ground_truth: str
-    train_prompt: str
-    objective_type: str  # "all_correct" | "mixed_privileged" | "all_wrong_gt_privileged"
-    rho_hat: float
-    prompt_weight: float
-    correct: List[RolloutTrajectory]
-    wrong: List[RolloutTrajectory]
-    correct_weights: List[float]
-    privileged_wrong_examples: List[PrivilegedWrongExample]
 
 
 @dataclass
@@ -98,21 +70,6 @@ class PrivilegedStepStats:
     lora_health: Dict[str, float]
 
 
-@dataclass
-class DistillBatchTensors:
-    student_input_ids: torch.Tensor
-    student_attention_mask: torch.Tensor
-    teacher_input_ids: torch.Tensor
-    teacher_attention_mask: torch.Tensor
-    student_prompt_lens: torch.Tensor
-    teacher_prompt_lens: torch.Tensor
-    target_ids: torch.Tensor
-    token_mask: torch.Tensor
-    weights: torch.Tensor
-    kept_count: int
-    total_count: int
-
-
 def _zero_lora_health() -> Dict[str, float]:
     return {
         "lora_mean_abs": 0.0,
@@ -120,259 +77,6 @@ def _zero_lora_health() -> Dict[str, float]:
         "lora_nan_ratio": 0.0,
         "lora_inf_ratio": 0.0,
     }
-
-
-def _load_source_iter(args: argparse.Namespace):
-    layout = args.dataset_layout
-    if layout == "auto":
-        layout = detect_parquet_dataset_layout(args.dataset_path)
-    if layout == "dapo":
-        source_iter = iter_dapo_samples(
-            parquet_path=args.dataset_path,
-            scan_batch_size=args.scan_batch_size,
-            max_source_samples=args.max_source_samples,
-            gold_rationale_key_paths=args.gold_rationale_key,
-            require_gold_rationale=False,
-        )
-    elif layout == "math_hf":
-        source_iter = iter_math_hf_samples(
-            parquet_path=args.dataset_path,
-            scan_batch_size=args.scan_batch_size,
-            max_source_samples=args.max_source_samples,
-            gold_rationale_key_paths=(),
-            require_gold_rationale=False,
-        )
-    else:
-        raise ValueError(f"Unsupported --dataset_layout: {layout}")
-    return layout, source_iter
-
-
-def _truncate_privileged_trace(trace: str, max_chars: int) -> str:
-    text = str(trace or "").strip()
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip()
-
-
-def _format_privileged_user_prompt(
-    *,
-    prompt_user_effective: str,
-    privileged_trace: str,
-    source_type: str,
-    args: argparse.Namespace,
-) -> str:
-    trace = _truncate_privileged_trace(
-        privileged_trace,
-        int(getattr(args, "privileged_trace_max_chars", 0)),
-    )
-    label = "ground-truth reference reasoning" if source_type == "gt_rationale" else "successful reference reasoning"
-    if args.privileged_prompt_style == "compact":
-        return (
-            f"{prompt_user_effective}\n\n"
-            f"Private {label} for the same problem:\n"
-            f"{trace}\n\n"
-            "Use the private reference only as hidden context, then solve the original problem."
-        ).strip()
-    raise ValueError(f"Unsupported --privileged_prompt_style: {args.privileged_prompt_style}")
-
-
-def _build_privileged_prompt(
-    tokenizer: object,
-    *,
-    prompt_user_effective: str,
-    privileged_trace: str,
-    source_type: str,
-    system_prompt: str,
-    args: argparse.Namespace,
-) -> str:
-    user_prompt = _format_privileged_user_prompt(
-        prompt_user_effective=prompt_user_effective,
-        privileged_trace=privileged_trace,
-        source_type=source_type,
-        args=args,
-    )
-    return apply_qwen_chat_template(
-        tokenizer,
-        user_prompt,
-        enable_thinking=args.enable_thinking,
-        system_prompt=system_prompt,
-    )
-
-
-def _gt_privileged_trace(sample: DapoSample) -> str:
-    gt_text = strip_prompt_prefix_from_text(sample.prompt, sample.gold_rationale)
-    if not gt_text and sample.ground_truth:
-        gt_text = f"Answer: {sample.ground_truth}"
-    return str(gt_text or "").strip()
-
-
-def _build_rollout_trajectories_with_hidden(
-    *,
-    model: object,
-    tokenizer: object,
-    device: torch.device,
-    train_prompt: str,
-    candidates: Sequence[str],
-    split: Any,
-    args: argparse.Namespace,
-) -> List[RolloutTrajectory]:
-    if not candidates:
-        return []
-
-    token_ids_all = tokenizer(
-        list(candidates),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    prompt_texts = [train_prompt for _ in candidates]
-    avg_logprobs: List[float] = []
-    avg_entropies: List[float] = []
-    hidden_vecs: List[List[float]] = []
-    mb = args.rollout_feature_micro_batch_size if args.rollout_feature_micro_batch_size > 0 else len(candidates)
-
-    was_training = bool(getattr(model, "training", False))
-    model.eval()
-    with torch.no_grad():
-        for start in range(0, len(candidates), mb):
-            end = min(start + mb, len(candidates))
-            seq_logps, seq_entropy, batch_hidden = _compute_sequence_logps_and_hidden_batch(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_texts=prompt_texts[start:end],
-                completion_texts=list(candidates[start:end]),
-                max_length=args.max_length,
-                device=device,
-                hidden_layer_offset=args.hidden_layer_offset,
-                compute_entropy=bool(getattr(args, "rollout_compute_entropy", True)),
-            )
-            avg_logprobs.extend([float(v) for v in seq_logps.detach().cpu().tolist()])
-            avg_entropies.extend([float(v) for v in seq_entropy.detach().cpu().tolist()])
-            hidden_vecs.extend([[float(x) for x in row] for row in batch_hidden.detach().cpu().tolist()])
-    if was_training:
-        model.train()
-
-    trajectories: List[RolloutTrajectory] = []
-    for idx, response_text in enumerate(candidates):
-        avg_logprob = float(avg_logprobs[idx])
-        trajectories.append(
-            RolloutTrajectory(
-                response_text=str(response_text),
-                token_ids=[int(tid) for tid in token_ids_all[idx]],
-                is_correct=bool(split.responses_correct[idx]),
-                fail_type=str(split.responses_fail_type[idx]),
-                has_final_answer_line=bool(split.responses_has_final_answer_line[idx]),
-                final_answer=str(split.responses_final_answers[idx]),
-                avg_logprob=avg_logprob,
-                avg_nll=-avg_logprob,
-                avg_entropy=float(avg_entropies[idx]),
-                hidden_vec=list(hidden_vecs[idx]),
-            )
-        )
-    return trajectories
-
-
-def _nearest_correct_by_hidden(
-    correct_trajs: Sequence[RolloutTrajectory],
-    wrong_traj: RolloutTrajectory,
-) -> tuple[int, float]:
-    if not correct_trajs:
-        return -1, float("nan")
-    if wrong_traj.hidden_vec and all(t.hidden_vec for t in correct_trajs):
-        wrong_vec = torch.tensor(wrong_traj.hidden_vec, dtype=torch.float32)
-        correct_mat = torch.tensor([t.hidden_vec for t in correct_trajs], dtype=torch.float32)
-        if correct_mat.ndim == 2 and correct_mat.shape[1] == wrong_vec.numel():
-            sims = correct_mat @ wrong_vec
-            best_idx = int(torch.argmax(sims).item())
-            return best_idx, float(sims[best_idx].item())
-
-    best_idx = min(range(len(correct_trajs)), key=lambda i: float(correct_trajs[i].avg_nll))
-    return int(best_idx), float("nan")
-
-
-def _build_mixed_privileged_examples(
-    *,
-    tokenizer: object,
-    prompt_user_effective: str,
-    system_prompt: str,
-    train_prompt: str,
-    correct_trajs: Sequence[RolloutTrajectory],
-    wrong_trajs: Sequence[RolloutTrajectory],
-    prompt_weight: float,
-    args: argparse.Namespace,
-) -> List[PrivilegedWrongExample]:
-    if not correct_trajs or not wrong_trajs or args.lambda_priv <= 0:
-        return []
-    per_wrong_weight = float(args.lambda_priv) * float(prompt_weight) / float(len(wrong_trajs))
-    examples: List[PrivilegedWrongExample] = []
-    for wrong_traj in wrong_trajs:
-        correct_idx, sim = _nearest_correct_by_hidden(correct_trajs, wrong_traj)
-        if correct_idx < 0:
-            continue
-        source_trace = correct_trajs[correct_idx].response_text
-        privileged_prompt = _build_privileged_prompt(
-            tokenizer,
-            prompt_user_effective=prompt_user_effective,
-            privileged_trace=source_trace,
-            source_type="nearest_correct",
-            system_prompt=system_prompt,
-            args=args,
-        )
-        examples.append(
-            PrivilegedWrongExample(
-                train_prompt=train_prompt,
-                privileged_prompt=privileged_prompt,
-                wrong_response=wrong_traj.response_text,
-                source_type="nearest_correct",
-                source_trace=source_trace,
-                weight=per_wrong_weight,
-                match_correct_index=int(correct_idx),
-                match_similarity=float(sim),
-                wrong_avg_logprob=float(wrong_traj.avg_logprob),
-            )
-        )
-    return examples
-
-
-def _build_gt_privileged_examples(
-    *,
-    tokenizer: object,
-    sample: DapoSample,
-    prompt_user_effective: str,
-    system_prompt: str,
-    train_prompt: str,
-    wrong_trajs: Sequence[RolloutTrajectory],
-    prompt_weight: float,
-    args: argparse.Namespace,
-) -> List[PrivilegedWrongExample]:
-    if not wrong_trajs or not args.use_all_wrong_gt_preference or args.lambda_gt <= 0:
-        return []
-    source_trace = _gt_privileged_trace(sample)
-    if not source_trace:
-        return []
-    privileged_prompt = _build_privileged_prompt(
-        tokenizer,
-        prompt_user_effective=prompt_user_effective,
-        privileged_trace=source_trace,
-        source_type="gt_rationale",
-        system_prompt=system_prompt,
-        args=args,
-    )
-    per_wrong_weight = float(args.lambda_gt) * float(prompt_weight) / float(len(wrong_trajs))
-    return [
-        PrivilegedWrongExample(
-            train_prompt=train_prompt,
-            privileged_prompt=privileged_prompt,
-            wrong_response=wrong_traj.response_text,
-            source_type="gt_rationale",
-            source_trace=source_trace,
-            weight=per_wrong_weight,
-            match_correct_index=-1,
-            match_similarity=float("nan"),
-            wrong_avg_logprob=float(wrong_traj.avg_logprob),
-        )
-        for wrong_traj in wrong_trajs
-    ]
 
 
 def _build_zero_stats(reason: str, grad_norm: float = 0.0) -> PrivilegedStepStats:
@@ -393,231 +97,108 @@ def _build_zero_stats(reason: str, grad_norm: float = 0.0) -> PrivilegedStepStat
     )
 
 
-def _safe_pad_token_id(tokenizer: object) -> int:
-    pad_token_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_token_id is not None:
-        return int(pad_token_id)
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is not None:
-        return int(eos_token_id)
-    return 0
-
-
-def _pad_id_sequences(
-    sequences: Sequence[Sequence[int]],
-    *,
-    pad_token_id: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not sequences:
-        empty = torch.empty((0, 0), dtype=torch.long, device=device)
-        return empty, empty
-    max_len = max(len(seq) for seq in sequences)
-    input_ids = torch.full((len(sequences), max_len), pad_token_id, dtype=torch.long, device=device)
-    attention_mask = torch.zeros((len(sequences), max_len), dtype=torch.long, device=device)
-    for row, seq in enumerate(sequences):
-        if not seq:
-            continue
-        values = torch.tensor(list(seq), dtype=torch.long, device=device)
-        input_ids[row, : values.numel()] = values
-        attention_mask[row, : values.numel()] = 1
-    return input_ids, attention_mask
-
-
-def _build_privileged_distill_batch(
-    *,
-    tokenizer: object,
-    student_prompts: Sequence[str],
-    teacher_prompts: Sequence[str],
-    completions: Sequence[str],
-    weights: Sequence[float],
-    args: argparse.Namespace,
-    device: torch.device,
-) -> Optional[DistillBatchTensors]:
-    """Build paired student/teacher inputs that share the exact wrong rollout tokens.
-
-    OPSD distills the distribution on student on-policy tokens. Tokenizing the
-    completion separately gives both prompts the same supervised token ids, even
-    though the privileged prompt is longer.
-    """
-    if not student_prompts:
-        return None
-
-    student_prompt_ids = tokenizer(
-        list(student_prompts),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    teacher_prompt_ids = tokenizer(
-        list(teacher_prompts),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-    completion_ids = tokenizer(
-        list(completions),
-        add_special_tokens=False,
-        padding=False,
-        truncation=False,
-    )["input_ids"]
-
-    student_sequences: List[List[int]] = []
-    teacher_sequences: List[List[int]] = []
-    student_lens: List[int] = []
-    teacher_lens: List[int] = []
-    target_rows: List[List[int]] = []
-    kept_weights: List[float] = []
-    for sp_ids, tp_ids, comp_ids, weight in zip(
-        student_prompt_ids,
-        teacher_prompt_ids,
-        completion_ids,
-        weights,
-    ):
-        if float(weight) <= 0:
-            continue
-        sp = [int(x) for x in sp_ids]
-        tp = [int(x) for x in tp_ids]
-        cp = [int(x) for x in comp_ids]
-        if not sp or not tp or not cp:
-            continue
-        max_completion_len = min(
-            len(cp),
-            int(args.max_length) - len(sp),
-            int(args.max_length) - len(tp),
-        )
-        if max_completion_len <= 0:
-            continue
-        cp = cp[:max_completion_len]
-        student_sequences.append(sp + cp)
-        teacher_sequences.append(tp + cp)
-        student_lens.append(len(sp))
-        teacher_lens.append(len(tp))
-        target_rows.append(cp)
-        kept_weights.append(float(weight))
-
-    kept = len(student_sequences)
-    total = len(student_prompts)
-    if kept <= 0:
-        return None
-
-    pad_token_id = _safe_pad_token_id(tokenizer)
-    student_input_ids, student_attention_mask = _pad_id_sequences(
-        student_sequences,
-        pad_token_id=pad_token_id,
-        device=device,
+def _teacher_adapter_context(model: object, args: argparse.Namespace):
+    """OPSD fixed-teacher mode: disable LoRA adapters during teacher forward."""
+    if not bool(getattr(args, "fixed_teacher", False)):
+        return nullcontext()
+    if not bool(getattr(args, "use_lora", False)):
+        return nullcontext()
+    unwrapped = unwrap_model_for_save(model)
+    disable_adapter = getattr(unwrapped, "disable_adapter", None)
+    if callable(disable_adapter):
+        return disable_adapter()
+    print(
+        "[privileged_hidden_opsd] fixed_teacher=true but model has no disable_adapter(); "
+        "teacher will use current weights.",
+        flush=True,
     )
-    teacher_input_ids, teacher_attention_mask = _pad_id_sequences(
-        teacher_sequences,
-        pad_token_id=pad_token_id,
-        device=device,
-    )
-    max_target_len = max(len(row) for row in target_rows)
-    target_ids = torch.zeros((kept, max_target_len), dtype=torch.long, device=device)
-    token_mask = torch.zeros((kept, max_target_len), dtype=torch.bool, device=device)
-    for row_idx, row in enumerate(target_rows):
-        row_tensor = torch.tensor(row, dtype=torch.long, device=device)
-        target_ids[row_idx, : row_tensor.numel()] = row_tensor
-        token_mask[row_idx, : row_tensor.numel()] = True
-
-    return DistillBatchTensors(
-        student_input_ids=student_input_ids,
-        student_attention_mask=student_attention_mask,
-        teacher_input_ids=teacher_input_ids,
-        teacher_attention_mask=teacher_attention_mask,
-        student_prompt_lens=torch.tensor(student_lens, dtype=torch.long, device=device),
-        teacher_prompt_lens=torch.tensor(teacher_lens, dtype=torch.long, device=device),
-        target_ids=target_ids,
-        token_mask=token_mask,
-        weights=torch.tensor(kept_weights, dtype=torch.float32, device=device),
-        kept_count=kept,
-        total_count=total,
-    )
+    return nullcontext()
 
 
-def _extract_completion_logits(
-    logits: torch.Tensor,
-    prompt_lens: torch.Tensor,
-    token_mask: torch.Tensor,
-) -> torch.Tensor:
-    batch_size, max_completion_len = token_mask.shape
-    out = logits.new_zeros((batch_size, max_completion_len, logits.shape[-1]))
-    comp_lens = token_mask.sum(dim=1).tolist()
-    for row, comp_len_obj in enumerate(comp_lens):
-        comp_len = int(comp_len_obj)
-        if comp_len <= 0:
+def _first_nonfinite_grad_names(model: object, limit: int = 3) -> List[str]:
+    out: List[str] = []
+    named_params = getattr(model, "named_parameters", None)
+    if not callable(named_params):
+        return out
+    for name, param in model.named_parameters():
+        grad = getattr(param, "grad", None)
+        if grad is None:
             continue
-        start = int(prompt_lens[row].item()) - 1
-        if start < 0:
-            continue
-        out[row, :comp_len] = logits[row, start : start + comp_len]
+        if not torch.isfinite(grad.detach()).all():
+            out.append(str(name))
+            if len(out) >= limit:
+                break
     return out
 
 
-def _opsd_generalized_jsd_row_loss_and_gap(
+def _sanitize_nonfinite_grads_(
+    trainable: Sequence[torch.nn.Parameter],
     *,
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    target_ids: torch.Tensor,
-    token_mask: torch.Tensor,
-    args: argparse.Namespace,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    temperature = float(getattr(args, "privileged_distill_temperature", 1.0))
-    if temperature <= 0:
-        raise ValueError("--privileged_distill_temperature must be > 0")
-    beta_value = float(getattr(args, "privileged_jsd_beta", -1.0))
-    if beta_value < 0:
-        beta_value = float(args.beta)
-    beta_value = min(max(beta_value, 1e-6), 1.0 - 1e-6)
-    beta = torch.tensor(beta_value, device=student_logits.device, dtype=torch.float32)
+    element_clip_abs: float,
+) -> tuple[int, int]:
+    touched_tensors = 0
+    nonfinite_values = 0
+    for param in trainable:
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        if grad.is_sparse:
+            grad = grad.coalesce()
+            param.grad = grad
+            values = grad._values()
+            finite_mask = torch.isfinite(values)
+            if not bool(finite_mask.all()):
+                nonfinite_values += int((~finite_mask).sum().item())
+                touched_tensors += 1
+                values.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            if element_clip_abs > 0:
+                values.clamp_(min=-element_clip_abs, max=element_clip_abs)
+            continue
+        g = grad.detach()
+        finite_mask = torch.isfinite(g)
+        if not bool(finite_mask.all()):
+            nonfinite_values += int((~finite_mask).sum().item())
+            touched_tensors += 1
+            g.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+        if element_clip_abs > 0:
+            g.clamp_(min=-element_clip_abs, max=element_clip_abs)
+    return touched_tensors, nonfinite_values
 
-    logit_clip_abs = float(getattr(args, "privileged_logit_clip_abs", 80.0))
-    student_logits_f = torch.nan_to_num(
-        student_logits.float(),
-        nan=0.0,
-        posinf=logit_clip_abs,
-        neginf=-logit_clip_abs,
-    )
-    teacher_logits_f = torch.nan_to_num(
-        teacher_logits.float(),
-        nan=0.0,
-        posinf=logit_clip_abs,
-        neginf=-logit_clip_abs,
-    )
-    if logit_clip_abs > 0:
-        student_logits_f = student_logits_f.clamp(-logit_clip_abs, logit_clip_abs)
-        teacher_logits_f = teacher_logits_f.clamp(-logit_clip_abs, logit_clip_abs)
 
-    student_log_probs = F.log_softmax(student_logits_f / temperature, dim=-1)
-    teacher_log_probs = F.log_softmax(teacher_logits_f / temperature, dim=-1)
-    mixture_log_probs = torch.logsumexp(
-        torch.stack(
-            [
-                student_log_probs + torch.log1p(-beta),
-                teacher_log_probs + torch.log(beta),
-            ]
-        ),
-        dim=0,
-    )
-    kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
-    kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
-    pointwise_jsd = beta * kl_teacher + (1.0 - beta) * kl_student
-    pointwise_jsd = torch.nan_to_num(pointwise_jsd, nan=0.0, posinf=0.0, neginf=0.0)
-    clip_max = float(getattr(args, "privileged_pointwise_kl_clip", 0.0))
-    if clip_max > 0:
-        pointwise_jsd = pointwise_jsd.clamp(max=clip_max)
-
-    mask_f = token_mask.to(dtype=pointwise_jsd.dtype)
-    token_jsd = pointwise_jsd.sum(dim=-1)
-    row_loss = (token_jsd * mask_f).sum(dim=-1) / mask_f.sum(dim=-1).clamp_min(1.0)
-
-    safe_targets = target_ids.clamp_min(0)
-    student_target_logps = student_log_probs.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
-    teacher_target_logps = teacher_log_probs.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
-    student_avg_logps = (student_target_logps * mask_f).sum(dim=-1) / mask_f.sum(dim=-1).clamp_min(1.0)
-    teacher_avg_logps = (teacher_target_logps * mask_f).sum(dim=-1) / mask_f.sum(dim=-1).clamp_min(1.0)
-    sampled_token_gap = teacher_avg_logps.detach() - student_avg_logps.detach()
-    return row_loss, sampled_token_gap, teacher_avg_logps.detach(), student_avg_logps.detach()
+def _compute_grad_norm_and_clip_(
+    trainable: Sequence[torch.nn.Parameter],
+    *,
+    max_grad_norm: float,
+    device: torch.device,
+) -> float:
+    total_sq = torch.zeros((), dtype=torch.float32, device=device)
+    for param in trainable:
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        if grad.is_sparse:
+            grad = grad.coalesce()
+            param.grad = grad
+            vals = grad._values().float()
+            total_sq = total_sq + (vals * vals).sum()
+        else:
+            g = grad.detach().float()
+            total_sq = total_sq + (g * g).sum()
+    total_norm = torch.sqrt(total_sq)
+    grad_norm = float(total_norm.item())
+    if max_grad_norm > 0 and math.isfinite(grad_norm) and grad_norm > max_grad_norm:
+        scale = float(max_grad_norm) / (grad_norm + 1e-12)
+        for param in trainable:
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                grad = grad.coalesce()
+                param.grad = grad
+                grad._values().mul_(scale)
+            else:
+                grad.mul_(scale)
+    return grad_norm
 
 
 def _run_optimizer_step(
@@ -639,8 +220,8 @@ def _run_optimizer_step(
     gt_priv_wrong: List[str],
     gt_priv_weights: List[float],
 ) -> PrivilegedStepStats:
-    total_weight = float(sum(mle_weights) + sum(priv_weights) + sum(gt_priv_weights))
-    if total_weight <= 0:
+    original_total_weight = float(sum(mle_weights) + sum(priv_weights) + sum(gt_priv_weights))
+    if original_total_weight <= 0:
         return _build_zero_stats("zero_total_weight")
 
     mb = args.logprob_micro_batch_size if args.logprob_micro_batch_size > 0 else max(
@@ -684,6 +265,13 @@ def _run_optimizer_step(
                 f"{skip_prefix}_loss_chunk_too_large(value={loss_chunk_val:.4f},cap={args.online_loss_value_cap:.4f})"
             )
         loss_chunk.backward()
+        bad_grad_names = _first_nonfinite_grad_names(model)
+        if bad_grad_names:
+            optimizer.zero_grad(set_to_none=True)
+            return _build_zero_stats(
+                f"nonfinite_{skip_prefix}_grad_after_backward(start={start},end={end},"
+                f"params={','.join(bad_grad_names)})"
+            )
         return None
 
     def _run_privileged_branch(
@@ -711,7 +299,7 @@ def _run_optimizer_step(
             tp = train_prompts[start:end]
             pp = privileged_prompts[start:end]
             wc = wrong_completions[start:end]
-            distill_batch = _build_privileged_distill_batch(
+            distill_batch = build_privileged_distill_batch(
                 tokenizer=tokenizer,
                 student_prompts=tp,
                 teacher_prompts=pp,
@@ -737,13 +325,13 @@ def _run_optimizer_step(
             was_training = bool(getattr(model, "training", False))
             model.eval()
             try:
-                with torch.no_grad():
+                with torch.no_grad(), _teacher_adapter_context(model, args):
                     teacher_outputs = model(
                         input_ids=distill_batch.teacher_input_ids,
                         attention_mask=distill_batch.teacher_attention_mask,
                         use_cache=False,
                     )
-                    teacher_logits = _extract_completion_logits(
+                    teacher_logits = extract_completion_logits(
                         teacher_outputs.logits,
                         distill_batch.teacher_prompt_lens,
                         distill_batch.token_mask,
@@ -757,24 +345,22 @@ def _run_optimizer_step(
                 attention_mask=distill_batch.student_attention_mask,
                 use_cache=False,
             )
-            student_logits = _extract_completion_logits(
+            student_logits = extract_completion_logits(
                 student_outputs.logits,
                 distill_batch.student_prompt_lens,
                 distill_batch.token_mask,
             )
-            row_loss, raw_gap, teacher_avg_logps, student_avg_logps = _opsd_generalized_jsd_row_loss_and_gap(
+            opsd_outputs = opsd_generalized_jsd_row_loss_and_gap(
                 student_logits=student_logits,
                 teacher_logits=teacher_logits,
                 target_ids=distill_batch.target_ids,
                 token_mask=distill_batch.token_mask,
                 args=args,
             )
+            row_loss = opsd_outputs[0]
+            raw_gap = opsd_outputs[1]
 
             keep_mask = torch.isfinite(row_loss) & torch.isfinite(raw_gap)
-            if args.online_pref_min_avg_logprob_chosen is not None:
-                keep_mask = keep_mask & (teacher_avg_logps >= float(args.online_pref_min_avg_logprob_chosen))
-            if args.online_pref_min_avg_logprob_rejected is not None:
-                keep_mask = keep_mask & (student_avg_logps >= float(args.online_pref_min_avg_logprob_rejected))
             kept = int(keep_mask.sum().item())
             total = int(keep_mask.numel())
             if kept <= 0:
@@ -793,7 +379,7 @@ def _run_optimizer_step(
             w_kept = distill_batch.weights[keep_mask]
             loss_vec = row_loss[keep_mask]
             gap_vec = raw_gap.to(device=device)[keep_mask]
-            loss_chunk = (loss_vec * w_kept).sum() / total_weight
+            loss_chunk = (loss_vec * w_kept).sum() / original_total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
             failed = _check_and_backward(
                 loss_chunk=loss_chunk,
@@ -820,118 +406,7 @@ def _run_optimizer_step(
                 gt_priv_pairs_used += kept
         return None
 
-    def _run_privileged_sampled_branch(
-        *,
-        branch: str,
-        train_prompts: List[str],
-        privileged_prompts: List[str],
-        wrong_completions: List[str],
-        weights: List[float],
-    ) -> Optional[PrivilegedStepStats]:
-        nonlocal priv_loss_weighted_sum
-        nonlocal gt_priv_loss_weighted_sum
-        nonlocal priv_adv_weighted_sum
-        nonlocal gt_priv_adv_weighted_sum
-        nonlocal priv_weight_sum_used
-        nonlocal gt_priv_weight_sum_used
-        nonlocal priv_pairs_used
-        nonlocal gt_priv_pairs_used
-
-        branch_batch = len(train_prompts)
-        if branch_batch <= 0:
-            return None
-        for start in range(0, branch_batch, mb):
-            end = min(start + mb, branch_batch)
-            tp = train_prompts[start:end]
-            pp = privileged_prompts[start:end]
-            wc = wrong_completions[start:end]
-            w = torch.tensor(weights[start:end], device=device, dtype=torch.float32)
-            was_training = bool(getattr(model, "training", False))
-            model.eval()
-            try:
-                with torch.no_grad():
-                    teacher_logps = _compute_sequence_logps_batch(
-                        model=model,
-                        tokenizer=tokenizer,
-                        prompt_texts=pp,
-                        completion_texts=wc,
-                        max_length=args.max_length,
-                        device=device,
-                    )
-            finally:
-                if was_training:
-                    model.train()
-            student_logps = _compute_sequence_logps_batch(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_texts=tp,
-                completion_texts=wc,
-                max_length=args.max_length,
-                device=device,
-            )
-            raw_adv = teacher_logps.detach() - student_logps.detach()
-            keep_mask = torch.isfinite(teacher_logps) & torch.isfinite(student_logps) & torch.isfinite(raw_adv)
-            if args.online_pref_min_avg_logprob_chosen is not None:
-                keep_mask = keep_mask & (teacher_logps >= float(args.online_pref_min_avg_logprob_chosen))
-            if args.online_pref_min_avg_logprob_rejected is not None:
-                keep_mask = keep_mask & (student_logps.detach() >= float(args.online_pref_min_avg_logprob_rejected))
-            kept = int(keep_mask.sum().item())
-            total = int(keep_mask.numel())
-            if kept <= 0:
-                print(
-                    f"[privileged_hidden_opsd] {branch} prefilter chunk=[{start},{end}) kept=0/{total}",
-                    flush=True,
-                )
-                continue
-            if kept < total:
-                print(
-                    f"[privileged_hidden_opsd] {branch} prefilter chunk=[{start},{end}) kept={kept}/{total}",
-                    flush=True,
-                )
-            keep_mask = keep_mask.to(device=student_logps.device)
-            student_kept = student_logps[keep_mask]
-            adv = raw_adv.to(device=student_logps.device)[keep_mask]
-            if args.privileged_advantage_clip_abs > 0:
-                adv = adv.clamp(
-                    -float(args.privileged_advantage_clip_abs),
-                    float(args.privileged_advantage_clip_abs),
-                )
-            w_kept = w[keep_mask]
-            loss_vec = -adv * student_kept
-            loss_chunk = (loss_vec * w_kept).sum() / total_weight
-            loss_chunk_val = float(loss_chunk.detach().item())
-            failed = _check_and_backward(
-                loss_chunk=loss_chunk,
-                loss_chunk_val=loss_chunk_val,
-                skip_prefix=branch,
-                start=start,
-                end=end,
-            )
-            if failed is not None:
-                return failed
-
-            loss_sum = float((loss_vec.detach() * w_kept).sum().item())
-            adv_sum = float((adv.detach() * w_kept).sum().item())
-            w_sum = float(w_kept.sum().item())
-            if branch == "privileged":
-                priv_loss_weighted_sum += loss_sum
-                priv_adv_weighted_sum += adv_sum
-                priv_weight_sum_used += w_sum
-                priv_pairs_used += kept
-            else:
-                gt_priv_loss_weighted_sum += loss_sum
-                gt_priv_adv_weighted_sum += adv_sum
-                gt_priv_weight_sum_used += w_sum
-                gt_priv_pairs_used += kept
-        return None
-
-    branch_runner = (
-        _run_privileged_sampled_branch
-        if args.privileged_distill_loss == "sampled_pg"
-        else _run_privileged_branch
-    )
-
-    failed = branch_runner(
+    failed = _run_privileged_branch(
         branch="privileged",
         train_prompts=priv_train_prompts,
         privileged_prompts=priv_prompts,
@@ -941,7 +416,7 @@ def _run_optimizer_step(
     if failed is not None:
         return failed
 
-    failed = branch_runner(
+    failed = _run_privileged_branch(
         branch="gt_privileged",
         train_prompts=gt_priv_train_prompts,
         privileged_prompts=gt_priv_prompts,
@@ -957,7 +432,7 @@ def _run_optimizer_step(
             tp = mle_train_prompts[start:end]
             cp = mle_completions[start:end]
             w = torch.tensor(mle_weights[start:end], device=device, dtype=torch.float32)
-            logps = _compute_sequence_logps_batch(
+            logps = compute_sequence_logps_batch_local(
                 model=model,
                 tokenizer=tokenizer,
                 prompt_texts=tp,
@@ -971,7 +446,7 @@ def _run_optimizer_step(
             logps = logps[keep_mask]
             w = w[keep_mask.to(device=w.device)]
             mle_loss_vec = -logps
-            loss_chunk = (mle_loss_vec * w).sum() / total_weight
+            loss_chunk = (mle_loss_vec * w).sum() / original_total_weight
             loss_chunk_val = float(loss_chunk.detach().item())
             failed = _check_and_backward(
                 loss_chunk=loss_chunk,
@@ -986,17 +461,43 @@ def _run_optimizer_step(
             mle_weight_sum_used += float(w.sum().item())
             mle_samples_used += int(w.numel())
 
-    if mle_weight_sum_used + priv_weight_sum_used + gt_priv_weight_sum_used <= 0:
+    used_weight = mle_weight_sum_used + priv_weight_sum_used + gt_priv_weight_sum_used
+    if used_weight <= 0:
         optimizer.zero_grad(set_to_none=True)
         return _build_zero_stats("all_train_samples_filtered_before_autograd")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    if args.max_grad_norm > 0:
-        total_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-    else:
-        parts = [torch.linalg.vector_norm(p.grad.detach(), ord=2) for p in trainable if p.grad is not None]
-        total_norm = torch.linalg.vector_norm(torch.stack(parts), ord=2) if parts else torch.tensor(0.0, device=device)
-    grad_norm = float(total_norm.item()) if isinstance(total_norm, torch.Tensor) else float(total_norm)
+    grad_rescale = float(original_total_weight) / float(used_weight)
+    if not math.isfinite(grad_rescale) or grad_rescale <= 0:
+        optimizer.zero_grad(set_to_none=True)
+        return _build_zero_stats(
+            f"invalid_grad_rescale(original_total_weight={original_total_weight:.6f},used_weight={used_weight:.6f})"
+        )
+    # Keep backward micro-batch accumulation memory behavior, but align final gradient scale
+    # with the filtered effective weight used by metrics.
+    if abs(grad_rescale - 1.0) > 1e-12:
+        for param in trainable:
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            grad.mul_(grad_rescale)
+
+    if bool(getattr(args, "online_sanitize_gradients", True)):
+        touched, nonfinite_count = _sanitize_nonfinite_grads_(
+            trainable,
+            element_clip_abs=float(getattr(args, "online_grad_element_clip_abs", 0.0)),
+        )
+        if nonfinite_count > 0:
+            print(
+                "[privileged_hidden_opsd] sanitized nonfinite gradients "
+                f"tensors={touched} values={nonfinite_count}",
+                flush=True,
+            )
+    grad_norm = _compute_grad_norm_and_clip_(
+        trainable,
+        max_grad_norm=float(args.max_grad_norm),
+        device=device,
+    )
     if args.online_skip_nonfinite_loss and not math.isfinite(grad_norm):
         optimizer.zero_grad(set_to_none=True)
         return _build_zero_stats("nonfinite_grad_norm", grad_norm=grad_norm)
@@ -1012,7 +513,6 @@ def _run_optimizer_step(
     if args.online_abort_on_lora_nan and lora_health["lora_nan_ratio"] > 0:
         raise RuntimeError(f"Detected NaN in LoRA params: lora_nan_ratio={lora_health['lora_nan_ratio']:.6f}")
 
-    used_weight = mle_weight_sum_used + priv_weight_sum_used + gt_priv_weight_sum_used
     return PrivilegedStepStats(
         total_loss=(mle_loss_weighted_sum + priv_loss_weighted_sum + gt_priv_loss_weighted_sum) / used_weight,
         mle_loss=mle_loss_weighted_sum / mle_weight_sum_used if mle_weight_sum_used > 0 else 0.0,
@@ -1032,60 +532,6 @@ def _run_optimizer_step(
         skip_reason="",
         lora_health=lora_health,
     )
-
-
-def _rollout_record(
-    *,
-    sample: DapoSample,
-    split: Any,
-    objective: Optional[PrivilegedObjective],
-    candidates: Sequence[str],
-    log_text: bool,
-) -> Dict[str, Any]:
-    record: Dict[str, Any] = {
-        "sample_id": sample.sample_id,
-        "ground_truth": sample.ground_truth,
-        "objective_type": "skip" if objective is None else objective.objective_type,
-        "n_total": len(candidates),
-        "n_correct": int(sum(1 for x in split.responses_correct if x)),
-        "n_wrong": int(sum(1 for x in split.responses_correct if not x)),
-        "responses_correct": [bool(x) for x in split.responses_correct],
-        "responses_fail_type": [str(x) for x in split.responses_fail_type],
-        "responses_final_answers": [str(x) for x in split.responses_final_answers],
-    }
-    if objective is not None:
-        record["rho_hat"] = float(objective.rho_hat)
-        record["prompt_weight"] = float(objective.prompt_weight)
-        record["n_privileged_wrong_examples"] = len(objective.privileged_wrong_examples)
-        record["privileged_matches"] = [
-            {
-                "source_type": ex.source_type,
-                "match_correct_index": int(ex.match_correct_index),
-                "match_similarity": float(ex.match_similarity),
-                "wrong_avg_logprob": float(ex.wrong_avg_logprob),
-                "weight": float(ex.weight),
-            }
-            for ex in objective.privileged_wrong_examples
-        ]
-        if log_text:
-            record["rollouts"] = [
-                rollout_trajectory_to_json(t, include_dense=bool(False))
-                for t in [*objective.correct, *objective.wrong]
-            ]
-            record["privileged_examples"] = [
-                {
-                    "source_type": ex.source_type,
-                    "source_trace": ex.source_trace,
-                    "wrong_response": ex.wrong_response,
-                    "privileged_prompt": ex.privileged_prompt,
-                    "weight": float(ex.weight),
-                }
-                for ex in objective.privileged_wrong_examples
-            ]
-    if log_text:
-        record["prompt"] = sample.prompt
-        record["responses"] = [str(x) for x in candidates]
-    return record
 
 
 def run_training(args: argparse.Namespace) -> None:
@@ -1145,7 +591,7 @@ def run_training(args: argparse.Namespace) -> None:
         args.max_source_samples = None
     if args.online_steps == 0:
         args.online_steps = None
-    layout, source_iter = _load_source_iter(args)
+    layout, source_iter = load_source_iter(args)
     rollout_user_suffix = str(args.user_content_suffix or "")
     if args.auto_math_hf_user_suffix and layout == "math_hf" and not rollout_user_suffix.strip():
         rollout_user_suffix = DEFAULT_MATH_HF_USER_CONTENT_SUFFIX
@@ -1159,9 +605,9 @@ def run_training(args: argparse.Namespace) -> None:
         f"rollout_batch_size={args.rollout_batch_size} rollout_n={args.rollout_n} "
         f"objectives_per_update={args.online_pairs_per_step} online_steps={total_steps_str} "
         f"lambda_mle={args.lambda_mle} lambda_priv={args.lambda_priv} lambda_gt={args.lambda_gt} "
-        f"hidden_layer_offset={args.hidden_layer_offset} distill_loss={args.privileged_distill_loss} "
+        f"hidden_layer_offset={args.hidden_layer_offset} "
         f"jsd_beta={args.privileged_jsd_beta if args.privileged_jsd_beta >= 0 else args.beta} "
-        f"pointwise_kl_clip={args.privileged_pointwise_kl_clip}",
+        f"pointwise_kl_clip={args.privileged_pointwise_kl_clip} fixed_teacher={args.fixed_teacher}",
         flush=True,
     )
     write_metric(
@@ -1176,11 +622,12 @@ def run_training(args: argparse.Namespace) -> None:
             "lambda_gt": float(args.lambda_gt),
             "rollout_n": int(args.rollout_n),
             "hidden_layer_offset": int(args.hidden_layer_offset),
-            "privileged_distill_loss": str(args.privileged_distill_loss),
             "privileged_jsd_beta": float(args.privileged_jsd_beta if args.privileged_jsd_beta >= 0 else args.beta),
             "privileged_distill_temperature": float(args.privileged_distill_temperature),
             "privileged_pointwise_kl_clip": float(args.privileged_pointwise_kl_clip),
-            "privileged_advantage_clip_abs": float(args.privileged_advantage_clip_abs),
+            "fixed_teacher": bool(args.fixed_teacher),
+            "online_sanitize_gradients": bool(args.online_sanitize_gradients),
+            "online_grad_element_clip_abs": float(args.online_grad_element_clip_abs),
         },
     )
 
@@ -1275,21 +722,9 @@ def run_training(args: argparse.Namespace) -> None:
                 n_correct = int(sum(1 for x in split.responses_correct if x))
                 sampled_correct_total += n_correct
                 sampled_total += n_total
-                rho_hat = compute_smoothed_correct_rate(
-                    r_cnt=n_correct,
-                    total=n_total,
-                    alpha=args.prompt_smoothing_alpha,
-                    beta=args.prompt_smoothing_beta,
-                )
-                prompt_weight = compute_prompt_rarity_weight(
-                    rho_hat=rho_hat,
-                    gamma=args.prompt_weight_gamma,
-                    w_min=args.prompt_weight_min,
-                    w_max=args.prompt_weight_max,
-                )
 
                 objective: Optional[PrivilegedObjective] = None
-                trajectories = _build_rollout_trajectories_with_hidden(
+                trajectories = build_rollout_trajectories_with_hidden(
                     model=model,
                     tokenizer=tokenizer,
                     device=device,
@@ -1302,18 +737,13 @@ def run_training(args: argparse.Namespace) -> None:
                 wrong_trajs = [trajectories[i] for i in split.wrong_kept_indices]
 
                 if n_correct == n_total and correct_trajs:
-                    correct_weights = compute_correct_trajectory_weights(
-                        correct_trajs=correct_trajs,
-                        mode=args.positive_weight_mode,
-                        tau=args.positive_weight_tau,
-                    )
+                    uniform_weight = 1.0 / float(len(correct_trajs))
+                    correct_weights = [uniform_weight for _ in correct_trajs]
                     objective = PrivilegedObjective(
                         sample_id=sample_obj.sample_id,
                         ground_truth=sample_obj.ground_truth,
                         train_prompt=prompt_texts[idx],
                         objective_type="all_correct",
-                        rho_hat=rho_hat,
-                        prompt_weight=prompt_weight,
                         correct=correct_trajs,
                         wrong=[],
                         correct_weights=correct_weights,
@@ -1323,34 +753,26 @@ def run_training(args: argparse.Namespace) -> None:
                     all_correct_in_rollout += 1
                     logged_all_correct += 1
                 elif n_correct > 0 and correct_trajs and wrong_trajs:
-                    correct_weights = compute_correct_trajectory_weights(
-                        correct_trajs=correct_trajs,
-                        mode=args.positive_weight_mode,
-                        tau=args.positive_weight_tau,
-                    )
-                    privileged_examples = _build_mixed_privileged_examples(
+                    privileged_examples = build_mixed_privileged_examples(
                         tokenizer=tokenizer,
                         prompt_user_effective=prompt_user_effective[idx],
                         system_prompt=system_prompts[idx],
                         train_prompt=prompt_texts[idx],
                         correct_trajs=correct_trajs,
                         wrong_trajs=wrong_trajs,
-                        prompt_weight=prompt_weight,
                         args=args,
                     )
                     objective = PrivilegedObjective(
                         sample_id=sample_obj.sample_id,
                         ground_truth=sample_obj.ground_truth,
                         train_prompt=prompt_texts[idx],
-                        objective_type="mixed_privileged",
-                        rho_hat=rho_hat,
-                        prompt_weight=prompt_weight,
+                        objective_type="mixed_hidden_opsd",
                         correct=correct_trajs,
                         wrong=wrong_trajs,
-                        correct_weights=correct_weights,
+                        correct_weights=[],
                         privileged_wrong_examples=privileged_examples,
                     )
-                    if correct_trajs or privileged_examples:
+                    if privileged_examples:
                         rollout_objectives.append(objective)
                         mixed_in_rollout += 1
                         logged_mixed += 1
@@ -1359,14 +781,13 @@ def run_training(args: argparse.Namespace) -> None:
                         skipped_after_filter += 1
                         skipped_after_filter_in_rollout += 1
                 elif n_correct <= 0 and wrong_trajs:
-                    gt_examples = _build_gt_privileged_examples(
+                    gt_examples = build_gt_privileged_examples(
                         tokenizer=tokenizer,
                         sample=sample_obj,
                         prompt_user_effective=prompt_user_effective[idx],
                         system_prompt=system_prompts[idx],
                         train_prompt=prompt_texts[idx],
                         wrong_trajs=wrong_trajs,
-                        prompt_weight=prompt_weight,
                         args=args,
                     )
                     if gt_examples:
@@ -1375,8 +796,6 @@ def run_training(args: argparse.Namespace) -> None:
                             ground_truth=sample_obj.ground_truth,
                             train_prompt=prompt_texts[idx],
                             objective_type="all_wrong_gt_privileged",
-                            rho_hat=rho_hat,
-                            prompt_weight=prompt_weight,
                             correct=[],
                             wrong=wrong_trajs,
                             correct_weights=[],
@@ -1395,7 +814,7 @@ def run_training(args: argparse.Namespace) -> None:
 
                 rollout_log.write(
                     json.dumps(
-                        _rollout_record(
+                        build_rollout_record(
                             sample=sample_obj,
                             split=split,
                             objective=objective,
@@ -1452,13 +871,11 @@ def run_training(args: argparse.Namespace) -> None:
                 gt_priv_weights: List[float] = []
 
                 for obj in chunk:
-                    if args.lambda_mle > 0 and obj.correct:
+                    if args.lambda_mle > 0 and obj.objective_type == "all_correct" and obj.correct:
                         for traj, traj_weight in zip(obj.correct, obj.correct_weights):
                             mle_train_prompts.append(obj.train_prompt)
                             mle_completions.append(traj.response_text)
-                            mle_weights.append(
-                                float(args.lambda_mle) * float(obj.prompt_weight) * float(traj_weight)
-                            )
+                            mle_weights.append(float(args.lambda_mle) * float(traj_weight))
                     for ex in obj.privileged_wrong_examples:
                         if ex.source_type == "gt_rationale":
                             gt_priv_train_prompts.append(ex.train_prompt)
@@ -1608,16 +1025,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Weight for mixed prompts: privileged-context OPSD distillation on wrong trajectories.",
     )
     parser.add_argument(
-        "--privileged_distill_loss",
-        type=str,
-        default="jsd",
-        choices=["jsd", "sampled_pg"],
-        help=(
-            "Privileged branch loss. 'jsd' is OPSD-style full-vocab generalized JSD on the wrong "
-            "rollout tokens. 'sampled_pg' keeps the earlier sampled-token logprob-advantage fallback."
-        ),
-    )
-    parser.add_argument(
         "--privileged_jsd_beta",
         type=float,
         default=-1.0,
@@ -1642,12 +1049,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clip fp32 student/teacher logits inside privileged JSD. Use <=0 to disable.",
     )
     parser.add_argument(
-        "--privileged_advantage_clip_abs",
-        type=float,
-        default=1.0,
-        help="Only used by --privileged_distill_loss sampled_pg. Clip teacher-minus-student avg-logprob advantage.",
-    )
-    parser.add_argument(
         "--privileged_prompt_style",
         type=str,
         default="compact",
@@ -1661,10 +1062,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional character cap for private reference traces. 0 keeps the full trace.",
     )
     parser.add_argument(
+        "--fixed_teacher",
+        type=str2bool,
+        default=False,
+        help="If true with LoRA, disable adapters for teacher forward, matching OPSD fixed-teacher main setting.",
+    )
+    parser.add_argument(
         "--log_rollout_text",
         type=str2bool,
         default=False,
         help="If true, rollout_records.jsonl stores full response and privileged prompt text.",
+    )
+    parser.add_argument(
+        "--online_sanitize_gradients",
+        type=str2bool,
+        default=True,
+        help="If true, replace non-finite gradients with 0 and optionally clamp gradient elements before norm/clipping.",
+    )
+    parser.add_argument(
+        "--online_grad_element_clip_abs",
+        type=float,
+        default=100.0,
+        help="If >0 with --online_sanitize_gradients, clamp each gradient element into [-clip_abs, clip_abs].",
     )
     return parser
 
@@ -1694,11 +1113,8 @@ def main() -> None:
         (args.privileged_jsd_beta > 0 and args.privileged_jsd_beta >= 1, "error: --privileged_jsd_beta must be < 1"),
         (args.privileged_pointwise_kl_clip < 0, "error: --privileged_pointwise_kl_clip must be >= 0"),
         (args.privileged_logit_clip_abs < 0, "error: --privileged_logit_clip_abs must be >= 0"),
-        (
-            args.privileged_advantage_clip_abs < 0,
-            "error: --privileged_advantage_clip_abs must be >= 0",
-        ),
         (args.privileged_trace_max_chars < 0, "error: --privileged_trace_max_chars must be >= 0"),
+        (args.online_grad_element_clip_abs < 0, "error: --online_grad_element_clip_abs must be >= 0"),
     ]
     for failed, message in validations:
         if failed:

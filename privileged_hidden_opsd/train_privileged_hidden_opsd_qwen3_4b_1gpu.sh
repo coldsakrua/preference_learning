@@ -46,13 +46,11 @@ max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
 lambda_mle=${LAMBDA_MLE:-1.0}
 lambda_priv=${LAMBDA_PRIV:-1.0}
-lambda_gt=${LAMBDA_GT:-1.0}
-privileged_distill_loss=${PRIVILEGED_DISTILL_LOSS:-jsd}
+lambda_gt=${LAMBDA_GT:-0.0}
 privileged_jsd_beta=${PRIVILEGED_JSD_BETA:--1.0}
 privileged_distill_temperature=${PRIVILEGED_DISTILL_TEMPERATURE:-1.0}
 privileged_pointwise_kl_clip=${PRIVILEGED_POINTWISE_KL_CLIP:-0.05}
 privileged_logit_clip_abs=${PRIVILEGED_LOGIT_CLIP_ABS:-80.0}
-privileged_advantage_clip_abs=${PRIVILEGED_ADVANTAGE_CLIP_ABS:-1.0}
 privileged_trace_max_chars=${PRIVILEGED_TRACE_MAX_CHARS:-0}
 hidden_layer_offset=${HIDDEN_LAYER_OFFSET:-4}
 rollout_feature_micro_batch_size=${ROLLOUT_FEATURE_MICRO_BATCH_SIZE:-4}
@@ -70,7 +68,7 @@ lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
 log_rollout_text=${LOG_ROLLOUT_TEXT:-false}
-use_all_wrong_gt_preference=${USE_ALL_WRONG_GT_PREFERENCE:-true}
+use_all_wrong_gt_preference=${USE_ALL_WRONG_GT_PREFERENCE:-false}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -104,7 +102,7 @@ echo "[PRIV-HIDDEN-OPSD] run_root=${run_root}"
 echo "[PRIV-HIDDEN-OPSD] model_path=${model_path}"
 echo "[PRIV-HIDDEN-OPSD] rollout_batch_size=${rollout_batch_size} rollout_n=${rollout_n}"
 echo "[PRIV-HIDDEN-OPSD] lambda_mle=${lambda_mle} lambda_priv=${lambda_priv} lambda_gt=${lambda_gt}"
-echo "[PRIV-HIDDEN-OPSD] hidden_layer_offset=${hidden_layer_offset} distill_loss=${privileged_distill_loss} jsd_beta=${privileged_jsd_beta}"
+echo "[PRIV-HIDDEN-OPSD] hidden_layer_offset=${hidden_layer_offset} jsd_beta=${privileged_jsd_beta}"
 echo "[PRIV-HIDDEN-OPSD] use_all_wrong_gt_preference=${use_all_wrong_gt_preference} (false => skip all-wrong samples)"
 
 python privileged_hidden_opsd/train_privileged_hidden_opsd.py \
@@ -134,12 +132,10 @@ python privileged_hidden_opsd/train_privileged_hidden_opsd.py \
   --lambda_mle "${lambda_mle}" \
   --lambda_priv "${lambda_priv}" \
   --lambda_gt "${lambda_gt}" \
-  --privileged_distill_loss "${privileged_distill_loss}" \
   --privileged_jsd_beta "${privileged_jsd_beta}" \
   --privileged_distill_temperature "${privileged_distill_temperature}" \
   --privileged_pointwise_kl_clip "${privileged_pointwise_kl_clip}" \
   --privileged_logit_clip_abs "${privileged_logit_clip_abs}" \
-  --privileged_advantage_clip_abs "${privileged_advantage_clip_abs}" \
   --privileged_trace_max_chars "${privileged_trace_max_chars}" \
   --hidden_layer_offset "${hidden_layer_offset}" \
   --rollout_feature_micro_batch_size "${rollout_feature_micro_batch_size}" \
@@ -154,8 +150,6 @@ python privileged_hidden_opsd/train_privileged_hidden_opsd.py \
   --gradient_checkpointing true \
   --enable_thinking false \
   --use_all_wrong_gt_preference "${use_all_wrong_gt_preference}" \
-  --online_pref_min_avg_logprob_chosen -6 \
-  --online_pref_min_avg_logprob_rejected -6 \
   --log_rollout_text "${log_rollout_text}"
 
 echo "[PRIV-HIDDEN-OPSD] done"
