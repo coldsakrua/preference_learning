@@ -45,8 +45,8 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
 lambda_mle=${LAMBDA_MLE:-1.0}
-lambda_priv=${LAMBDA_PRIV:-1.0}
-lambda_gt=${LAMBDA_GT:-0.0}
+lambda_priv=${LAMBDA_PRIV:-5.0}
+lambda_gt=${LAMBDA_GT:-5.0}
 privileged_jsd_beta=${PRIVILEGED_JSD_BETA:--1.0}
 privileged_distill_temperature=${PRIVILEGED_DISTILL_TEMPERATURE:-1.0}
 privileged_pointwise_kl_clip=${PRIVILEGED_POINTWISE_KL_CLIP:-0.05}
@@ -61,6 +61,7 @@ gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.60}
 rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-4096}
 max_length=${MAX_LENGTH:-${rollout_max_model_len}}
 online_vllm_enforce_eager=${ONLINE_VLLM_ENFORCE_EAGER:-true}
+attn_implementation=${ATTN_IMPLEMENTATION:-sdpa}
 
 use_lora=${USE_LORA:-true}
 lora_r=${LORA_R:-64}
@@ -68,7 +69,7 @@ lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
 log_rollout_text=${LOG_ROLLOUT_TEXT:-false}
-use_all_wrong_gt_preference=${USE_ALL_WRONG_GT_PREFERENCE:-false}
+use_all_wrong_gt_preference=${USE_ALL_WRONG_GT_PREFERENCE:-true}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -104,6 +105,7 @@ echo "[PRIV-HIDDEN-OPSD] rollout_batch_size=${rollout_batch_size} rollout_n=${ro
 echo "[PRIV-HIDDEN-OPSD] lambda_mle=${lambda_mle} lambda_priv=${lambda_priv} lambda_gt=${lambda_gt}"
 echo "[PRIV-HIDDEN-OPSD] hidden_layer_offset=${hidden_layer_offset} jsd_beta=${privileged_jsd_beta}"
 echo "[PRIV-HIDDEN-OPSD] use_all_wrong_gt_preference=${use_all_wrong_gt_preference} (false => skip all-wrong samples)"
+echo "[PRIV-HIDDEN-OPSD] attn_implementation=${attn_implementation}"
 
 python train_privileged_hidden_opsd.py \
   --seed "${seed}" \
@@ -147,6 +149,7 @@ python train_privileged_hidden_opsd.py \
   --lora_dropout "${lora_dropout}" \
   --vllm_max_lora_rank "${vllm_max_lora_rank}" \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
+  --attn_implementation "${attn_implementation}" \
   --gradient_checkpointing true \
   --enable_thinking false \
   --use_all_wrong_gt_preference "${use_all_wrong_gt_preference}" \

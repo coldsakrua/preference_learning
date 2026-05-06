@@ -19,7 +19,7 @@ export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH
 set -u
 mkdir -p logs
 
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export VLLM_ATTENTION_BACKEND=SDPA
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export VLLM_HOST_IP=127.0.0.1
@@ -32,14 +32,14 @@ if [[ -z "${world_size}" || "${world_size}" -lt 1 ]]; then
 fi
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-64}
-online_steps=${ONLINE_STEPS:-160}
+online_steps=${ONLINE_STEPS:-80}
 online_pairs_per_step=${ONLINE_PAIRS_PER_STEP:-8}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-10}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}

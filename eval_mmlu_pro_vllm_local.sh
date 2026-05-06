@@ -24,14 +24,14 @@ export VLLM_HOST_IP=127.0.0.1
 export TORCH_CUDA_ARCH_LIST=8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b}
 
 NO_THINKING=${NO_THINKING:-1}
 dataset_name=${DATASET_NAME:-mmlu-pro}
 data_format=${DATA_FORMAT:-mmlu_pro_hf}
 mmlu_pro_config=${MMLU_PRO_CONFIG:-default}
 mmlu_pro_split=${MMLU_PRO_SPLIT:-test}
-checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/onesided_v2_4b_1gpu/20260505_061846_job1561995/train/checkpoint-update-80}}
+checkpoint_dir=${CHECKPOINT_DIR:-${LORA_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/privileged_hidden_opsd/outputs/privileged_hidden_opsd_4b_1gpu/20260506_084618_job1574107/train/checkpoint-update-40}}
 max_lora_rank=${MAX_LORA_RANK:-${VLLM_MAX_LORA_RANK:-64}}
 use_lora=${USE_LORA:-1}
 num_samples=${NUM_SAMPLES:-0}
