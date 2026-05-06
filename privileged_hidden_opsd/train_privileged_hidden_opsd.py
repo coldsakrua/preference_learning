@@ -41,6 +41,7 @@ from privileged_hidden_opsd.opsd_local_utils import (  # noqa: E402
     apply_qwen_chat_template,
     build_parser as build_cli_parser,
     build_prompt_pool,
+    compute_correct_trajectory_weights,
     choose_system_prompt,
     ensure_input_require_grads_for_checkpointing,
     online_rollout_completions_flat_hf as _online_rollout_completions_flat_hf,
@@ -626,6 +627,7 @@ def run_training(args: argparse.Namespace) -> None:
             "privileged_distill_temperature": float(args.privileged_distill_temperature),
             "privileged_pointwise_kl_clip": float(args.privileged_pointwise_kl_clip),
             "fixed_teacher": bool(args.fixed_teacher),
+            "mle_include_mixed_correct": bool(args.mle_include_mixed_correct),
             "online_sanitize_gradients": bool(args.online_sanitize_gradients),
             "online_grad_element_clip_abs": float(args.online_grad_element_clip_abs),
         },
@@ -641,6 +643,7 @@ def run_training(args: argparse.Namespace) -> None:
     kept_priv_pairs = 0
     kept_gt_priv_pairs = 0
     logged_mixed = 0
+    logged_mixed_mle_only = 0
     logged_all_correct = 0
     logged_all_wrong = 0
     skipped_all_wrong = 0
@@ -702,6 +705,7 @@ def run_training(args: argparse.Namespace) -> None:
             sampled_correct_total = 0
             sampled_total = 0
             mixed_in_rollout = 0
+            mixed_mle_only_in_rollout = 0
             all_correct_in_rollout = 0
             all_wrong_in_rollout = 0
             skipped_all_wrong_in_rollout = 0
@@ -753,6 +757,11 @@ def run_training(args: argparse.Namespace) -> None:
                     all_correct_in_rollout += 1
                     logged_all_correct += 1
                 elif n_correct > 0 and correct_trajs and wrong_trajs:
+                    correct_weights = compute_correct_trajectory_weights(
+                        correct_trajs,
+                        mode=str(args.positive_weight_mode),
+                        tau=float(args.positive_weight_tau),
+                    )
                     privileged_examples = build_mixed_privileged_examples(
                         tokenizer=tokenizer,
                         prompt_user_effective=prompt_user_effective[idx],
@@ -769,7 +778,7 @@ def run_training(args: argparse.Namespace) -> None:
                         objective_type="mixed_hidden_opsd",
                         correct=correct_trajs,
                         wrong=wrong_trajs,
-                        correct_weights=[],
+                        correct_weights=correct_weights,
                         privileged_wrong_examples=privileged_examples,
                     )
                     if privileged_examples:
@@ -777,6 +786,11 @@ def run_training(args: argparse.Namespace) -> None:
                         mixed_in_rollout += 1
                         logged_mixed += 1
                         priv_examples_in_rollout += len(privileged_examples)
+                    elif args.lambda_mle > 0 and args.mle_include_mixed_correct:
+                        objective.objective_type = "mixed_mle_only"
+                        rollout_objectives.append(objective)
+                        mixed_mle_only_in_rollout += 1
+                        logged_mixed_mle_only += 1
                     else:
                         skipped_after_filter += 1
                         skipped_after_filter_in_rollout += 1
@@ -829,7 +843,8 @@ def run_training(args: argparse.Namespace) -> None:
             sampled_correct_rate = sampled_correct_total / sampled_total if sampled_total > 0 else 0.0
             print(
                 f"[privileged_hidden_opsd] rollout_step={rollout_steps}/{total_steps_str} scanned={scanned} "
-                f"mixed={mixed_in_rollout} all_correct={all_correct_in_rollout} all_wrong_gt={all_wrong_in_rollout} "
+                f"mixed={mixed_in_rollout} mixed_mle_only={mixed_mle_only_in_rollout} "
+                f"all_correct={all_correct_in_rollout} all_wrong_gt={all_wrong_in_rollout} "
                 f"skipped_all_wrong={skipped_all_wrong_in_rollout} skipped_after_filter={skipped_after_filter_in_rollout} "
                 f"sampled_correct_rate={sampled_correct_rate:.4f} objectives={len(rollout_objectives)} "
                 f"priv_examples={priv_examples_in_rollout} gt_priv_examples={gt_priv_examples_in_rollout}",
@@ -841,6 +856,7 @@ def run_training(args: argparse.Namespace) -> None:
                     "rollout_step": int(rollout_steps),
                     "scanned": int(scanned),
                     "mixed": int(mixed_in_rollout),
+                    "mixed_mle_only": int(mixed_mle_only_in_rollout),
                     "all_correct": int(all_correct_in_rollout),
                     "all_wrong_gt": int(all_wrong_in_rollout),
                     "skipped_all_wrong": int(skipped_all_wrong_in_rollout),
@@ -871,8 +887,13 @@ def run_training(args: argparse.Namespace) -> None:
                 gt_priv_weights: List[float] = []
 
                 for obj in chunk:
-                    if args.lambda_mle > 0 and obj.objective_type == "all_correct" and obj.correct:
-                        for traj, traj_weight in zip(obj.correct, obj.correct_weights):
+                    if args.lambda_mle > 0 and obj.correct:
+                        if obj.correct_weights and len(obj.correct_weights) == len(obj.correct):
+                            current_correct_weights = obj.correct_weights
+                        else:
+                            uniform_weight = 1.0 / float(len(obj.correct))
+                            current_correct_weights = [uniform_weight for _ in obj.correct]
+                        for traj, traj_weight in zip(obj.correct, current_correct_weights):
                             mle_train_prompts.append(obj.train_prompt)
                             mle_completions.append(traj.response_text)
                             mle_weights.append(float(args.lambda_mle) * float(traj_weight))
@@ -986,6 +1007,7 @@ def run_training(args: argparse.Namespace) -> None:
         f"[privileged_hidden_opsd] finished rollout_steps={rollout_steps} optimizer_steps={updates} scanned={scanned} "
         f"kept_mle_samples={kept_mle_samples} kept_priv_pairs={kept_priv_pairs} "
         f"kept_gt_priv_pairs={kept_gt_priv_pairs} logged_mixed={logged_mixed} "
+        f"logged_mixed_mle_only={logged_mixed_mle_only} "
         f"logged_all_correct={logged_all_correct} logged_all_wrong={logged_all_wrong} "
         f"skipped_all_wrong={skipped_all_wrong} skipped_after_filter={skipped_after_filter} final_model={final_dir}",
         flush=True,
@@ -1000,6 +1022,7 @@ def run_training(args: argparse.Namespace) -> None:
             "kept_priv_pairs": int(kept_priv_pairs),
             "kept_gt_priv_pairs": int(kept_gt_priv_pairs),
             "logged_mixed": int(logged_mixed),
+            "logged_mixed_mle_only": int(logged_mixed_mle_only),
             "logged_all_correct": int(logged_all_correct),
             "logged_all_wrong": int(logged_all_wrong),
             "skipped_all_wrong": int(skipped_all_wrong),
@@ -1072,6 +1095,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=False,
         help="If true, rollout_records.jsonl stores full response and privileged prompt text.",
+    )
+    parser.add_argument(
+        "--mle_include_mixed_correct",
+        type=str2bool,
+        default=False,
+        help=(
+            "If true, include correct trajectories from mixed samples into MLE updates even when privileged "
+            "examples are disabled."
+        ),
     )
     parser.add_argument(
         "--online_sanitize_gradients",
