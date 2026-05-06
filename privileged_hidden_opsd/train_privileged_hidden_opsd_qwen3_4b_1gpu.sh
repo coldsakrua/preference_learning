@@ -28,14 +28,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b}
 
 seed=${SEED:-42}
 max_source_samples=${MAX_SOURCE_SAMPLES:-0}
 rollout_batch_size=${ROLLOUT_BATCH_SIZE:-32}
 online_steps=${ONLINE_STEPS:-80}
 online_objectives_per_step=${ONLINE_OBJECTIVES_PER_STEP:-8}
-online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-16}
+online_save_every_updates=${ONLINE_SAVE_EVERY_UPDATES:-8}
 rollout_n=${ROLLOUT_N:-8}
 temperature=${TEMPERATURE:-0.7}
 top_p=${TOP_P:-0.8}
@@ -45,8 +45,8 @@ presence_penalty=${PRESENCE_PENALTY:-0.0}
 max_new_tokens=${MAX_NEW_TOKENS:-2048}
 learning_rate=${LEARNING_RATE:-1e-6}
 lambda_mle=${LAMBDA_MLE:-1.0}
-lambda_priv=${LAMBDA_PRIV:-0.25}
-lambda_gt=${LAMBDA_GT:-0.25}
+lambda_priv=${LAMBDA_PRIV:-1.0}
+lambda_gt=${LAMBDA_GT:-1.0}
 privileged_distill_loss=${PRIVILEGED_DISTILL_LOSS:-jsd}
 privileged_jsd_beta=${PRIVILEGED_JSD_BETA:--1.0}
 privileged_distill_temperature=${PRIVILEGED_DISTILL_TEMPERATURE:-1.0}
@@ -70,6 +70,7 @@ lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 vllm_max_lora_rank=${VLLM_MAX_LORA_RANK:-64}
 log_rollout_text=${LOG_ROLLOUT_TEXT:-false}
+use_all_wrong_gt_preference=${USE_ALL_WRONG_GT_PREFERENCE:-true}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -104,6 +105,7 @@ echo "[PRIV-HIDDEN-OPSD] model_path=${model_path}"
 echo "[PRIV-HIDDEN-OPSD] rollout_batch_size=${rollout_batch_size} rollout_n=${rollout_n}"
 echo "[PRIV-HIDDEN-OPSD] lambda_mle=${lambda_mle} lambda_priv=${lambda_priv} lambda_gt=${lambda_gt}"
 echo "[PRIV-HIDDEN-OPSD] hidden_layer_offset=${hidden_layer_offset} distill_loss=${privileged_distill_loss} jsd_beta=${privileged_jsd_beta}"
+echo "[PRIV-HIDDEN-OPSD] use_all_wrong_gt_preference=${use_all_wrong_gt_preference} (false => skip all-wrong samples)"
 
 python privileged_hidden_opsd/train_privileged_hidden_opsd.py \
   --seed "${seed}" \
@@ -151,7 +153,7 @@ python privileged_hidden_opsd/train_privileged_hidden_opsd.py \
   --online_vllm_enforce_eager "${online_vllm_enforce_eager}" \
   --gradient_checkpointing true \
   --enable_thinking false \
-  --use_all_wrong_gt_preference true \
+  --use_all_wrong_gt_preference "${use_all_wrong_gt_preference}" \
   --online_pref_min_avg_logprob_chosen -6 \
   --online_pref_min_avg_logprob_rejected -6 \
   --log_rollout_text "${log_rollout_text}"
