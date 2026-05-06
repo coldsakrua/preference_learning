@@ -24,7 +24,7 @@ export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 dataset_path=${DATASET_PATH:-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/data/hendrycks_math/aggregated_l3plus/train.parquet}
-model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b-base}
+model_path=${MODEL_PATH:-/gpfs/share/home/2501210611/labShare/2501210611/model/qwen3-4b}
 
 seed=${SEED:-42}
 learning_rate=${LEARNING_RATE:-1e-6}
@@ -40,7 +40,7 @@ beta=${BETA:-0.04}
 save_steps=${SAVE_STEPS:-20}
 logging_steps=${LOGGING_STEPS:-5}
 
-use_lora=${USE_LORA:-1}
+use_lora=${USE_LORA:-0}
 if [[ "${use_lora}" == "1" ]]; then
   use_lora_bool=true
 elif [[ "${use_lora}" == "0" ]]; then
@@ -53,7 +53,7 @@ lora_r=${LORA_R:-64}
 lora_alpha=${LORA_ALPHA:-128}
 lora_dropout=${LORA_DROPOUT:-0.05}
 lora_target_modules=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
-lora_path=${LORA_PATH-/gpfs/share/home/2501210611/prefernce-learning/preference_learning/outputs/pref_4b_1gpu/20260427_101454_job1469254/train/final}
+lora_path=${LORA_PATH-}
 
 stamp=$(date -u +%Y%m%d_%H%M%S)
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
